@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["crates/dmpicker-search", "crates/dmpicker-engine", "crates/dmpicker-nav", "crates/dmpicker-app"]
+
+[workspace.package]
+edition = "2021"
+version = "1.0.0"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"

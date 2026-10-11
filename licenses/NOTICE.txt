@@ -1,0 +1,8 @@
+DM PICKER는 NEOWIZ와 관련 없는 비공식 유틸입니다.
+
+DJMAX, DJMAX RESPECT V는 NEOWIZ의 상표입니다.
+곡 자켓 이미지와 인식에 쓰는 게임 화면 이미지의 저작권은 NEOWIZ와
+각 곡·콜라보레이션의 권리자에게 있습니다.
+
+UI 글꼴 Pretendard는 SIL Open Font License 1.1로 배포됩니다.
+전문은 Pretendard-OFL.txt에 있습니다.

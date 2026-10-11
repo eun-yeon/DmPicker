@@ -1,0 +1,8 @@
+[package]
+name = "dmpicker-nav"
+description = "DJMAX RESPECT V 곡 목록 이동: 목록 모델, 키 동작, 최단 키 계획, 화면 확인하며 이동"
+edition.workspace = true
+version.workspace = true
+
+# 의존성 없이 유지
+[dependencies]

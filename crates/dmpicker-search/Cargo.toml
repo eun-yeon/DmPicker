@@ -1,0 +1,9 @@
+[package]
+name = "dmpicker-search"
+edition.workspace = true
+version.workspace = true
+description = "DJMAX RESPECT V 곡 검색, 한글 조합 중 입력과 초성 지원"
+
+[dependencies]
+dmpicker-nav = { path = "../dmpicker-nav" }
+serde_json = "1"
