@@ -50,6 +50,16 @@ const CLOSE_SECS: f32 = 0.16;
 const HOTKEY_NOTE_SECS: f32 = 2.0;
 /// 세그먼트 컨트롤 손잡이가 새 선택으로 미끄러지는 시간
 const SEG_SECS: f32 = 0.25;
+/// 토글: 노브는 끝을 살짝 지나쳤다 돌아오고 (커브가 넘침을 만듦, 연타해도 뒤로 안 튐)
+const KNOB_SECS: f32 = 0.24;
+const KNOB_EASE: Ease = Ease(0.34, 1.56, 0.64, 1.0);
+/// 토글 색은 노브보다 짧게 따로, 눌렸던 노브도 이걸로 돌아옴
+const QUICK_SECS: f32 = 0.18;
+const QUICK_EASE: Ease = Ease(0.16, 1.0, 0.3, 1.0);
+/// 토글을 누르는 동안 노브가 천천히 세로로 눌려 캡슐이 됨 (가로는 그대로)
+const PRESS_Y: f32 = 10.0 / 12.0;
+const PRESS_SECS: f32 = 0.42;
+const PRESS_EASE: Ease = Ease(0.33, 1.0, 0.68, 1.0);
 /// 닫기: 판이 이 불투명도까지 흐려질 때쯤 글과 줄은 이미 사라짐
 const CLOSE_TEXT_GONE: f32 = 0.5;
 /// 패널이 나타날 땐 이만큼 (DIP) 위에서 내려앉고, 사라질 땐 그만큼 올라가며 흐려짐
@@ -79,7 +89,10 @@ mod lay {
     pub const ROW_H: f32 = 48.0;
     pub const ROWS: usize = 6;
     pub const LEVEL_W: f32 = 60.0; // 줄 오른쪽 끝의 레벨 칸
-    pub const SETTINGS_H: f32 = 294.0; // 맨 아래 버튼 아래 16 (= 오른쪽 여백)
+    pub const SETTINGS_H: f32 = 348.0; // 맨 아래 줄(버튼 높이 30) 아래 16 (= 오른쪽 여백)
+    pub const TOGGLE_W: f32 = 42.0;
+    pub const TOGGLE_H: f32 = 24.0;
+    pub const KNOB: f32 = 18.0; // 둘레 3
     pub const CARD_H: f32 = 84.0;
     pub const CARD_BTN_W: f32 = 112.0;
     pub const COND_W: f32 = 52.0; // 글은 가운데, 오른쪽 끝이 16 정렬선
@@ -239,6 +252,7 @@ enum Hit {
     DiffSeg(usize),
     Rescan,
     Hotkey,
+    KeepQuery,
     CardButton,
     Row(usize),
 }
@@ -266,6 +280,9 @@ struct SettingsLayout {
     hotkey_title: f32,
     hotkey: D2D_RECT_F, // 글 너비에 맞춘 버튼
     hotkey_note: f32,
+    keep_title: f32,
+    keep: D2D_RECT_F, // 토글
+    keep_note: f32,
 }
 
 pub struct Popup {
@@ -289,6 +306,8 @@ pub struct Popup {
     pub diff_choice: Diff,
     /// 최근 고른 곡 id, 최신순 (앱이 불러오고 저장함)
     pub recent: Vec<u32>,
+    /// 다시 열 때 지난 검색어를 남김 (앱이 불러오고 저장함)
+    pub keep_query: bool,
     /// 입력한 글, 캐럿과 선택 (조합 중인 글자는 `preedit`에 따로, 캐럿 자리에 그림)
     edit: Editor,
     preedit: String,
@@ -317,7 +336,8 @@ pub struct Popup {
     wheel_acc: i32, // 아직 줄로 안 바꾼 휠 값 (정밀 휠, 터치패드)
     view: View,
     sheet: Sheet,
-    kb_focus: Option<usize>, // 설정 키보드 포커스: 0 모드, 1 난이도, 2 다시 인식, 3 단축키
+    kb_focus: Option<usize>, // 설정 키보드 포커스: 0 모드, 1 난이도, 2 다시 인식, 3 단축키, 4 검색어 유지
+    keep_down: bool,         // 검색어 유지 토글을 누른 채 (떼면 바뀜)
     hover: Hit,
     // 애니메이션
     open_s: Spring,      // 띄울 때 0에서 1로 (살짝 튐)
@@ -331,6 +351,9 @@ pub struct Popup {
     sel_y: Spring,          // 선택 강조 위쪽, 패널 px (높이는 한 줄)
     scroll_s: Spring,       // 목록 오프셋 px, scroll x 줄 간격을 따라감
     seg: [Tween; 2],        // 세그먼트 손잡이 [모드, 난이도]: 왼쪽 끝, 칸 단위
+    knob: Tween,            // 토글 노브 자리 0 끔 .. 1 켬 (살짝 넘침)
+    knob_tint: Tween,       // 토글 색 0 끔 .. 1 켬
+    knob_press: Tween,      // 노브 세로 배율, 누르는 동안 줄어듦
     hover_since: Option<Instant>,
     leave_since: Option<Instant>,
     in_zone: bool, // 커서가 두 버튼을 드러내는 영역에 있음
@@ -413,6 +436,7 @@ impl Popup {
             mode_choice: Mode::B4,
             diff_choice: Diff::NM,
             recent: Vec::new(),
+            keep_query: false,
             edit: Editor::default(),
             preedit: String::new(),
             high_surrogate: None,
@@ -431,6 +455,7 @@ impl Popup {
             view: View::Results,
             sheet: Sheet::Results,
             kb_focus: None,
+            keep_down: false,
             hover: Hit::None,
             open_s: OPEN_SPRING,
             reveal: [Spring::new(0.0, 300.0, 17.0); 2],
@@ -443,6 +468,9 @@ impl Popup {
             sel_y: SEL_SPRING,
             scroll_s: Spring::new(0.0, 600.0, 46.0),
             seg: [Tween::new(0.0); 2],
+            knob: Tween::new(0.0),
+            knob_tint: Tween::new(0.0),
+            knob_press: Tween::new(1.0),
             hover_since: None,
             leave_since: None,
             in_zone: false,
@@ -495,6 +523,7 @@ impl Popup {
                 || !self.sel_y.settled()
                 || !self.scroll_s.settled()
                 || self.seg.iter().any(|t| !t.done())
+                || [self.knob, self.knob_tint, self.knob_press].iter().any(|t| !t.done())
                 || self.hover_since.is_some()
                 || self.leave_since.is_some())
     }
@@ -588,6 +617,8 @@ impl Popup {
         self.owned = owned;
         self.stale = stale;
 
+        // 닫을 때 조합 중이던 글자까지 보이던 그대로
+        let kept = if self.keep_query { self.query() } else { String::new() };
         self.edit.clear();
         self.preedit.clear();
         self.high_surrogate = None;
@@ -615,8 +646,19 @@ impl Popup {
         self.icon_alpha.snap(0.0);
         self.panel_h.snap(0.0);
         self.shown.snap(0.0);
+        // 검색어 유지: 지난 글을 다 선택해 둠 (치면 바뀌고 Enter면 같은 검색), 결과는 이번 목록으로 다시 찾음
+        if !kept.is_empty() {
+            self.edit.insert(&kept);
+            self.edit.select_all();
+            self.seen = kept;
+            self.search_now();
+        }
         self.retarget_panel();
         self.snap_segments();
+        let on = self.keep_query as u8 as f32;
+        self.knob.snap(on);
+        self.knob_tint.snap(on);
+        self.knob_press.snap(1.0);
         self.hover_since = None;
         self.leave_since = None;
         self.in_zone = false;
@@ -656,6 +698,7 @@ impl Popup {
         self.closing = true;
         self.end_hotkey_wait();
         self.end_drag();
+        self.release_toggle();
         self.notify_composition(CPS_CANCEL); // 조합 중이던 글자는 숨겨질 때까지 그려 둠
         unsafe {
             let _ = KillTimer(Some(self.hwnd), TIMER_CARET);
@@ -880,6 +923,10 @@ impl Popup {
             hotkey_title: y(246.0),
             hotkey: rect(r - (self.measure(&self.hotkey_text(), |f| &f.item) + self.px(28.0)).max(self.px(88.0)).round(), y(248.0), r, y(278.0)),
             hotkey_note: y(266.0),
+            // 같은 두 줄 묶음, 토글은 버튼 줄(302..332) 가운데
+            keep_title: y(300.0),
+            keep: rect(r - self.px(lay::TOGGLE_W), y(317.0 - lay::TOGGLE_H / 2.0), r, y(317.0 + lay::TOGGLE_H / 2.0)),
+            keep_note: y(320.0),
         }
     }
 
@@ -994,6 +1041,11 @@ impl Popup {
             }
             if inside(&sl.hotkey, x, y) {
                 return Hit::Hotkey;
+            }
+            // 토글은 작아서 둘레를 조금 더, 위아래는 버튼 줄만큼
+            let k = sl.keep;
+            if inside(&rect(k.left - self.px(6.0), k.top - self.px(3.0), k.right, k.bottom + self.px(3.0)), x, y) {
+                return Hit::KeepQuery;
             }
             return Hit::Inside;
         }
@@ -1297,6 +1349,24 @@ impl Popup {
         self.rolls.draw(&self.results, self.rng.next())
     }
 
+    /// 검색어 유지를 바꿈, 노브와 색이 따로 움직임
+    fn set_keep_query(&mut self, on: bool) {
+        self.keep_query = on;
+        let v = on as u8 as f32;
+        self.knob.go(v, KNOB_SECS, KNOB_EASE);
+        self.knob_tint.go(v, QUICK_SECS, QUICK_EASE);
+    }
+
+    /// 토글에서 손을 뗌, 노브가 원으로 돌아옴
+    fn release_toggle(&mut self) {
+        if std::mem::take(&mut self.keep_down) {
+            self.knob_press.go(1.0, QUICK_SECS, QUICK_EASE);
+            unsafe {
+                let _ = ReleaseCapture();
+            }
+        }
+    }
+
     fn snap_segments(&mut self) {
         for (k, idx) in [self.mode_choice.index(), self.diff_choice.index()].into_iter().enumerate() {
             self.seg[k].snap(idx as f32);
@@ -1521,7 +1591,7 @@ impl Popup {
                         }
                         VK_DOWN => {
                             // 처음 누른 화살표는 첫 컨트롤로
-                            self.kb_focus = Some(if self.kb_focus.is_some() { (f + 1).min(3) } else { 0 });
+                            self.kb_focus = Some(if self.kb_focus.is_some() { (f + 1).min(4) } else { 0 });
                             Action::None
                         }
                         VK_LEFT | VK_RIGHT => {
@@ -1536,6 +1606,11 @@ impl Popup {
                                     self.cycle_diff(d);
                                     Action::Choice
                                 }
+                                // 토글은 왼쪽이 끔, 오른쪽이 켬
+                                4 if (d > 0) != self.keep_query => {
+                                    self.set_keep_query(d > 0);
+                                    Action::Choice
+                                }
                                 _ => Action::None,
                             }
                         }
@@ -1543,6 +1618,10 @@ impl Popup {
                         VK_RETURN if f == 3 => {
                             self.start_hotkey_wait();
                             Action::None
+                        }
+                        VK_RETURN if f == 4 => {
+                            self.set_keep_query(!self.keep_query);
+                            Action::Choice
                         }
                         VK_BACK => {
                             self.edit.backspace(false);
@@ -1749,6 +1828,16 @@ impl Popup {
                         self.start_hotkey_wait();
                         Action::None
                     }
+                    // 누르는 동안 노브가 눌리고, 토글 위에서 떼면 바뀜
+                    Hit::KeepQuery => {
+                        self.kb_focus = None;
+                        self.keep_down = true;
+                        self.knob_press.go(PRESS_Y, PRESS_SECS, PRESS_EASE);
+                        unsafe {
+                            SetCapture(self.hwnd);
+                        }
+                        Action::None
+                    }
                     // 예전 검색어 결과가 보이던 줄을 누르면 대신 지금 결과를 띄움
                     Hit::Row(_) if self.search_now() => Action::None,
                     Hit::Row(i) => {
@@ -1764,8 +1853,22 @@ impl Popup {
                 self.end_drag();
                 Some((0, Action::None))
             }
+            WM_LBUTTONUP if self.keep_down => {
+                let (x, y) = (lp.0 as i16 as f32, (lp.0 >> 16) as i16 as f32);
+                let over = self.hit(x, y) == Hit::KeepQuery;
+                self.release_toggle();
+                if over {
+                    self.set_keep_query(!self.keep_query);
+                    return Some((0, Action::Choice));
+                }
+                Some((0, Action::None))
+            }
             WM_CAPTURECHANGED => {
                 self.dragging = false;
+                // 다른 데로 캡처를 뺏기면 안 바꾸고 놓음
+                if std::mem::take(&mut self.keep_down) {
+                    self.knob_press.go(1.0, QUICK_SECS, QUICK_EASE);
+                }
                 None
             }
             WM_ACTIVATE => {
@@ -2191,6 +2294,12 @@ impl Popup {
                     };
                     let nl3 = g.layout(note, &f.sub, sl.hotkey.left - self.px(12.0) - l0, self.px(18.0))?;
                     dc.DrawTextLayout(gfx::pt(l0t, sl.hotkey_note), &nl3, nb, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                    let kt = g.layout("검색어 유지", &f.item_bold, self.px(200.0), self.px(20.0))?;
+                    dc.DrawTextLayout(gfx::pt(l0t, sl.keep_title), &kt, &text_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                    let nl4 = g.layout("다시 열면 마지막 검색어가 남아 있어요", &f.sub, sl.keep.left - self.px(12.0) - l0, self.px(18.0))?;
+                    dc.DrawTextLayout(gfx::pt(l0t, sl.keep_note), &nl4, &note_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                    let knob = (self.knob.value(), self.knob_tint.value(), self.knob_press.value());
+                    draw_toggle(g, sl.keep, knob, self.hover == Hit::KeepQuery || self.kb_focus == Some(4), s)?;
                 } else if let (Sheet::Card, Some((title, sub, button))) = (self.sheet, self.notice()) {
                     let top = ct;
                     let tw = r0 - l0 - self.px(lay::CARD_BTN_W + 12.0);
@@ -2320,6 +2429,26 @@ fn draw_button(g: &Gfx, font: &IDWriteTextFormat, r: D2D_RECT_F, label: &str, li
         g.dc.FillRoundedRectangle(&rounded(r, (8.0 * s).round()), &fill);
         let l = g.layout_centered(label, font, r.right - r.left, r.bottom - r.top)?;
         g.dc.DrawTextLayout(gfx::pt(r.left, r.top), &l, &g.brush(TEXT)?, D2D1_DRAW_TEXT_OPTIONS_NONE);
+    }
+    Ok(())
+}
+
+/// 토글: 꺼지면 옅은 트랙에 흐린 노브, 켜지면 밝은 트랙에 판 색 노브 (호버·포커스면 트랙을 조금 바꿈)
+/// `knob`은 (자리 0 끔 .. 1 켬, 넘칠 수 있음, 켬 색 비율, 노브 세로 배율)
+/// 눌린 노브는 높이 절반을 반지름으로 둬서 타원이 아니라 캡슐
+fn draw_toggle(g: &Gfx, r: D2D_RECT_F, (at, tint, press): (f32, f32, f32), lit: bool, s: f32) -> Result<()> {
+    unsafe {
+        let h = r.bottom - r.top;
+        let d = (lay::KNOB * s).round();
+        let pad = (h - d) / 2.0;
+        let travel = r.right - r.left - d - pad * 2.0;
+        let mix = |a: f32, b: f32| a + (b - a) * tint;
+        let (off, on) = if lit { (FILL_STRONG, 0.80) } else { (FILL_SELECTED, TEXT.a) };
+        g.dc.FillRoundedRectangle(&rounded(r, h / 2.0), &g.brush(white(mix(off, on)))?);
+        let knob = color(mix(1.0, TINT.r), mix(1.0, TINT.g), mix(1.0, TINT.b), mix(SUB.a, 1.0));
+        let (cx, cy) = (r.left + pad + d / 2.0 + travel * at, (r.top + r.bottom) / 2.0);
+        let (rx, ry) = (d / 2.0, d / 2.0 * press);
+        g.dc.FillRoundedRectangle(&rrect(cx - rx, cy - ry, cx + rx, cy + ry, ry), &g.brush(knob)?);
     }
     Ok(())
 }

@@ -232,10 +232,13 @@ fn apply_settings(p: &mut Popup, v: &serde_json::Value) {
     if let Some(k) = v["hotkey"].as_str().and_then(Hotkey::parse) {
         p.hotkey = k;
     }
+    if let Some(b) = v["keep_query"].as_bool() {
+        p.keep_query = b;
+    }
 }
 
 fn settings_json(p: &Popup) -> serde_json::Value {
-    serde_json::json!({ "mode": p.mode_choice.label(), "diff": p.diff_choice.label(), "hotkey": p.hotkey.label() })
+    serde_json::json!({ "mode": p.mode_choice.label(), "diff": p.diff_choice.label(), "hotkey": p.hotkey.label(), "keep_query": p.keep_query })
 }
 
 /// 저장하지 못하면 알림 (다시 켜면 예전 값으로 돌아감)
