@@ -670,7 +670,7 @@ fn firm(a: &Seen, b: &Seen) -> bool {
 pub enum ScanStage {
     /// 정렬 창에서 게임 정렬을 확인하고 제목순으로 맞추는 중
     Sorting,
-    /// 목록 읽는 중, 곡 데이터로 짐작한 길이 중 읽은 비율 (0..1)
+    /// 목록 읽는 중, 짐작한 길이 중 읽은 비율 (0..1), 끝을 찾으면 1
     Reading(f32),
     /// 그 길이를 넘게 읽었는데 아직 끝을 못 찾음
     FindingEnd,
@@ -678,18 +678,17 @@ pub enum ScanStage {
     Rechecking(usize, usize),
 }
 
-/// 목록을 다 읽었을 때 링의 채움 정도, 다시 보기로 99 %까지 가고 저장해야 100 %
-const READ_FILL: f32 = 0.9;
-const RECHECK_FILL: f32 = 0.09;
+/// 끝을 찾기 전 링의 최대 채움, 100 %는 다 읽었을 때만
+const FINDING_FILL: f32 = 0.99;
 
 impl ScanStage {
-    /// 진행 링의 채움 정도 (0..1)
+    /// 진행 링의 채움 정도 (0..1), 다시 보기 동안은 다 찬 채로
     pub fn fill(self) -> f32 {
         match self {
             ScanStage::Sorting => 0.0,
-            ScanStage::Reading(p) => READ_FILL * p.clamp(0.0, 1.0),
-            ScanStage::FindingEnd => READ_FILL,
-            ScanStage::Rechecking(done, of) => READ_FILL + RECHECK_FILL * done as f32 / of.max(1) as f32,
+            ScanStage::Reading(p) => p.clamp(0.0, 1.0),
+            ScanStage::FindingEnd => FINDING_FILL,
+            ScanStage::Rechecking(..) => 1.0,
         }
     }
 }
@@ -1686,8 +1685,10 @@ pub fn run_scan(ctx: &Ctx, cancel: &AtomicBool, mut progress: impl FnMut(ScanSta
         eprintln!("scan: the sort is unknown and the keys are not watched");
         return JobResult::Failed(SORT_ASK.into());
     }
-    // 곡 데이터의 모든 곡, RANDOM, 끝을 지나 더 읽는 구간
-    let est = (ctx.titles.len() + 1) as i64 + PAST_END;
+    // 저장된 목록 길이, 처음이면 곡 데이터의 모든 곡과 RANDOM (ALL TRACK엔 가진 곡만 있어서 더 길게 잡힘)
+    // 그리고 끝을 지나 더 읽는 구간
+    let songs = Learned::load(&ctx.store, kind).map_or(ctx.titles.len() + 1, |l| l.entries.len());
+    let est = songs as i64 + PAST_END;
     let reading = |seen: usize| if (seen as i64) < est { ScanStage::Reading(seen as f32 / est as f32) } else { ScanStage::FindingEnd };
     match scan(&screen, &ctx.refs, cancel, &hands, |seen| progress(reading(seen))) {
         Ok(pending) => {
@@ -1695,6 +1696,7 @@ pub fn run_scan(ctx: &Ctx, cancel: &AtomicBool, mut progress: impl FnMut(ScanSta
             if out_of_order(&pending.learned, &ctx.titles) {
                 return JobResult::Failed(MISREAD.into());
             }
+            progress(ScanStage::Reading(1.0));
             let (mut l, doubtful) = pending.repair(&|id| ctx.title(id));
             // 제목 순서가 거꾸로 가는 곳은 양옆 중 한 칸이 오인식일 가능성이 큼
             let doubtful = recheck_targets(doubtful, &l, &ctx.titles);

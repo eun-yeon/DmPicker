@@ -83,6 +83,8 @@ const RED: D2D1_COLOR_F = D2D1_COLOR_F { r: 0.941, g: 0.267, b: 0.322, a: 1.0 };
 /// 진행 링과 트랙, 글처럼 이 불투명도의 흰색
 const RING: f32 = 0.85;
 const TRACK: f32 = 0.14;
+/// 진행 링이 다 찬 것으로 보는 채움, 완료면 여기서 체크로 바뀜
+const FULL: f32 = 0.995;
 
 /// 모션이 `t` ms 지났을 때 (트랙 링, 진행 링, 원) 불투명도, 배지 배율,
 /// 뛰어오른 높이 (px, 위가 음수), 체크가 그려진 비율
@@ -137,12 +139,13 @@ impl Toast {
         match badge {
             Badge::Progress(p) if opening || !matches!(self.badge, Badge::Progress(_)) => self.ring.snap(p),
             Badge::Progress(p) => self.ring.target = p,
-            Badge::Done | Badge::Failed if self.badge != badge => {
-                if badge == Badge::Done {
-                    self.ring.target = 1.0;
-                }
-                self.end_at = Some(Instant::now());
+            // 진행 중에 끝나면 링이 다 찬 걸 보여 준 뒤 체크로 (`frame`)
+            Badge::Done if self.badge != badge => {
+                let filling = matches!(self.badge, Badge::Progress(_)) && !opening;
+                self.ring.target = 1.0;
+                self.end_at = if filling && self.ring.value < FULL { None } else { Some(Instant::now()) };
             }
+            Badge::Failed if self.badge != badge => self.end_at = Some(Instant::now()),
             _ => {}
         }
         if !badge.is_end() {
@@ -212,8 +215,9 @@ impl Toast {
 
     pub fn animating(&self) -> bool {
         let morphing = self.end_at.is_some_and(|t| t.elapsed().as_secs_f32() * 1000.0 < MORPH_MS);
+        let filling = self.badge == Badge::Done && self.end_at.is_none(); // 0.99에서 멈춘 링도 끝까지
         let fading = self.opened_at.elapsed().as_secs_f32() < FADE;
-        self.shown && (!self.open.settled() || !self.ring.settled() || morphing || fading)
+        self.shown && (!self.open.settled() || !self.ring.settled() || filling || morphing || fading)
     }
 
     /// 애니메이션 한 프레임 ([`Toast::animating`] 동안 UI 루프에서 부름)
@@ -222,6 +226,9 @@ impl Toast {
         let dt = (now - self.last).as_secs_f32();
         self.open.step(dt);
         self.ring.step(dt);
+        if self.badge == Badge::Done && self.end_at.is_none() && self.ring.value >= FULL {
+            self.end_at = Some(now);
+        }
         self.last = now;
         if self.open.target == 0.0 && self.open.value < 0.02 {
             self.shown = false;

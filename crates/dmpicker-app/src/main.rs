@@ -334,7 +334,8 @@ fn on_pick(a: &mut App, id: u32, chart: Option<(dmpicker_search::Mode, dmpicker_
 fn scan_status(s: driver::ScanStage, hk: &str) -> String {
     let head = match s {
         driver::ScanStage::Sorting => "곡 제목순 정렬 확인 중".to_string(),
-        driver::ScanStage::Reading(_) => format!("곡 목록 인식 중 {:.0}%", s.fill() * 100.0),
+        // 내림, 끝을 찾기 전엔 100 %가 안 나오게
+        driver::ScanStage::Reading(_) => format!("곡 목록 인식 중 {}%", (s.fill() * 100.0) as u32),
         driver::ScanStage::FindingEnd => "목록 끝 확인 중".to_string(),
         driver::ScanStage::Rechecking(done, of) => format!("다시 확인 중 {done}/{of}"),
     };
