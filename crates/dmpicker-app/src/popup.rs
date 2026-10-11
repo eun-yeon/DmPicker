@@ -2433,7 +2433,7 @@ fn draw_button(g: &Gfx, font: &IDWriteTextFormat, r: D2D_RECT_F, label: &str, li
     Ok(())
 }
 
-/// 토글: 꺼지면 옅은 트랙에 흐린 노브, 켜지면 밝은 트랙에 판 색 노브 (호버·포커스면 트랙을 조금 바꿈)
+/// 토글: 꺼지면 옅은 트랙에 흐린 노브, 켜지면 밝은 트랙에 판 색 노브 (호버·포커스면 꺼진 트랙만 조금 밝게)
 /// `knob`은 (자리 0 끔 .. 1 켬, 넘칠 수 있음, 켬 색 비율, 노브 세로 배율)
 /// 눌린 노브는 높이 절반을 반지름으로 둬서 타원이 아니라 캡슐
 fn draw_toggle(g: &Gfx, r: D2D_RECT_F, (at, tint, press): (f32, f32, f32), lit: bool, s: f32) -> Result<()> {
@@ -2443,8 +2443,8 @@ fn draw_toggle(g: &Gfx, r: D2D_RECT_F, (at, tint, press): (f32, f32, f32), lit: 
         let pad = (h - d) / 2.0;
         let travel = r.right - r.left - d - pad * 2.0;
         let mix = |a: f32, b: f32| a + (b - a) * tint;
-        let (off, on) = if lit { (FILL_STRONG, 0.80) } else { (FILL_SELECTED, TEXT.a) };
-        g.dc.FillRoundedRectangle(&rounded(r, h / 2.0), &g.brush(white(mix(off, on)))?);
+        let off = if lit { FILL_STRONG } else { FILL_SELECTED };
+        g.dc.FillRoundedRectangle(&rounded(r, h / 2.0), &g.brush(white(mix(off, TEXT.a)))?);
         let knob = color(mix(1.0, TINT.r), mix(1.0, TINT.g), mix(1.0, TINT.b), mix(SUB.a, 1.0));
         let (cx, cy) = (r.left + pad + d / 2.0 + travel * at, (r.top + r.bottom) / 2.0);
         let (rx, ry) = (d / 2.0, d / 2.0 * press);
