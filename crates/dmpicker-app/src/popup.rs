@@ -2116,6 +2116,8 @@ impl Popup {
     }
 
     /// 두 버튼용 호버 머무름·떠남 시간 처리, 앞 버튼이 먼저 움직이고 다른 버튼은 시차 뒤에 따라감
+    /// 입력 칸에 글이 있으면 (조합 중인 글자 포함) 호버해도 안 나오고 나와 있던 버튼도 들어감
+    /// 설정·히스토리 보기에선 늘 나옴
     fn update_reveal(&mut self, now: Instant) {
         if let Some((at, k, to)) = self.reveal_follow {
             if now >= at {
@@ -2123,7 +2125,14 @@ impl Popup {
                 self.reveal_follow = None;
             }
         }
-        let mut want = self.beads_out;
+        let typed = !self.edit.text().is_empty() || !self.preedit.is_empty();
+        if typed {
+            self.hover_since = None;
+        } else if self.in_zone && !self.beads_out && self.hover_since.is_none() {
+            // 다 지웠을 때 커서가 이미 영역에 있으면 안 움직여도 머무름 뒤에 나옴
+            self.hover_since = Some(now);
+        }
+        let mut want = self.beads_out && !typed;
         if let Some(t) = self.hover_since {
             if now - t >= Duration::from_millis(100) {
                 want = true;
