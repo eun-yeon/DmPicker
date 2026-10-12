@@ -16,7 +16,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use dmpicker_search::{Diff, Filter, Mode};
 
 use crate::anim::{Ease, Spring, Tween};
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, Song};
 use crate::edit::{clean_paste, Editor};
 use crate::gfx::{
     self, circle, color, rect, rounded, rrect, white, with_alpha, Drawing, Gfx, Retarget, BEARING, CARET, FAINT, FILL_HOVER,
@@ -97,6 +97,8 @@ mod lay {
     pub const CARD_BTN_W: f32 = 112.0;
     pub const COND_W: f32 = 52.0; // 글은 가운데, 오른쪽 끝이 16 정렬선
     pub const PANEL_MAX: f32 = PAD * 2.0 + ROW_H * ROWS as f32; // 304
+    /// 키워드 칩 줄 한도: 칩 위 88, 아래 안내 문구·여백 48을 빼고 창 높이에 드는 줄 (칩 28 + 간격 6)
+    pub const CHIP_LINES: usize = ((PANEL_MAX.max(SETTINGS_H) - 88.0 - 48.0 + 6.0) / 34.0) as usize; // 6
 }
 
 struct Fonts {
@@ -107,6 +109,7 @@ struct Fonts {
     head: IDWriteTextFormat,
     item: IDWriteTextFormat,
     item_bold: IDWriteTextFormat,
+    item_regular: IDWriteTextFormat,
     small: IDWriteTextFormat,
     icon: Option<IDWriteTextFormat>,
     /// 히스토리 시계, 같은 크기면 톱니보다 잉크가 적어 작고 가늘어 보여서 조금 크게
@@ -140,6 +143,8 @@ enum View {
     Settings,
     /// 최근 고른 곡, 히스토리 버튼으로 엶
     History,
+    /// 곡 하나의 내 키워드, 결과·히스토리 줄을 우클릭하거나 F2로 엶
+    Keywords,
 }
 
 /// 시트에 그리는 내용, 보이거나 나타나는 중에만 바뀌고 사라지는 동안엔 그대로 (`retarget_panel`)
@@ -151,6 +156,23 @@ enum Sheet {
     Results,
     /// 최근 고른 곡 줄
     History,
+    /// 곡 줄과 키워드 칩
+    Keywords,
+}
+
+/// 키워드 시트 상태와 닫으면 돌아갈 보기·입력·줄·스크롤
+struct KeywordEdit {
+    /// `songs` 인덱스, 색인을 다시 만들어도 그대로
+    song: usize,
+    from: View,
+    /// 열기 전 입력, 시트에선 입력 칸에 키워드를 씀
+    edit: Editor,
+    row: Row,
+    scroll: usize,
+    /// 한 번 더 Backspace를 누르면 지울 칩
+    remove: Option<usize>,
+    /// 칩 아래 안내 문구 (입력 오류, 저장 실패)
+    note: Option<&'static str>,
 }
 
 /// 결과 한 줄
@@ -255,6 +277,10 @@ enum Hit {
     KeepQuery,
     CardButton,
     Row(usize),
+    /// 키워드 시트의 완료 버튼
+    Done,
+    /// i번째 키워드 칩의 × 버튼
+    RemoveKeyword(usize),
 }
 
 /// 글이 바뀐 이유, `requery`에서 씀
@@ -283,6 +309,16 @@ struct SettingsLayout {
     keep_title: f32,
     keep: D2D_RECT_F, // 토글
     keep_note: f32,
+}
+
+/// 물리 px 기준 키워드 시트: 클릭 영역과 각 글줄의 위쪽
+struct KeywordLayout {
+    done: D2D_RECT_F,
+    label: f32,
+    chips_top: f32,
+    chips: Vec<(D2D_RECT_F, D2D_RECT_F)>, // 칩과 그 안의 × 버튼, 창에 안 들어가는 칩은 빠짐
+    note: f32,
+    height: f32, // 시트 높이
 }
 
 pub struct Popup {
@@ -338,6 +374,7 @@ pub struct Popup {
     sheet: Sheet,
     kb_focus: Option<usize>, // 설정 키보드 포커스: 0 모드, 1 난이도, 2 다시 인식, 3 단축키, 4 검색어 유지
     keep_down: bool,         // 검색어 유지 토글을 누른 채 (떼면 바뀜)
+    keyword_edit: Option<KeywordEdit>,
     hover: Hit,
     // 애니메이션
     open_s: Spring,      // 띄울 때 0에서 1로 (살짝 튐)
@@ -456,6 +493,7 @@ impl Popup {
             sheet: Sheet::Results,
             kb_focus: None,
             keep_down: false,
+            keyword_edit: None,
             hover: Hit::None,
             open_s: OPEN_SPRING,
             reveal: [Spring::new(0.0, 300.0, 17.0); 2],
@@ -608,6 +646,7 @@ impl Popup {
     /// 검색창을 띄움, `owned`는 보이는 목록에서 고를 수 있는 곡 (첫 인식 전엔 None)
     /// `stale`이면 곡 이동 중 화면이 저장된 목록과 달랐음
     pub fn show(&mut self, owned: Option<HashSet<u32>>, stale: bool) {
+        self.restore_keyword_query();
         if !self.prepare() {
             return;
         }
@@ -716,6 +755,7 @@ impl Popup {
     fn finish_hide(&mut self) {
         self.closing = false;
         self.visible = false;
+        self.restore_keyword_query();
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_HIDE);
         }
@@ -735,6 +775,7 @@ impl Popup {
             head: g.ui_format(14.0 * s, DWRITE_FONT_WEIGHT_SEMI_BOLD)?,
             item: g.ui_format(13.0 * s, DWRITE_FONT_WEIGHT_MEDIUM)?,
             item_bold: g.ui_format(13.0 * s, DWRITE_FONT_WEIGHT_SEMI_BOLD)?,
+            item_regular: g.ui_format(13.0 * s, DWRITE_FONT_WEIGHT_NORMAL)?,
             small: g.ui_format(11.0 * s, DWRITE_FONT_WEIGHT_SEMI_BOLD)?,
             icon: icon_family.and_then(|f| g.text_format(f, 19.0 * s, DWRITE_FONT_WEIGHT_NORMAL).ok()),
             icon_history: icon_family.and_then(|f| g.text_format(f, 20.5 * s, DWRITE_FONT_WEIGHT_NORMAL).ok()),
@@ -878,6 +919,7 @@ impl Popup {
         match self.view {
             View::Settings => Sheet::Settings,
             View::History => Sheet::History,
+            View::Keywords => Sheet::Keywords,
             View::Results if self.card().is_some() => Sheet::Card,
             View::Results => Sheet::Results,
         }
@@ -885,7 +927,11 @@ impl Popup {
 
     /// 시트 `s`의 줄
     fn rows_of(&self, s: Sheet) -> &[Row] {
-        if s == Sheet::History { &self.history } else { &self.results }
+        match s {
+            Sheet::History => &self.history,
+            Sheet::Keywords => &[],
+            _ => &self.results,
+        }
     }
 
     /// 지금 보기의 줄, 키·마우스·높이 계산용 (그리기는 `sheet`의 줄)
@@ -928,6 +974,61 @@ impl Popup {
             keep: rect(r - self.px(lay::TOGGLE_W), y(317.0 - lay::TOGGLE_H / 2.0), r, y(317.0 + lay::TOGGLE_H / 2.0)),
             keep_note: y(320.0),
         }
+    }
+
+    /// 키워드 시트: 결과 줄과 같은 곡 줄, 라벨, 줄바꿈하며 흐르는 칩, 안내 문구
+    /// 그리기·판정·시트 높이가 같이 씀
+    fn keyword_layout(&self) -> KeywordLayout {
+        let top = self.panel_top();
+        let y = |v: f32| top + self.px(v);
+        // 완료 버튼은 레벨 칸 자리: 오른쪽 끝을 맞추고 줄 가운데, 높이 30에 글 좌우로 14
+        let done_r = self.px(lay::MARGIN + lay::W) - self.px(lay::PAD) - self.px(8.0);
+        let done_w = (self.measure("완료", |f| &f.item) + self.px(28.0)).round();
+        let cy = y(lay::PAD) + self.px(lay::ROW_H) / 2.0;
+        let done = rect(done_r - done_w, cy - self.px(15.0), done_r, cy + self.px(15.0));
+        // 곡 줄 아래 8에 라벨 (줄 높이 16), 그 아래 8부터 칩 (높이 28, 세로 간격 6)
+        // 안내 문구는 칩 아래 12 (줄 높이 16), 맨 아래 여백 20
+        let (h, gap) = (self.px(28.0), self.px(6.0));
+        let chips_top = y(88.0);
+        let words = self.keyword_song().map_or(&[][..], |s| &s.user_keys[..]);
+        let flow = self.chip_flow(words.iter().map(String::as_str));
+        // 줄 한도를 넘는 칩은 안 그림, 추가할 땐 막으니 파일을 직접 고친 경우뿐
+        let lines = flow.last().map_or(1, |&(.., line)| line + 1).min(lay::CHIP_LINES);
+        let chips = flow
+            .into_iter()
+            .take_while(|&(.., line)| line < lay::CHIP_LINES)
+            .map(|(x, cw, line)| {
+                let t = chips_top + (h + gap) * line as f32;
+                let (bx, by) = (x + cw - self.px(24.0), t + ((h - self.px(20.0)) / 2.0).round());
+                (rect(x, t, x + cw, t + h), rect(bx, by, bx + self.px(20.0), by + self.px(20.0)))
+            })
+            .collect();
+        let chips_bottom = chips_top + (h + gap) * lines as f32 - gap;
+        let note = chips_bottom + self.px(12.0);
+        let bottom = if self.keyword_note().is_some() { note + self.px(16.0) } else { chips_bottom };
+        KeywordLayout { done, label: y(lay::PAD + lay::ROW_H + 8.0), chips_top, chips, note, height: bottom + self.px(20.0) - top }
+    }
+
+    /// 칩 자리: 16 정렬선 사이를 흐르며 줄바꿈, 칩마다 (왼쪽, 너비, 줄)
+    /// 시트 배치 (`keyword_layout`)와 추가할 자리 검사가 같이 씀
+    fn chip_flow<'a>(&self, words: impl IntoIterator<Item = &'a str>) -> Vec<(f32, f32, usize)> {
+        let (l, r) = (self.px(lay::MARGIN + lay::INSET), self.px(lay::MARGIN + lay::W - lay::INSET));
+        let gap = self.px(6.0);
+        let (mut x, mut line) = (l, 0);
+        words
+            .into_iter()
+            .map(|w| {
+                // 글 왼쪽 10, 글 뒤 4 띄우고 20 x 20 × 버튼, 오른쪽 4, 한 줄보다 긴 글은 말줄임
+                let cw = (self.px(10.0) + self.measure(w, |f| &f.item).ceil() + self.px(28.0)).min(r - l);
+                if x > l && x + cw > r {
+                    line += 1;
+                    x = l;
+                }
+                let at = (x, cw, line);
+                x += cw + gap;
+                at
+            })
+            .collect()
     }
 
     /// 단축키 버튼 글, 새 조합을 기다리는 중이면 안내
@@ -995,6 +1096,7 @@ impl Popup {
     fn panel_target(&self) -> f32 {
         match self.sheet_now() {
             Sheet::Settings => self.px(lay::SETTINGS_H),
+            Sheet::Keywords => self.keyword_layout().height,
             Sheet::Card => self.px(lay::CARD_H),
             _ if !self.listing() => 0.0,
             _ => self.px(lay::PAD * 2.0 + lay::ROW_H * self.visible_rows().max(1) as f32),
@@ -1028,6 +1130,17 @@ impl Popup {
             return Hit::Inside;
         }
         let y = y - sg.dy;
+        if self.view == View::Keywords {
+            let kl = self.keyword_layout();
+            if inside(&kl.done, x, y) {
+                return Hit::Done;
+            }
+            // × 버튼은 작아서 칩 오른쪽 끝까지, 위아래는 칩 높이만큼
+            if let Some(i) = kl.chips.iter().position(|(c, b)| inside(&rect(b.left, c.top, c.right, c.bottom), x, y)) {
+                return Hit::RemoveKeyword(i);
+            }
+            return Hit::Inside;
+        }
         if self.view == View::Settings {
             let sl = self.settings_layout();
             if inside(&sl.mode, x, y) {
@@ -1078,10 +1191,212 @@ impl Popup {
 
     // ---------------------------------------------------------------- 상태 변경
 
+    /// `i`번째 줄 곡의 키워드 시트를 엶, 무작위 줄·설정·안내 카드에선 안 엶
+    fn open_keywords(&mut self, i: usize) -> bool {
+        if !matches!(self.sheet_now(), Sheet::Results | Sheet::History) || !self.listing() {
+            return false;
+        }
+        let Some(&row) = self.rows().get(i) else { return false };
+        let Some(song) = row.song() else { return false };
+        self.complete_composition();
+        self.end_drag();
+        self.release_toggle();
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), TIMER_SEARCH);
+        }
+        self.keyword_edit = Some(KeywordEdit {
+            song,
+            from: self.view,
+            edit: std::mem::take(&mut self.edit),
+            row,
+            scroll: self.scroll,
+            remove: None,
+            note: None,
+        });
+        self.clear_input();
+        self.view = View::Keywords;
+        self.hover = Hit::None;
+        self.retarget_panel();
+        true
+    }
+
+    /// 키워드 시트의 곡 (키워드는 `user_keys`)
+    fn keyword_song(&self) -> Option<&Song> {
+        self.keyword_edit.as_ref().map(|k| &self.catalog.songs[k.song])
+    }
+
+    /// 한 번 더 Backspace를 누르면 지울 칩
+    fn keyword_remove_mark(&self) -> Option<usize> {
+        self.keyword_edit.as_ref().and_then(|k| k.remove)
+    }
+
+    fn keyword_note(&self) -> Option<&'static str> {
+        self.keyword_edit.as_ref().and_then(|k| k.note)
+    }
+
+    /// 칩 아래 문구를 바꾸고 지울 칩 표시는 풂, 문구가 바뀌면 시트 높이도 따라감
+    fn set_keyword_note(&mut self, note: Option<&'static str>) {
+        let Some(k) = &mut self.keyword_edit else { return };
+        k.remove = None;
+        if std::mem::replace(&mut k.note, note) != note {
+            self.retarget_panel();
+        }
+    }
+
+    /// 입력 칸을 비움, 조합 중인 글자와 가로로 민 거리까지
+    fn clear_input(&mut self) {
+        self.edit.clear();
+        self.preedit.clear();
+        self.high_surrogate = None;
+        self.seen.clear();
+        self.ended = None;
+        self.text_scroll = 0.0;
+        self.caret_t0 = Instant::now();
+    }
+
+    /// 입력을 검사하고 저장, 되면 입력 칸만 비워 이어서 넣을 수 있게 함
+    fn try_add_keyword(&mut self, input: &str) -> bool {
+        let Some(song) = self.keyword_song() else { return false };
+        let word = input.trim();
+        let norm = dmpicker_search::normalize(word);
+        let why = if norm.is_empty() {
+            Some("글자나 숫자를 넣어 주세요")
+        } else if Filter::parse(word).is_some() {
+            Some("sc15나 bpm150 같은 조건 검색어는 키워드로 쓸 수 없어요")
+        } else if song.user_keys.iter().any(|k| dmpicker_search::normalize(k) == norm) {
+            Some("이미 있는 키워드예요")
+        } else if self.chip_flow(song.user_keys.iter().map(String::as_str).chain([word])).last().is_some_and(|&(.., line)| line >= lay::CHIP_LINES) {
+            // 줄 한도를 넘은 칩은 안 보여서 ×로도 Backspace 표시로도 못 지움
+            Some("키워드를 더 넣을 자리가 없어요")
+        } else {
+            None
+        };
+        if why.is_some() {
+            self.set_keyword_note(why);
+            return false;
+        }
+        let mut words = song.user_keys.clone();
+        words.push(word.to_owned());
+        let saved = self.save_keywords(words);
+        if saved {
+            self.clear_input();
+        }
+        saved
+    }
+
+    /// `i`번째 키워드를 지움
+    fn delete_keyword(&mut self, i: usize) -> bool {
+        let Some(song) = self.keyword_song() else { return false };
+        let mut words = song.user_keys.clone();
+        if i >= words.len() {
+            return false;
+        }
+        words.remove(i);
+        self.save_keywords(words)
+    }
+
+    /// 바꾼 키워드 목록을 저장, 못 하면 이유를 보여 주고 칩은 그대로
+    fn save_keywords(&mut self, words: Vec<String>) -> bool {
+        let Some(k) = &self.keyword_edit else { return false };
+        let saved = self.catalog.save_keywords(k.song, words);
+        self.set_keyword_note(saved.err());
+        self.retarget_panel();
+        // 칩이 당겨지거나 새로 생겨 커서 아래 칩이 바뀔 수 있음
+        if let Some((x, y)) = self.last_mouse.filter(|_| self.tracking) {
+            self.hover = self.hit(x as f32, y as f32);
+        }
+        saved.is_ok()
+    }
+
+    /// 빈 칸에서 두 번 눌러 마지막 칩 삭제, 누른 채 반복되는 키는 안 셈
+    fn keyword_backspace(&mut self, repeat: bool) {
+        if repeat {
+            return;
+        }
+        if let Some(i) = self.keyword_remove_mark() {
+            self.delete_keyword(i);
+        } else if let Some(i) = self.keyword_song().and_then(|s| s.user_keys.len().checked_sub(1)) {
+            self.set_keyword_note(None);
+            if let Some(k) = &mut self.keyword_edit {
+                k.remove = Some(i);
+            }
+        }
+    }
+
+    /// 열기 전 입력과 보기로 되돌림, 쓰던 키워드는 버림
+    /// 검색창을 닫거나 다시 열 때도 불림, 쓰던 키워드가 검색어로 남지 않게
+    fn restore_keyword_query(&mut self) -> Option<(Row, usize)> {
+        let k = self.keyword_edit.take()?;
+        self.clear_input();
+        self.edit = k.edit;
+        self.seen = self.edit.text().to_owned();
+        self.view = k.from;
+        Some((k.row, k.scroll))
+    }
+
+    /// 원래 보기로 돌아가 바뀐 키워드로 다시 검색, 고치던 줄을 고름
+    fn close_keywords(&mut self) {
+        if self.keyword_edit.is_none() {
+            return;
+        }
+        // 쓰던 키워드의 조합 중인 글자는 검색어로 안 넘어가게 버림
+        self.preedit.clear();
+        self.notify_composition(CPS_CANCEL);
+        let Some((row, scroll)) = self.restore_keyword_query() else { return };
+        self.searched.clear();
+        self.search_now();
+        self.retarget_panel();
+        self.selected = self.rows().iter().position(|r| *r == row).unwrap_or(0);
+        self.scroll = scroll.min(self.rows().len().saturating_sub(lay::ROWS)).min(self.selected);
+        if self.selected >= self.scroll + lay::ROWS {
+            self.scroll = self.selected + 1 - lay::ROWS;
+        }
+        self.scroll_s.snap(self.scroll as f32 * self.px(lay::ROW_H));
+        self.retarget_selection(true);
+        self.hover = Hit::None;
+    }
+
+    /// 키워드 시트를 여닫는 키와 시트 안의 키, 처리했으면 true
+    /// 시트에서 입력 편집 키는 아래 공통 처리로 넘김
+    fn keyword_key(&mut self, vk: VIRTUAL_KEY, ctrl: bool, alt: bool, shift: bool, repeat: bool) -> bool {
+        // F2나 메뉴 키 (Apps, Shift+F10), 시트에선 F2만 닫음
+        let open_key = !ctrl && !alt && ((!shift && matches!(vk, VK_F2 | VK_APPS)) || (shift && vk == VK_F10));
+        if self.view != View::Keywords {
+            if open_key {
+                self.open_keywords(self.selected);
+            }
+            return open_key;
+        }
+        let empty = self.edit.text().is_empty() && self.preedit.is_empty();
+        // Backspace 사이에 다른 키를 누르면 지울 칩 표시를 풂
+        if vk != VK_BACK || !empty {
+            if let Some(k) = &mut self.keyword_edit {
+                k.remove = None;
+            }
+        }
+        if vk == VK_ESCAPE || (open_key && vk == VK_F2) {
+            self.close_keywords();
+        } else if vk == VK_RETURN {
+            self.complete_composition();
+            let q = self.query();
+            if q.trim().is_empty() {
+                self.close_keywords();
+            } else {
+                self.try_add_keyword(&q);
+            }
+        } else if vk == VK_BACK && empty {
+            self.keyword_backspace(repeat);
+        } else {
+            // 시트에선 입력 편집만, 보기 전환·모드 바꾸기·곡 고르기는 막음
+            return alt || matches!(vk, VK_TAB | VK_UP | VK_DOWN | VK_PRIOR | VK_NEXT | VK_APPS | VK_F10 | VK_F2);
+        }
+        true
+    }
+
     /// 보여 줄 내용이 있으면 한 프레임에 그 내용으로, 없으면 직전 내용 그대로 사라짐 (`retarget_panel`)
-    /// 히스토리는 열 때마다 최근 곡으로 다시 채움
+    /// 히스토리는 열 때마다 최근 곡으로 다시 채움, 키워드 시트에선 `close_keywords`로만 나감
     fn set_view(&mut self, v: View) {
-        if self.view == v {
+        if self.view == v || self.view == View::Keywords {
             return;
         }
         self.view = v;
@@ -1162,6 +1477,11 @@ impl Popup {
     /// (글에서 그 글자가 빠짐) 그다음에 입력으로 넘겨주기 때문
     fn requery(&mut self, edit: Edit) {
         self.caret_t0 = Instant::now();
+        // 키워드 입력은 검색하지 않고 안내 문구만 지움
+        if self.view == View::Keywords {
+            self.set_keyword_note(None);
+            return;
+        }
         // 입력하면 글이 바뀌고, 그대로 확정된 글자는 글을 안 바꿈
         // IME가 먼저 조합을 끝낸 경우도 같음 (끝내기 전 글과 비교)
         let was = match (edit, self.ended.take()) {
@@ -1210,6 +1530,9 @@ impl Popup {
     fn search_now(&mut self) -> bool {
         unsafe {
             let _ = KillTimer(Some(self.hwnd), TIMER_SEARCH);
+        }
+        if self.view == View::Keywords {
+            return false; // 키워드를 쓰는 동안 결과는 그대로
         }
         let q = self.query();
         if q == self.searched {
@@ -1263,7 +1586,7 @@ impl Popup {
 
     /// 결과 줄을 고를 수 있음: 검색 결과나 히스토리, 검색어를 지운 뒤 사라지는 중인 줄은 아님
     fn listing(&self) -> bool {
-        !self.searched.trim().is_empty() || self.view == View::History
+        self.view != View::Keywords && (!self.searched.trim().is_empty() || self.view == View::History)
     }
 
     fn row_y(&self, i: usize) -> f32 {
@@ -1457,6 +1780,7 @@ impl Popup {
                 Some((r.0, Action::None))
             }
             WM_IME_STARTCOMPOSITION => {
+                self.set_keyword_note(None);
                 // 선택이 있으면 먼저 지우고 그 자리에서 조합 (검색은 이어 오는 조합 메시지가 함)
                 self.edit.delete_selection();
                 self.place_candidate_window();
@@ -1552,6 +1876,9 @@ impl Popup {
                 let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
                 let alt = msg == WM_SYSKEYDOWN || unsafe { GetKeyState(VK_MENU.0 as i32) } < 0;
                 let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+                if self.keyword_key(vk, ctrl, alt, shift, lp.0 & (1 << 30) != 0) {
+                    return Some((0, Action::None));
+                }
                 // 어디서나 되는 단축키
                 if alt && vk == VIRTUAL_KEY(b'M' as u16) {
                     self.cycle_mode(if shift { -1 } else { 1 });
@@ -1568,6 +1895,9 @@ impl Popup {
                 // 입력 칸 편집 단축키는 어느 보기에서나, 조합 중인 글자는 먼저 확정
                 if ctrl && !shift && !alt && matches!(vk.0 as u8, b'A' | b'C' | b'X' | b'V') {
                     self.complete_composition();
+                    if vk.0 as u8 != b'C' {
+                        self.set_keyword_note(None);
+                    }
                     match vk.0 as u8 {
                         b'A' => self.edit.select_all(),
                         b'C' => {
@@ -1781,6 +2111,13 @@ impl Popup {
                 }
                 Some((0, Action::None))
             }
+            WM_RBUTTONUP => {
+                let (x, y) = (lp.0 as i16 as f32, (lp.0 >> 16) as i16 as f32);
+                if let Hit::Row(i) = self.hit(x, y) {
+                    self.open_keywords(i);
+                }
+                Some((0, Action::None))
+            }
             WM_LBUTTONDOWN => {
                 let (x, y) = (lp.0 as i16 as f32, (lp.0 >> 16) as i16 as f32);
                 let hit = self.hit(x, y);
@@ -1836,6 +2173,14 @@ impl Popup {
                         unsafe {
                             SetCapture(self.hwnd);
                         }
+                        Action::None
+                    }
+                    Hit::Done => {
+                        self.close_keywords();
+                        Action::None
+                    }
+                    Hit::RemoveKeyword(i) => {
+                        self.delete_keyword(i);
                         Action::None
                     }
                     // 예전 검색어 결과가 보이던 줄을 누르면 대신 지금 결과를 띄움
@@ -2041,6 +2386,7 @@ impl Popup {
         };
         let ids: Vec<Option<u32>> = shown.iter().map(|&j| self.rows_of(self.sheet)[j].song().map(|i| self.catalog.songs[i].id)).collect();
         let jackets: Vec<Option<ID2D1Bitmap1>> = ids.into_iter().map(|id| id.and_then(|id| self.jacket(id))).collect();
+        let kw_jacket = self.keyword_song().map(|s| s.id).and_then(|id| self.jacket(id));
 
         let g = self.gfx.as_ref().unwrap();
         let f = self.fonts.as_ref().unwrap();
@@ -2149,27 +2495,43 @@ impl Popup {
                 None,
             )?;
             let ix = bar.left + self.px(24.0);
-            let (lx, ly, lr) = (ix - self.px(1.5), cy - self.px(1.5), self.px(6.0));
-            let handle = vec![gfx::pt(ix + self.px(3.0), cy + self.px(3.0)), gfx::pt(ix + self.px(7.5), cy + self.px(7.5))];
-            dc.DrawGeometry(&g.strokes(&[(gfx::pt(lx, ly), lr)], &[handle])?, &sub_b, 1.5 * s, &round);
+            let keywords = self.view == View::Keywords;
+            if keywords {
+                // 키워드 입력: 돋보기 자리에 같은 크기의 #, 세로 두 줄은 살짝 기울임
+                let p = |x: f32, y: f32| gfx::pt(ix + x * s, cy + y * s);
+                let lines = [
+                    vec![p(-1.8, -7.0), p(-3.4, 7.0)],
+                    vec![p(3.4, -7.0), p(1.8, 7.0)],
+                    vec![p(-6.5, -2.5), p(7.0, -2.5)],
+                    vec![p(-7.0, 2.5), p(6.5, 2.5)],
+                ];
+                dc.DrawGeometry(&g.strokes(&[], &lines)?, &sub_b, 1.5 * s, &round);
+            } else {
+                let (lx, ly, lr) = (ix - self.px(1.5), cy - self.px(1.5), self.px(6.0));
+                let handle = vec![gfx::pt(ix + self.px(3.0), cy + self.px(3.0)), gfx::pt(ix + self.px(7.5), cy + self.px(7.5))];
+                dc.DrawGeometry(&g.strokes(&[(gfx::pt(lx, ly), lr)], &[handle])?, &sub_b, 1.5 * s, &round);
+            }
 
             // 곡 이동 때 고를 채보 "4B · HD", 보여주기만 함 (설정은 톱니 버튼이나 Tab으로 엶)
-            // 레벨 조건 검색 중엔 실제로 적용될 모드·난이도
+            // 레벨 조건 검색 중엔 실제로 적용될 모드·난이도, 키워드 입력 중엔 안 보임
             let cr = self.cond_rect();
-            let (cm, cd) = match Filter::parse(&self.searched).and_then(|f| f.level).filter(|_| self.view == View::Results) {
-                Some(q) => (q.mode.unwrap_or(self.mode_choice), q.diff),
-                None => (self.mode_choice, self.diff_choice),
-            };
-            let cond = format!("{} · {}", cm.label(), cd.label());
-            let cl_ = g.layout_centered(&cond, &f.small, cr.right - cr.left, cr.bottom - cr.top)?;
-            dc.DrawTextLayout(gfx::pt(cr.left, cr.top), &cl_, &sub_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
+            if !keywords {
+                let (cm, cd) = match Filter::parse(&self.searched).and_then(|f| f.level).filter(|_| self.view == View::Results) {
+                    Some(q) => (q.mode.unwrap_or(self.mode_choice), q.diff),
+                    None => (self.mode_choice, self.diff_choice),
+                };
+                let cond = format!("{} · {}", cm.label(), cd.label());
+                let cl_ = g.layout_centered(&cond, &f.small, cr.right - cr.left, cr.bottom - cr.top)?;
+                dc.DrawTextLayout(gfx::pt(cr.left, cr.top), &cl_, &sub_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
+            }
 
             let (tx, _) = self.text_origin();
             let tw = (cr.left - self.px(8.0) - tx).max(10.0);
             let q = self.query();
             if q.is_empty() {
                 let ph = g.brush(FAINT)?;
-                let l = g.layout("곡 검색 · 초성 · 작곡가", &f.placeholder, tw, bar_h)?;
+                let hint = if keywords { "추가할 키워드를 입력해 주세요" } else { "곡 검색 · 초성 · 작곡가" };
+                let l = g.layout(hint, &f.placeholder, tw, bar_h)?;
                 l.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
                 // 커서가 첫 글자를 파고들지 않게 살짝 오른쪽에
                 dc.DrawTextLayout(gfx::pt(tx + self.px(2.0), bar.top), &l, &ph, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
@@ -2314,6 +2676,53 @@ impl Popup {
                     dc.DrawTextLayout(gfx::pt(l0t, y0), &tl, &text_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
                     dc.DrawTextLayout(gfx::pt(l0t, y0 + tm.height + gap), &sl_, &sub_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
                     draw_button(g, &f.item_bold, self.card_button(), button, matches!(self.hover, Hit::CardButton), s)?;
+                } else if let (Sheet::Keywords, Some(song)) = (self.sheet, self.keyword_song()) {
+                    let kl = self.keyword_layout();
+                    // 곡 줄: 결과 줄과 같은 재킷·제목·아랫줄 (선택 강조 없음), 레벨 칸 자리에 완료 버튼
+                    let y = ct + self.row_y(0);
+                    let jsz = self.px(32.0);
+                    let (jx, jy) = (panel.left + self.px(lay::PAD) + self.px(8.0), y + (self.px(lay::ROW_H) - jsz) / 2.0);
+                    if let Some(bmp) = &kw_jacket {
+                        draw_jacket(g, bmp, jx, jy, jsz, self.px(lay::PANEL_R - lay::PAD - 8.0))?;
+                    }
+                    let tx = jx + jsz + self.px(10.0);
+                    let tw = kl.done.left - self.px(8.0) - tx;
+                    let tl = g.layout(&song.name, &f.title, tw, self.px(19.0))?;
+                    dc.DrawTextLayout(gfx::pt(tx, y + self.px(6.67)), &tl, &text_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+                    let sub = format!("{}  ·  {}", song.composer, song.dlc);
+                    let sl_ = g.layout(&sub, &f.sub, tw, self.px(16.0))?;
+                    dc.DrawTextLayout(gfx::pt(tx, y + self.px(26.67)), &sl_, &sub_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+                    draw_button(g, &f.item, kl.done, "완료", self.hover == Hit::Done, s)?;
+
+                    // 라벨·빈 칸 문구·안내 문구는 줄 높이 안 가운데, 잉크가 16 정렬선에 맞음
+                    let faint_b = g.brush(FAINT)?;
+                    let text_line = |text: &str, font: &IDWriteTextFormat, top: f32, h: f32, b: &ID2D1SolidColorBrush| -> Result<()> {
+                        let l = g.layout(text, font, r0 - l0, h)?;
+                        l.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+                        dc.DrawTextLayout(gfx::pt(l0t, top), &l, b, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                        Ok(())
+                    };
+                    text_line("내 키워드", &f.sub, kl.label, self.px(16.0), &sub_b)?;
+                    if song.user_keys.is_empty() {
+                        text_line("아직 없어요", &f.item_regular, kl.chips_top, self.px(28.0), &faint_b)?;
+                    }
+                    // 한 번 더 Backspace를 누르면 지울 칩은 진하게, ×는 호버하거나 지울 칩이면 밝게
+                    let mark = self.keyword_remove_mark();
+                    for (i, ((c, b), word)) in kl.chips.iter().zip(&song.user_keys).enumerate() {
+                        let marked = mark == Some(i);
+                        dc.FillRoundedRectangle(&rounded(*c, self.px(8.0)), &g.brush(white(if marked { FILL_STRONG } else { FILL_HOVER }))?);
+                        let wx = c.left + self.px(10.0);
+                        let wl = g.layout(word, &f.item, b.left - self.px(4.0) - wx, c.bottom - c.top)?;
+                        wl.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+                        dc.DrawTextLayout(gfx::pt(wx, c.top), &wl, &text_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+                        let (bx, by, d) = ((b.left + b.right) / 2.0, (b.top + b.bottom) / 2.0, 3.0 * s);
+                        let cross = [vec![gfx::pt(bx - d, by - d), gfx::pt(bx + d, by + d)], vec![gfx::pt(bx + d, by - d), gfx::pt(bx - d, by + d)]];
+                        let xb = if marked || self.hover == Hit::RemoveKeyword(i) { &text_b } else { &faint_b };
+                        dc.DrawGeometry(&g.strokes(&[], &cross)?, xb, 1.5 * s, &round);
+                    }
+                    if let Some(note) = self.keyword_note() {
+                        text_line(note, &f.sub, kl.note, self.px(16.0), &sub_b)?;
+                    }
                 } else if listed && n_rows == 0 {
                     // 최근 곡이 있는데 이 목록에 하나도 없을 때도 따로 알림
                     let empty = match self.sheet {
@@ -2350,12 +2759,7 @@ impl Popup {
                                 dc.DrawTextLayout(gfx::pt(jx, jy), &il, &text_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
                             }
                         } else if let Some(bmp) = &jackets[k] {
-                            let bb = dc.CreateBitmapBrush(bmp, None, None)?;
-                            let sz = bmp.GetPixelSize();
-                            let sc = jsz / sz.width as f32;
-                            bb.SetTransform(&windows_numerics::Matrix3x2 { M11: sc, M12: 0.0, M21: 0.0, M22: sc, M31: jx, M32: jy });
-                            bb.SetInterpolationMode1(D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
-                            dc.FillRoundedRectangle(&rrect(jx, jy, jx + jsz, jy + jsz, jr), &bb);
+                            draw_jacket(g, bmp, jx, jy, jsz, jr)?;
                         }
                         // 제목, 아랫줄, 레벨 칸의 (난이도, 레벨, 서열표)
                         let (title, sub, level) = match row {
@@ -2422,7 +2826,20 @@ fn baseline(l: &IDWriteTextLayout) -> f32 {
     m[0].baseline
 }
 
-/// 패널 버튼 (설정, 안내 카드): 둥근 채움 (호버·포커스·눌림이면 진하게)과 가운데 글
+/// 재킷을 (`x`, `y`)에서 한 변 `size`로 줄여 둥근 사각형에 채움
+fn draw_jacket(g: &Gfx, bmp: &ID2D1Bitmap1, x: f32, y: f32, size: f32, rad: f32) -> Result<()> {
+    unsafe {
+        let bb = g.dc.CreateBitmapBrush(bmp, None, None)?;
+        let sz = bmp.GetPixelSize();
+        let sc = size / sz.width as f32;
+        bb.SetTransform(&windows_numerics::Matrix3x2 { M11: sc, M12: 0.0, M21: 0.0, M22: sc, M31: x, M32: y });
+        bb.SetInterpolationMode1(D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
+        g.dc.FillRoundedRectangle(&rrect(x, y, x + size, y + size, rad), &bb);
+    }
+    Ok(())
+}
+
+/// 패널 버튼 (설정, 안내 카드, 키워드 완료): 둥근 채움 (호버·포커스·눌림이면 진하게)과 가운데 글
 fn draw_button(g: &Gfx, font: &IDWriteTextFormat, r: D2D_RECT_F, label: &str, lit: bool, s: f32) -> Result<()> {
     unsafe {
         let fill = g.brush(white(if lit { FILL_STRONG } else { FILL_SELECTED }))?;

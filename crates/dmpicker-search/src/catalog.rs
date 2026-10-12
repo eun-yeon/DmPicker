@@ -105,6 +105,8 @@ pub struct Song {
     /// djmax.gg의 곡 자체 이름 (`searchDoc.names`: 읽는 법, 별명)
     /// 같이 쓰는 곡이 많아도 항상 곡 자체의 별칭 (DIE IN과 아티스트 DIEIN 둘 다 "다인")
     pub names: Vec<String>,
+    /// 내 키워드, djmax.gg 데이터엔 없고 앱이 따로 읽어 채움
+    pub user_keys: Vec<String>,
     /// 패턴이 있으면 `[mode][diff]` 레벨
     /// `Some(0)`은 패턴은 있는데 레벨이 없다는 뜻 (지금 데이터엔 없음)
     pub levels: [[Option<u8>; 4]; 4],
@@ -227,6 +229,7 @@ fn parse_entry(i: usize, e: &Value) -> Result<Song, String> {
         composer_keys: string_list(doc.and_then(|d| d.get("composerKeys"))),
         tags: string_list(doc.and_then(|d| d.get("tags"))),
         names: string_list(doc.and_then(|d| d.get("names"))),
+        user_keys: Vec::new(),
         levels,
         floors,
     })

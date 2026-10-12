@@ -1,11 +1,11 @@
 //! 검색기: 미리 펼쳐 둔 검색 문자열 + 등급별 점수
 //!
-//! 곡마다 검색할 문자열 (이름, 별칭, 약어, 작곡가 키, DLC·장르 키) 하나하나가 *키*
+//! 곡마다 검색할 문자열 (이름, 별칭, 내 키워드, 약어, 작곡가 키, DLC·장르 키) 하나하나가 *키*
 //! 키를 `\0`으로 구분해 이어 붙여 긴 문자열 세 개를 만듦
 //!
 //! * `compact`: 정규화한 텍스트 (모든 키)
 //! * `keystroke`: 2벌식 타자 자모 (한글이 든 키만)
-//! * `chosung`: 초성 (한글이 든 이름·별칭 키만)
+//! * `chosung`: 초성 (한글이 든 이름·별칭·키워드 키만)
 //!
 //! 검색은 해당 문자열을 처음부터 끝까지 훑음 (`char` 수백 KB)
 //! 찾은 자리는 위치별 표로 키를 찾아 점수를 매기고, 곡마다 최고 점수만 남김
@@ -31,6 +31,8 @@ enum Kind {
     Name,
     /// `searchDoc.segments`의 제목 별칭·발음
     Alias,
+    /// 내 키워드, compact 완전 일치만 이름보다 위
+    User,
     /// 이름 각 단어의 첫 글자 ("!!New Game Start!!"면 "ngs")
     Acronym,
     Composer,
@@ -54,6 +56,8 @@ const F_ENDS_WORD: u8 = 8;
 const F_CROSSES: u8 = 16;
 
 // ---- 점수 등급 --------------------------------------------------------
+/// 내 키워드 compact 완전 일치, 이름이 똑같은 곡보다도 위
+const USER_EXACT: i32 = NAME_EXACT + 1;
 const NAME_EXACT: i32 = 1000;
 const ALIAS_EXACT: i32 = 950;
 /// 이름이 검색어를 온전한 단어로 시작함 ("zero"로 "Zero-Break")
@@ -381,9 +385,9 @@ fn direct_score(kind: Kind, off: usize, qlen: usize, klen: usize, fl: u8) -> i32
         Kind::Name if word && whole => NAME_WORD + WHOLE_WORD_BONUS - pen,
         Kind::Name if word => NAME_WORD - pen,
         Kind::Name => NAME_SUB - pen,
-        Kind::Alias if exact => ALIAS_EXACT,
-        Kind::Alias if prefix => ALIAS_PREFIX,
-        Kind::Alias => ALIAS_SUB - pen,
+        Kind::Alias | Kind::User if exact => ALIAS_EXACT,
+        Kind::Alias | Kind::User if prefix => ALIAS_PREFIX,
+        Kind::Alias | Kind::User => ALIAS_SUB - pen,
         Kind::Acronym if exact => ACRONYM_EXACT,
         Kind::Acronym if prefix && qlen >= 2 => ACRONYM_PREFIX,
         Kind::Acronym => 0,
@@ -408,9 +412,9 @@ fn chosung_score(kind: Kind, off: usize, qlen: usize, klen: usize, word: bool) -
         Kind::Name if off == 0 => CHO_NAME_PREFIX,
         Kind::Name if word => CHO_NAME_WORD - pen,
         Kind::Name => CHO_NAME_SUB - pen,
-        Kind::Alias if exact => CHO_ALIAS_EXACT,
-        Kind::Alias if off == 0 => CHO_ALIAS_PREFIX,
-        Kind::Alias => CHO_ALIAS_SUB - pen,
+        Kind::Alias | Kind::User if exact => CHO_ALIAS_EXACT,
+        Kind::Alias | Kind::User if off == 0 => CHO_ALIAS_PREFIX,
+        Kind::Alias | Kind::User => CHO_ALIAS_SUB - pen,
         _ => 0,
     }
 }
@@ -420,7 +424,7 @@ fn chosung_score(kind: Kind, off: usize, qlen: usize, klen: usize, word: bool) -
 #[inline]
 fn layout_score(kind: Kind, off: usize, qlen: usize, klen: usize, fl: u8) -> i32 {
     match kind {
-        Kind::Name | Kind::Alias if off == 0 || (kind == Kind::Name && fl & F_WORD != 0) => {
+        Kind::Name | Kind::Alias | Kind::User if off == 0 || (kind == Kind::Name && fl & F_WORD != 0) => {
             direct_score(kind, off, qlen, klen, fl) - LAYOUT_PENALTY
         }
         _ => 0,
@@ -435,7 +439,7 @@ fn bump(best: &mut [i32], song: u32, score: i32) {
     }
 }
 
-/// 만드는 중인 곡별 키 목록 (중복 제거, 먼저 들어온 종류 우선)
+/// 만드는 중인 곡별 키 목록 (중복 제거, 먼저 들어온 종류 우선, 내 키워드는 따로)
 struct KeyList {
     keys: Vec<(Vec<NormChar>, Kind)>,
 }
@@ -446,7 +450,9 @@ impl KeyList {
             || self
                 .keys
                 .iter()
-                .any(|(k, _)| k.iter().map(|n| n.c).eq(v.iter().map(|n| n.c)))
+                .any(|(k, t)| {
+                    (*t == Kind::User) == (kind == Kind::User) && k.iter().map(|n| n.c).eq(v.iter().map(|n| n.c))
+                })
         {
             return;
         }
@@ -560,6 +566,10 @@ impl Searcher {
             for k in s.genres.iter().chain(&group_segs) {
                 list.add(k, Kind::Group);
             }
+            // 이름·별칭과 같은 키워드도 따로 넣음, 이름 키의 단어 점수가 남게
+            for k in &s.user_keys {
+                list.add(k, Kind::User);
+            }
 
             // 검색 문자열에 펼쳐 넣음
             let (c0, k0, h0) = (
@@ -593,7 +603,7 @@ impl Searcher {
                 }
                 keystroke.push_key(si32, *kind, &units);
 
-                if matches!(kind, Kind::Name | Kind::Alias) {
+                if matches!(kind, Kind::Name | Kind::Alias | Kind::User) {
                     units.clear();
                     for nc in key {
                         let mut flag = F_START | word(nc);
@@ -665,14 +675,17 @@ impl Searcher {
 
         // 1. 모든 키에서 compact (음절까지 정확한) 매치
         let ql = q.compact.len();
-        let mut whole = false; // 검색어가 후보 곡의 이름·별칭·아티스트와 똑같음
+        let mut whole = false; // 검색어가 후보 곡의 이름·별칭·키워드·아티스트와 똑같음
         self.compact.for_each_match(&q.compact, |key, off, fl| {
-            whole |= off == 0 && ql == key.len as usize && matches!(key.kind, Kind::Name | Kind::Alias | Kind::Composer) && allow(key.song as usize);
+            let exact = off == 0 && ql == key.len as usize;
+            whole |= exact && matches!(key.kind, Kind::Name | Kind::Alias | Kind::User | Kind::Composer) && allow(key.song as usize);
             if mid_word_into_next(fl) {
                 return;
             }
             let word = fl & F_WORD != 0;
-            let s = if q.all_consonants && off > 0 {
+            let s = if exact && key.kind == Kind::User {
+                USER_EXACT
+            } else if q.all_consonants && off > 0 {
                 // "ㄷㄱㄷㄱㄷㄷ" 같은 자모뿐인 별칭 안이면 강한 부분 매치가 아니라 초성 매치
                 chosung_score(key.kind, off, ql, key.len as usize, word)
             } else {
@@ -748,12 +761,12 @@ impl Searcher {
                 }
                 let (a, z) = hay.song_keys[song];
                 for key in &hay.keys[a as usize..z as usize] {
-                    if !matches!(key.kind, Kind::Name | Kind::Alias) {
+                    if !matches!(key.kind, Kind::Name | Kind::Alias | Kind::User) {
                         continue;
                     }
                     let text = &hay.text[key.start as usize..(key.start + key.len) as usize];
                     if let Some(d) = prefix_typos(needle, text, max, &mut rows) {
-                        let alias = if key.kind == Kind::Alias { 10 } else { 0 };
+                        let alias = if matches!(key.kind, Kind::Alias | Kind::User) { 10 } else { 0 };
                         *b = (*b).max(TYPO - TYPO_EDIT * d as i32 - alias);
                     }
                 }
@@ -780,7 +793,7 @@ impl Searcher {
                     }
                     let (a, z) = hay.song_keys[song];
                     for key in &hay.keys[a as usize..z as usize] {
-                        if !matches!(key.kind, Kind::Name | Kind::Alias) || (key.len as usize) < nl
+                        if !matches!(key.kind, Kind::Name | Kind::Alias | Kind::User) || (key.len as usize) < nl
                         {
                             continue;
                         }

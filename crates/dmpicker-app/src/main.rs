@@ -10,6 +10,7 @@ mod edit;
 mod gfx;
 mod hands;
 mod hotkey;
+mod keywords;
 mod pace;
 mod popup;
 mod sys;
@@ -502,7 +503,7 @@ fn main() -> Result<()> {
         }
 
         let dir = data_dir();
-        let catalog = match catalog::Catalog::load(&dir) {
+        let mut catalog = match catalog::Catalog::load(&dir) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("failed to load catalog from {}: {e}", dir.display());
@@ -511,6 +512,7 @@ fn main() -> Result<()> {
                 return Ok(());
             }
         };
+        catalog.load_keywords(store_dir().join("keywords.json"));
         println!("catalog: {} songs from {}", catalog.songs.len(), dir.display());
 
         let ex = WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOREDIRECTIONBITMAP;
