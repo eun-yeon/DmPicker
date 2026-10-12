@@ -120,6 +120,7 @@ mod lay {
     pub const CARD_H: f32 = 84.0;
     pub const CARD_BTN_W: f32 = 112.0;
     pub const COND_W: f32 = 52.0; // 글은 가운데, 오른쪽 끝이 16 정렬선
+    pub const TEXT_FADE: f32 = 16.0; // 입력 칸 글이 가려진 쪽 가장자리를 흐리는 최대 폭
     pub const PANEL_MAX: f32 = PAD * 2.0 + ROW_H * ROWS as f32; // 304
     /// 히스토리 맨 위 탭 띠: 위 8 + 세그먼트 32, 그 아래 8은 줄 목록의 PAD (6줄이면 344)
     pub const TABS_H: f32 = PAD + 32.0;
@@ -693,6 +694,15 @@ fn text_x(l: &IDWriteTextLayout, s: &str, at: usize) -> f32 {
     let mut m = DWRITE_HIT_TEST_METRICS::default();
     let _ = unsafe { l.HitTestTextPosition(u - 1, true, &mut x, &mut y, &mut m) };
     x
+}
+
+/// 입력 칸 (왼쪽, 오른쪽) 가장자리를 흐릴 폭, 글이 가려진 쪽만 가려진 만큼 `max`까지, 캐럿을 넘어 들어오진 않음
+/// `field`는 그라데이션을 까는 클립의 (왼쪽, 오른쪽) 끝, `text`는 글의 (왼쪽, 오른쪽) 끝
+/// `caret`은 (조합 글자 앞, 뒤) x라 조합 중이면 조합 글자도 안 흐림, x는 모두 클라이언트 px
+fn edge_fades(field: (f32, f32), text: (f32, f32), caret: (f32, f32), max: f32) -> (f32, f32) {
+    let left = (field.0 - text.0).min(caret.0 - field.0);
+    let right = (text.1 - field.1).min(field.1 - caret.1);
+    (left.clamp(0.0, max), right.clamp(0.0, max))
 }
 
 fn inside(r: &D2D_RECT_F, x: f32, y: f32) -> bool {
@@ -3376,6 +3386,7 @@ impl Popup {
             }
             // 캐럿 (조합 중이면 조합 글자 뒤)이 입력 칸 안에 오게 가로로 밈
             let caret_x = text_x(&l, &q, c + self.preedit.len());
+            let end = text_x(&l, &q, q.len());
             let room = tw - self.px(3.0);
             let mut scroll = self.text_scroll;
             if caret_x - scroll > room {
@@ -3383,9 +3394,25 @@ impl Popup {
             } else if caret_x < scroll {
                 scroll = caret_x;
             }
-            self.text_scroll = scroll.clamp(0.0, (text_x(&l, &q, q.len()) - room).max(0.0));
+            self.text_scroll = scroll.clamp(0.0, (end - room).max(0.0));
             let ox = tx - self.text_scroll;
-            dc.PushAxisAlignedClip(&rect(tx - self.px(2.0), bar.top, tx + tw, bar.bottom), D2D1_ANTIALIAS_MODE_ALIASED);
+            let field = rect(tx - self.px(2.0), bar.top, tx + tw, bar.bottom);
+            dc.PushAxisAlignedClip(&field, D2D1_ANTIALIAS_MODE_ALIASED);
+            // 글이 가려진 쪽 가장자리는 잘린 끝 대신 흐리게, 캐럿은 빼고
+            let (fl, fr) = edge_fades((field.left, field.right), (ox, ox + end), (ox + text_x(&l, &q, c), ox + caret_x), self.px(lay::TEXT_FADE));
+            // 레이어 브러시에 대한 우리 참조 (있으면 레이어를 넣은 것), PopLayer 뒤 이 블록이 끝날 때 해제
+            let edge_brush = if fl > 0.0 || fr > 0.0 {
+                let w = field.right - field.left;
+                let edge = |f: f32| if f > 0.0 { 0.0 } else { 1.0 };
+                let stops = [(0.0, edge(fl)), (fl / w, 1.0), (1.0 - fr / w, 1.0), (1.0, edge(fr))]
+                    .map(|(position, a)| D2D1_GRADIENT_STOP { position, color: white(a) });
+                let ob = g.gradient(&stops, gfx::pt(field.left, 0.0), gfx::pt(field.right, 0.0))?;
+                let mut lp = D2D1_LAYER_PARAMETERS1 { contentBounds: field, opacityBrush: std::mem::ManuallyDrop::new(Some(ob.into())), ..fade_layer(1.0) };
+                dc.PushLayer(&lp, None);
+                std::mem::ManuallyDrop::into_inner(std::mem::replace(&mut lp.opacityBrush, std::mem::ManuallyDrop::new(None)))
+            } else {
+                None
+            };
             let selection = self.edit.selection().filter(|_| self.preedit.is_empty());
             if let Some((a, b)) = selection {
                 let sb = g.brush(white(FILL_STRONG))?;
@@ -3393,6 +3420,9 @@ impl Popup {
                 dc.FillRoundedRectangle(&rrect(x0, cy - self.px(11.0), x1, cy + self.px(11.0), self.px(3.0)), &sb);
             }
             dc.DrawTextLayout(gfx::pt(ox, bar.top), &l, &text_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+            if edge_brush.is_some() {
+                dc.PopLayer();
+            }
             let blink_on = ((now - self.caret_t0).as_millis() / CARET_BLINK_MS as u128).is_multiple_of(2);
             if blink_on && self.preedit.is_empty() && selection.is_none() && !self.closing {
                 let cx = ox + caret_x + self.px(1.0);

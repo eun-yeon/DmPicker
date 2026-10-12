@@ -209,23 +209,19 @@ impl Gfx {
         Ok(b)
     }
 
-    /// `top`에서 `bottom`으로 가는 세로 선형 그라데이션
-    pub fn vertical_gradient(&self, stops: &[D2D1_GRADIENT_STOP], top: f32, bottom: f32) -> Result<ID2D1LinearGradientBrush> {
+    /// `from`에서 `to`로 가는 선형 그라데이션
+    pub fn gradient(&self, stops: &[D2D1_GRADIENT_STOP], from: windows_numerics::Vector2, to: windows_numerics::Vector2) -> Result<ID2D1LinearGradientBrush> {
         unsafe {
             let rt: &ID2D1RenderTarget = &self.dc;
             let coll = rt.CreateGradientStopCollection(stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)?;
-            self.dc.CreateLinearGradientBrush(
-                &D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES { startPoint: pt(0.0, top), endPoint: pt(0.0, bottom) },
-                None,
-                &coll,
-            )
+            self.dc.CreateLinearGradientBrush(&D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES { startPoint: from, endPoint: to }, None, &coll)
         }
     }
 
     /// 판 테두리 선의 빛: 위는 밝게, 옆은 흐리게, 아래는 은은하게 (검색창과 알림이 같음)
     pub fn rim_gradient(&self, top: f32, bottom: f32, alpha: f32) -> Result<ID2D1LinearGradientBrush> {
         let stops = [(0.0, 0.22), (0.3, 0.10), (1.0, 0.06)].map(|(position, a)| D2D1_GRADIENT_STOP { position, color: white(a * alpha) });
-        self.vertical_gradient(&stops, top, bottom)
+        self.gradient(&stops, pt(0.0, top), pt(0.0, bottom))
     }
 
     /// 원 (중심, 반지름)과 열린 꺾은선을 한 경로로 묶어 한 번에 그림
