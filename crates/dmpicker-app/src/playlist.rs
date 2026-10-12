@@ -404,6 +404,8 @@ fn fetch(id: &str) -> Result<Playlist, Failure> {
             std::ptr::null(),
             WINHTTP_FLAG_SECURE,
         ))?;
+        // 헤더를 조금씩 보내도 전체 응답 헤더 대기는 10초로 제한
+        WinHttpSetOption(Some(req.0), WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT, Some(&10_000u32.to_ne_bytes())).map_err(failed)?;
         WinHttpSendRequest(req.0, None, None, 0, 0, 0).map_err(failed)?;
         WinHttpReceiveResponse(req.0, std::ptr::null_mut()).map_err(failed)?;
         let (mut status, mut size) = (0u32, 4u32);
