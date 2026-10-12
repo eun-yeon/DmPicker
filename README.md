@@ -1,16 +1,14 @@
-<div align="center">
-  <img src="crates/dmpicker-app/assets/icon.ico" alt="DM PICKER" width="120" height="120">
+<img src="crates/dmpicker-app/assets/icon.ico" alt="DM PICKER" width="72" height="72">
 
-  <h1>DM PICKER</h1>
+# DM PICKER
 
-  <p>
-    <strong>찾는 곡으로 바로 이동하는 곡 검색기</strong>
-  </p>
-</div>
+찾는 곡으로 바로 이동하는 곡 검색기
 
-<div align="center">
-  <img src=".github/assets/preview.png" alt="Screenshot" width="560">
-</div>
+[![GitHub release](https://img.shields.io/github/v/release/eun-yeon/DmPicker?logo=github)](https://github.com/eun-yeon/DmPicker/releases)
+[![GitHub downloads](https://img.shields.io/github/downloads/eun-yeon/DmPicker/total?logo=github)](https://github.com/eun-yeon/DmPicker/releases/latest)
+[![GitHub license](https://img.shields.io/github/license/eun-yeon/DmPicker?logo=github)](LICENSE)
+
+<img src=".github/assets/preview.png" alt="Screenshot" width="560">
 
 ## 개요
 
@@ -24,9 +22,11 @@
 
 ## 주요 기능
 
-**검색**: 곡 이름 · 초성 · 작곡가 · 별명 · 레벨 (`sc15`, `4b sc14-15`) · BPM (`bpm:150~180`, `sc14 bpm:200~`)
+**검색**: 곡 이름 · 초성 · 작곡가 · 별명 · 내 키워드 · 레벨 (`sc15`, `4b sc14-15`) · BPM (`bpm:150~180`, `sc14 bpm:200~`)
 
-**이동**: 고른 곡으로 바로 이동 · 버튼 모드와 난이도 맞추기 · 무작위로 고르기 · 최근 고른 곡
+**플레이리스트**: djmax.gg 플레이리스트 주소로 곡 목록 불러오기 · 배치 · 목표 · 코멘트 보기
+
+**이동**: 고른 곡으로 바로 이동 · 버튼 모드와 난이도 맞추기 · 무작위로 고르기 · 최근 고른 곡과 플레이리스트
 
 **화면**: 프리스타일과 온라인 방 · 해상도와 화면 비율 자동 인식
 
@@ -36,7 +36,7 @@
 
 실행하면 작업 표시줄 알림 영역에 아이콘이 생깁니다. 아이콘 메뉴에서 Windows 시작 시 실행을 켤 수 있습니다.
 
-설정과 인식한 곡 목록은 `%appdata%/DmPicker` 폴더에 저장됩니다.
+설정, 인식한 곡 목록, 내 키워드, 최근 기록은 `%appdata%/DmPicker` 폴더에 저장됩니다.
 
 ## 사용법
 
@@ -44,7 +44,19 @@
 2. 처음 한 번은 **목록 인식**으로 내 곡 목록을 읽어 와야 합니다. 읽는 동안에는 키보드와 마우스를 잠시 쉬어 주세요.
 3. 곡을 검색하고 Enter를 누르면 그 곡으로 이동합니다.
 
-버튼 모드, 난이도, 검색창 단축키, 검색어 유지는 검색창 오른쪽의 설정에서 바꿀 수 있습니다. 검색어 유지를 켜면 검색창을 다시 열 때 마지막 검색어가 남아 있습니다.
+버튼 모드, 난이도, 검색창 단축키, 검색어 유지는 검색창 오른쪽의 설정에서 바꿀 수 있습니다. 
+검색어 유지를 켜면 검색창을 다시 열 때 마지막 검색어와 고른 줄이 남아 있습니다.
+
+### 내 키워드
+
+검색 결과에서 곡을 우클릭하거나 `F2`를 누르면 그 곡에 내 키워드를 붙일 수 있습니다.
+붙인 키워드로 검색하면 설정한 곡이 맨 위에 나오며 키워드는 앱이나 곡 데이터를 새로 받아도 지워지지 않습니다.
+
+### 플레이리스트
+
+디맥지지 플레이리스트 주소 (`https://djmax.gg/playlist/...`)를 검색창에 붙여 넣으면 그 플레이리스트의 곡이 순서대로 나옵니다.
+곡을 고르면 플레이리스트에 정해진 버튼 모드와 난이도로 이동하고, 배치 · 목표 · 코멘트는 목록 아래에 보입니다.
+플레이리스트에서 고른 곡은 최근 기록에 플레이리스트로 남아, 다시 열면 마지막으로 고른 곡부터 이어 갈 수 있습니다.
 
 ## 사용 팁
 
@@ -59,6 +71,8 @@
 
 > [!NOTE]
 > DM PICKER는 화면을 보고 키보드 입력만 보냅니다. 게임 파일이나 메모리는 건드리지 않습니다.
+>
+> 인터넷은 플레이리스트 주소를 검색할 때만 djmax.gg에서 곡 목록을 받아 오는 데 씁니다.
 
 ## 개발
 
@@ -67,6 +81,7 @@
 - **언어**: Rust
 - **화면**: Direct2D · DirectComposition
 - **캡처**: PrintWindow · GDI
+- **통신**: WinHTTP
 
 ### 빌드
 
