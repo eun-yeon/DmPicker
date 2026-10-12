@@ -1818,13 +1818,13 @@ impl Popup {
         self.playlist.as_ref().is_some_and(|p| p.waiting)
     }
 
-    /// 플레이리스트 결과의 무작위 줄 아랫줄: 이름, 뽑을 곡 수, 다음에 뽑을 수 있는 곡이 적으면 남은 수
+    /// 플레이리스트 결과의 무작위 줄 아랫줄: 뽑을 곡 수, 다음에 뽑을 수 있는 곡이 적으면 남은 수 (이름은 아래 설명 줄에 나옴)
     fn playlist_random_note(&self) -> Option<String> {
-        let data = self.playlist_data()?;
+        self.playlist_data()?;
         let n = picks(&self.results).count();
         let m = self.rolls.choices(&self.results).0.count();
         let left = if m < n { format!(" ({m}개 남음)") } else { String::new() };
-        Some(format!("{} · {n}곡 중 하나{left}", data.name))
+        Some(format!("{n}곡 중 하나{left}"))
     }
 
     /// 플레이리스트 결과를 보는 중 (바의 채보 글자를 숨김), 입력 중인 주소가 아니라 검색한 결과 기준
