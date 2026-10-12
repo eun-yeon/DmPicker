@@ -1,4 +1,4 @@
-//! 검색창: 너비 480 px 고정, 알림과 같은 반투명 판, 호버하면 나오는 히스토리·톱니 버튼,
+//! 검색창: 너비 540 px 고정, 알림과 같은 반투명 판, 호버하면 나오는 히스토리·톱니 버튼,
 //! 결과 자리에 뜨는 설정·히스토리 시트, 한글 IME, 키보드·마우스
 
 use std::borrow::Cow;
@@ -98,7 +98,7 @@ const BEAD_STAGGER: Duration = Duration::from_millis(70);
 
 /// 논리 (96 dpi) 레이아웃, 검색창 전체 너비는 늘 `W`
 mod lay {
-    pub const W: f32 = 480.0;
+    pub const W: f32 = 540.0;
     pub const MARGIN: f32 = 32.0; // 그림자 자리
     pub const BAR_H: f32 = 46.0;
     pub const BAR_R: f32 = 23.0;
@@ -113,7 +113,7 @@ mod lay {
     pub const ROWS: usize = 6;
     pub const LEVEL_W: f32 = 60.0; // 줄 오른쪽 끝의 레벨 칸
     pub const PLAYLIST_LEVEL_W: f32 = 72.0; // 플레이리스트 결과는 모드까지, 가장 긴 "8B · MX 15"가 약 66
-    pub const SETTINGS_H: f32 = 348.0; // 맨 아래 줄(버튼 높이 30) 아래 16 (= 오른쪽 여백)
+    pub const SETTINGS_H: f32 = 402.0; // 맨 아래 줄(버튼 높이 30) 아래 16 (= 오른쪽 여백)
     pub const TOGGLE_W: f32 = 42.0;
     pub const TOGGLE_H: f32 = 24.0;
     pub const KNOB: f32 = 18.0; // 둘레 3
@@ -124,7 +124,7 @@ mod lay {
     /// 히스토리 맨 위 탭 띠: 위 8 + 세그먼트 32, 그 아래 8은 줄 목록의 PAD (6줄이면 344)
     pub const TABS_H: f32 = PAD + 32.0;
     /// 키워드 칩 줄 한도: 칩 위 88, 아래 안내 문구·여백 44를 빼고 창 높이에 드는 줄 (칩 28 + 간격 6)
-    pub const CHIP_LINES: usize = ((PANEL_MAX.max(SETTINGS_H) - 88.0 - 44.0 + 6.0) / 34.0) as usize; // 6
+    pub const CHIP_LINES: usize = ((PANEL_MAX.max(SETTINGS_H) - 88.0 - 44.0 + 6.0) / 34.0) as usize; // 8
     /// 플레이리스트 결과 아래 칸의 글 줄 높이와 줄 수 한도, 넘는 코멘트는 말줄임
     pub const NOTE_LINE: f32 = 19.0;
     pub const NOTE_LINES: usize = 5;
@@ -164,7 +164,7 @@ pub enum Action {
     PlaylistPick(String, Pattern),
     Hide,
     Scan,
-    /// 모드·난이도 바뀜 (저장해야 함)
+    /// 모드·난이도·토글 바뀜 (저장해야 함)
     Choice,
     /// 새 단축키를 받음, 등록해 보고 [`Popup::hotkey_result`]로 알려야 함
     Hotkey(Hotkey),
@@ -433,7 +433,7 @@ enum Hit {
     DiffSeg(usize),
     Rescan,
     Hotkey,
-    KeepQuery,
+    Toggle(Toggle),
     CardButton,
     Row(usize),
     /// 히스토리 맨 위 탭의 한 칸
@@ -444,6 +444,43 @@ enum Hit {
     Done,
     /// i번째 키워드 칩의 × 버튼
     RemoveKeyword(usize),
+}
+
+/// 설정 시트의 토글, 값이 `toggles`의 자리
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Toggle {
+    KeepQuery,
+    ShowDlc,
+}
+
+/// 토글 하나의 노브·색·눌림, 서로 다른 속도로 움직임
+struct ToggleMotion {
+    knob: Tween,  // 노브 자리 0 끔 .. 1 켬 (살짝 넘침)
+    tint: Tween,  // 색 0 끔 .. 1 켬
+    press: Tween, // 노브 세로 배율, 누르는 동안 줄어듦
+}
+
+impl ToggleMotion {
+    fn new() -> Self {
+        Self { knob: Tween::new(0.0), tint: Tween::new(0.0), press: Tween::new(1.0) }
+    }
+
+    fn snap(&mut self, on: bool) {
+        let v = on as u8 as f32;
+        self.knob.snap(v);
+        self.tint.snap(v);
+        self.press.snap(1.0);
+    }
+
+    fn go(&mut self, on: bool) {
+        let v = on as u8 as f32;
+        self.knob.go(v, KNOB_SECS, KNOB_EASE);
+        self.tint.go(v, QUICK_SECS, QUICK_EASE);
+    }
+
+    fn done(&self) -> bool {
+        [self.knob, self.tint, self.press].iter().all(|t| t.done())
+    }
 }
 
 /// 글이 바뀐 이유, `requery`에서 씀
@@ -472,6 +509,9 @@ struct SettingsLayout {
     keep_title: f32,
     keep: D2D_RECT_F, // 토글
     keep_note: f32,
+    dlc_title: f32,
+    dlc: D2D_RECT_F, // 토글
+    dlc_note: f32,
 }
 
 /// 물리 px 기준 키워드 시트: 클릭 영역과 각 글줄의 위쪽
@@ -513,6 +553,8 @@ pub struct Popup {
     playlist_request: Option<String>,
     /// 다시 열 때 지난 검색어와 결과 선택을 남김 (앱이 불러오고 저장함)
     pub keep_query: bool,
+    /// 결과 아랫줄에 DLC도 표시 (앱이 불러오고 저장함)
+    pub show_dlc: bool,
     /// 결과 보기에서 닫을 때 고른 줄과 스크롤, 다음 열기에서만 씀
     kept_row: Option<(Row, usize)>,
     /// 입력한 글, 캐럿과 선택 (조합 중인 글자는 `preedit`에 따로, 캐럿 자리에 그림)
@@ -522,7 +564,7 @@ pub struct Popup {
     high_surrogate: Option<u16>,
     /// 검색 결과
     results: Vec<Row>,
-    /// 결과가 BPM 조건 검색이라 아랫줄에 DLC 대신 BPM
+    /// 결과가 BPM 조건 검색이라 아랫줄에 DLC 표시와 상관없이 BPM
     bpm_rows: bool,
     /// 히스토리의 마지막 탭, 다시 열어도 그대로
     history_tab: HistoryTab,
@@ -547,8 +589,8 @@ pub struct Popup {
     wheel_acc: i32, // 아직 줄로 안 바꾼 휠 값 (정밀 휠, 터치패드)
     view: View,
     sheet: Sheet,
-    kb_focus: Option<usize>, // 설정 키보드 포커스: 0 모드, 1 난이도, 2 다시 인식, 3 단축키, 4 검색어 유지
-    keep_down: bool,         // 검색어 유지 토글을 누른 채 (떼면 바뀜)
+    kb_focus: Option<usize>, // 설정 키보드 포커스: 0 모드, 1 난이도, 2 다시 인식, 3 단축키, 4 검색어 유지, 5 DLC 표시
+    toggle_down: Option<Toggle>, // 누른 토글 (떼면 바뀜)
     keyword_edit: Option<KeywordEdit>,
     hover: Hit,
     // 애니메이션
@@ -565,9 +607,7 @@ pub struct Popup {
     seg: [Tween; 3],        // 세그먼트 손잡이 [모드, 난이도, 히스토리 탭]: 왼쪽 끝, 칸 단위
     list_shown: Tween,      // 히스토리 줄 목록 보임 0 .. 1, 탭을 바꾸면 옛 목록이 사라진 뒤 나타남
     star: Option<StarMotion>, // 키워드 시트 별 버튼 모션, 시트를 닫으면 버림
-    knob: Tween,            // 토글 노브 자리 0 끔 .. 1 켬 (살짝 넘침)
-    knob_tint: Tween,       // 토글 색 0 끔 .. 1 켬
-    knob_press: Tween,      // 노브 세로 배율, 누르는 동안 줄어듦
+    toggles: [ToggleMotion; 2], // 검색어 유지, DLC 표시
     hover_since: Option<Instant>,
     leave_since: Option<Instant>,
     in_zone: bool, // 커서가 두 버튼을 드러내는 영역에 있음
@@ -618,8 +658,8 @@ impl Foot {
     }
 }
 
-/// 아래 칸 `foot`을 빼고 창 높이 (설정 시트 348)에 드는 줄 수, 아래 칸이 없으면 `ROWS`
-/// 코멘트가 5줄에서 잘려서 효과 줄이 있어도 4줄은 남음
+/// 아래 칸 `foot`을 빼고 창 높이 (설정 시트 402)에 드는 줄 수, 아래 칸이 없으면 `ROWS`
+/// 코멘트가 5줄에서 잘려서 효과 줄이 있어도 5줄은 남음
 fn page_above(foot: Option<&Foot>) -> usize {
     let Some(foot) = foot else { return lay::ROWS };
     let room = lay::PANEL_MAX.max(lay::SETTINGS_H) - lay::PAD - foot.height();
@@ -690,6 +730,7 @@ impl Popup {
             playlist: None,
             playlist_request: None,
             keep_query: true,
+            show_dlc: false,
             kept_row: None,
             edit: Editor::default(),
             preedit: String::new(),
@@ -711,7 +752,7 @@ impl Popup {
             view: View::Results,
             sheet: Sheet::Results,
             kb_focus: None,
-            keep_down: false,
+            toggle_down: None,
             keyword_edit: None,
             hover: Hit::None,
             open_s: OPEN_SPRING,
@@ -727,9 +768,7 @@ impl Popup {
             seg: [Tween::new(0.0); 3],
             list_shown: Tween::new(1.0),
             star: None,
-            knob: Tween::new(0.0),
-            knob_tint: Tween::new(0.0),
-            knob_press: Tween::new(1.0),
+            toggles: [ToggleMotion::new(), ToggleMotion::new()],
             hover_since: None,
             leave_since: None,
             in_zone: false,
@@ -787,7 +826,7 @@ impl Popup {
                 || !self.list_shown.done()
                 || self.old_list.as_ref().is_some_and(|(_, fade)| !fade.done())
                 || self.star.as_ref().is_some_and(|m| !m.done(m.elapsed()))
-                || [self.knob, self.knob_tint, self.knob_press].iter().any(|t| !t.done())
+                || self.toggles.iter().any(|t| !t.done())
                 || self.hover_since.is_some()
                 || self.leave_since.is_some())
     }
@@ -902,10 +941,9 @@ impl Popup {
         self.reset_query();
         self.retarget_panel();
         self.snap_segments();
-        let on = self.keep_query as u8 as f32;
-        self.knob.snap(on);
-        self.knob_tint.snap(on);
-        self.knob_press.snap(1.0);
+        self.toggle_down = None;
+        self.toggles[Toggle::KeepQuery as usize].snap(self.keep_query);
+        self.toggles[Toggle::ShowDlc as usize].snap(self.show_dlc);
         self.hover_since = None;
         self.leave_since = None;
         self.in_zone = false;
@@ -1187,6 +1225,10 @@ impl Popup {
             keep_title: y(300.0),
             keep: rect(r - self.px(lay::TOGGLE_W), y(317.0 - lay::TOGGLE_H / 2.0), r, y(317.0 + lay::TOGGLE_H / 2.0)),
             keep_note: y(320.0),
+            // DLC 표시도 같은 묶음 (검색어 유지에서 24), 토글은 버튼 줄(356..386) 가운데
+            dlc_title: y(354.0),
+            dlc: rect(r - self.px(lay::TOGGLE_W), y(371.0 - lay::TOGGLE_H / 2.0), r, y(371.0 + lay::TOGGLE_H / 2.0)),
+            dlc_note: y(374.0),
         }
     }
 
@@ -1380,7 +1422,7 @@ impl Popup {
             let mut m = DWRITE_TEXT_METRICS::default();
             unsafe { l.GetMetrics(&mut m) }.ok().map(|_| m.lineCount as usize)
         });
-        let lines = lines.unwrap_or(1).clamp(1, lay::NOTE_LINES);
+        let lines = lines.unwrap_or_else(|| note.lines().count()).clamp(1, lay::NOTE_LINES);
         Some(Foot { meta, note, comment: comment.is_some(), lines })
     }
 
@@ -1473,9 +1515,10 @@ impl Popup {
                 return Hit::Hotkey;
             }
             // 토글은 작아서 둘레를 조금 더, 위아래는 버튼 줄만큼
-            let k = sl.keep;
-            if inside(&rect(k.left - self.px(6.0), k.top - self.px(3.0), k.right, k.bottom + self.px(3.0)), x, y) {
-                return Hit::KeepQuery;
+            for (k, toggle) in [(sl.keep, Toggle::KeepQuery), (sl.dlc, Toggle::ShowDlc)] {
+                if inside(&rect(k.left - self.px(6.0), k.top - self.px(3.0), k.right, k.bottom + self.px(3.0)), x, y) {
+                    return Hit::Toggle(toggle);
+                }
             }
             return Hit::Inside;
         }
@@ -2170,6 +2213,15 @@ impl Popup {
         self.catalog.songs.iter().find(|s| s.id == title)
     }
 
+    /// 곡 아랫줄에서 작곡가 뒤에 붙는 꼬리, BPM 조건 검색 결과는 늘 BPM, 아니면 DLC 표시를 켰을 때만 DLC
+    fn sub_tail(&self, song: &Song, bpm: bool) -> Option<String> {
+        if bpm {
+            Some(format!("  ·  BPM {}", song.bpm))
+        } else {
+            self.show_dlc.then(|| format!("  ·  {}", song.dlc))
+        }
+    }
+
     /// 히스토리 `row`번째 줄의 플레이리스트: 주소 id, 마지막으로 고른 패턴, 사본
     fn history_playlist(&self, row: usize) -> Option<(&str, Pattern, Option<&Playlist>)> {
         let Row::Playlist(i) = *self.history.get(row)? else { return None };
@@ -2385,18 +2437,26 @@ impl Popup {
         self.rolls.draw(&self.results, self.rng.next())
     }
 
-    /// 검색어 유지를 바꿈, 노브와 색이 따로 움직임
-    fn set_keep_query(&mut self, on: bool) {
-        self.keep_query = on;
-        let v = on as u8 as f32;
-        self.knob.go(v, KNOB_SECS, KNOB_EASE);
-        self.knob_tint.go(v, QUICK_SECS, QUICK_EASE);
+    fn toggle_value(&self, toggle: Toggle) -> bool {
+        match toggle {
+            Toggle::KeepQuery => self.keep_query,
+            Toggle::ShowDlc => self.show_dlc,
+        }
+    }
+
+    /// 토글 값을 바꿈, 노브와 색이 따로 움직임
+    fn set_toggle(&mut self, toggle: Toggle, on: bool) {
+        match toggle {
+            Toggle::KeepQuery => self.keep_query = on,
+            Toggle::ShowDlc => self.show_dlc = on,
+        }
+        self.toggles[toggle as usize].go(on);
     }
 
     /// 토글에서 손을 뗌, 노브가 원으로 돌아옴
     fn release_toggle(&mut self) {
-        if std::mem::take(&mut self.keep_down) {
-            self.knob_press.go(1.0, QUICK_SECS, QUICK_EASE);
+        if let Some(toggle) = self.toggle_down.take() {
+            self.toggles[toggle as usize].press.go(1.0, QUICK_SECS, QUICK_EASE);
             unsafe {
                 let _ = ReleaseCapture();
             }
@@ -2661,7 +2721,7 @@ impl Popup {
                         }
                         VK_DOWN => {
                             // 처음 누른 화살표는 첫 컨트롤로
-                            self.kb_focus = Some(if self.kb_focus.is_some() { (f + 1).min(4) } else { 0 });
+                            self.kb_focus = Some(if self.kb_focus.is_some() { (f + 1).min(5) } else { 0 });
                             Action::None
                         }
                         VK_LEFT | VK_RIGHT => {
@@ -2678,7 +2738,11 @@ impl Popup {
                                 }
                                 // 토글은 왼쪽이 끔, 오른쪽이 켬
                                 4 if (d > 0) != self.keep_query => {
-                                    self.set_keep_query(d > 0);
+                                    self.set_toggle(Toggle::KeepQuery, d > 0);
+                                    Action::Choice
+                                }
+                                5 if (d > 0) != self.show_dlc => {
+                                    self.set_toggle(Toggle::ShowDlc, d > 0);
                                     Action::Choice
                                 }
                                 _ => Action::None,
@@ -2690,7 +2754,11 @@ impl Popup {
                             Action::None
                         }
                         VK_RETURN if f == 4 => {
-                            self.set_keep_query(!self.keep_query);
+                            self.set_toggle(Toggle::KeepQuery, !self.keep_query);
+                            Action::Choice
+                        }
+                        VK_RETURN if f == 5 => {
+                            self.set_toggle(Toggle::ShowDlc, !self.show_dlc);
                             Action::Choice
                         }
                         VK_BACK => {
@@ -2909,10 +2977,10 @@ impl Popup {
                         Action::None
                     }
                     // 누르는 동안 노브가 눌리고, 토글 위에서 떼면 바뀜
-                    Hit::KeepQuery => {
+                    Hit::Toggle(toggle) => {
                         self.kb_focus = None;
-                        self.keep_down = true;
-                        self.knob_press.go(PRESS_Y, PRESS_SECS, PRESS_EASE);
+                        self.toggle_down = Some(toggle);
+                        self.toggles[toggle as usize].press.go(PRESS_Y, PRESS_SECS, PRESS_EASE);
                         unsafe {
                             SetCapture(self.hwnd);
                         }
@@ -2949,12 +3017,13 @@ impl Popup {
                 self.end_drag();
                 Some((0, Action::None))
             }
-            WM_LBUTTONUP if self.keep_down => {
+            WM_LBUTTONUP if self.toggle_down.is_some() => {
                 let (x, y) = (lp.0 as i16 as f32, (lp.0 >> 16) as i16 as f32);
-                let over = self.hit(x, y) == Hit::KeepQuery;
+                let toggle = self.toggle_down.unwrap();
+                let over = self.hit(x, y) == Hit::Toggle(toggle);
                 self.release_toggle();
                 if over {
-                    self.set_keep_query(!self.keep_query);
+                    self.set_toggle(toggle, !self.toggle_value(toggle));
                     return Some((0, Action::Choice));
                 }
                 Some((0, Action::None))
@@ -2962,8 +3031,8 @@ impl Popup {
             WM_CAPTURECHANGED => {
                 self.dragging = false;
                 // 다른 데로 캡처를 뺏기면 안 바꾸고 놓음
-                if std::mem::take(&mut self.keep_down) {
-                    self.knob_press.go(1.0, QUICK_SECS, QUICK_EASE);
+                if let Some(toggle) = self.toggle_down.take() {
+                    self.toggles[toggle as usize].press.go(1.0, QUICK_SECS, QUICK_EASE);
                 }
                 None
             }
@@ -3094,6 +3163,28 @@ impl Popup {
             self.drop_gfx();
         }
         r
+    }
+
+    /// 줄의 아랫줄을 (`x`, `y`)부터 너비 `w`에 그림, 다 들어가면 꼬리까지 한 덩어리로
+    /// 넘치면 꼬리는 다 보이게 두고 앞 글만 말줄임한 뒤 그 바로 뒤에 꼬리를 이음
+    /// 서열표 기준선을 맞추게 맨 앞 레이아웃을 돌려줌
+    fn draw_sub(&self, x: f32, y: f32, w: f32, text: &str, tail: Option<&str>, b: &ID2D1SolidColorBrush) -> Result<IDWriteTextLayout> {
+        let (g, f) = (self.gfx.as_ref().unwrap(), self.fonts.as_ref().unwrap());
+        let draw = |text: &str, x: f32, w: f32| -> Result<IDWriteTextLayout> {
+            let l = g.layout(text, &f.sub, w, self.px(16.0))?;
+            unsafe { g.dc.DrawTextLayout(gfx::pt(x, y), &l, b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT) };
+            Ok(l)
+        };
+        let Some(tail) = tail else { return draw(text, x, w) };
+        let full = format!("{text}{tail}");
+        if self.measure(&full, |f| &f.sub) <= w {
+            return draw(&full, x, w);
+        }
+        let l = draw(text, x, w - self.measure(tail, |f| &f.sub))?;
+        let mut m = DWRITE_TEXT_METRICS::default();
+        unsafe { l.GetMetrics(&mut m)? };
+        draw(tail, x + m.widthIncludingTrailingWhitespace, w - m.widthIncludingTrailingWhitespace)?;
+        Ok(l)
     }
 
     fn draw_frame(&mut self) -> Result<()> {
@@ -3422,30 +3513,25 @@ impl Popup {
                             None => {}
                         },
                     }
-                    // 제목, 아랫줄
-                    let (title, sub) = match row {
+                    // 제목, 아랫줄과 그 꼬리
+                    let (title, sub, tail) = match row {
                         Row::Random => {
                             let sub = self.playlist_random_note().unwrap_or_else(|| self.rolls.note(rows));
-                            (Cow::Borrowed("무작위로 고르기"), sub)
+                            (Cow::Borrowed("무작위로 고르기"), Cow::Owned(sub), None)
                         }
                         Row::Playlist(_) => {
                             let (title, sub) = self.history_playlist_text(j).unwrap_or_default();
-                            (Cow::Owned(title), sub)
+                            (Cow::Owned(title), Cow::Owned(sub), None)
                         }
                         Row::Unavailable(e) => {
                             let name = self.playlist_row_name(j).unwrap_or_default();
-                            let sub = self.unavailable_song(e).map(|s| format!("{}  ·  {}", s.composer, s.dlc)).unwrap_or_default();
-                            (Cow::Owned(name), sub)
+                            let song = self.unavailable_song(e);
+                            (Cow::Owned(name), Cow::Borrowed(song.map_or("", |s| s.composer.as_str())), song.and_then(|s| self.sub_tail(s, false)))
                         }
                         Row::Song(i) | Row::Chart(i, ..) => {
                             let song = &self.catalog.songs[i];
-                            // BPM 조건 검색 결과는 DLC 대신 BPM
-                            let sub = if self.bpm_rows && self.sheet == Sheet::Results {
-                                format!("{}  ·  BPM {}", song.composer, song.bpm)
-                            } else {
-                                format!("{}  ·  {}", song.composer, song.dlc)
-                            };
-                            (Cow::Borrowed(song.name.as_str()), sub)
+                            let tail = self.sub_tail(song, self.bpm_rows && self.sheet == Sheet::Results);
+                            (Cow::Borrowed(song.name.as_str()), Cow::Borrowed(song.composer.as_str()), tail)
                         }
                     };
                     let (title_b, line_b) = if dim { (&off_b, &off_b) } else { (&text_b, &sub_b) };
@@ -3455,8 +3541,7 @@ impl Popup {
                     let (title_y, sub_y) = (y + self.px(6.67), y + self.px(26.67));
                     let tl = g.layout(&title, &f.title, tw, self.px(19.0))?;
                     dc.DrawTextLayout(gfx::pt(tx, title_y), &tl, title_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
-                    let sl_ = g.layout(&sub, &f.sub, tw, self.px(16.0))?;
-                    dc.DrawTextLayout(gfx::pt(tx, sub_y), &sl_, line_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+                    let sl_ = self.draw_sub(tx, sub_y, tw, &sub, tail.as_deref(), line_b)?;
 
                     // 레벨 칸: 레벨 "HD 11"은 곡 이름과, 서열표 "13.4"는 아랫줄과 같은 글자 기준선
                     // 그 모드·난이도 패턴이 없는 곡은 비우고 (플레이리스트는 채보만), 서열표가 없는 패턴은 아래만 비움
@@ -3547,12 +3632,18 @@ impl Popup {
                     };
                     let nl3 = g.layout(note, &f.sub, sl.hotkey.left - self.px(12.0) - l0, self.px(18.0))?;
                     dc.DrawTextLayout(gfx::pt(l0t, sl.hotkey_note), &nl3, nb, D2D1_DRAW_TEXT_OPTIONS_NONE);
-                    let kt = g.layout("검색어 유지", &f.item_bold, self.px(200.0), self.px(20.0))?;
-                    dc.DrawTextLayout(gfx::pt(l0t, sl.keep_title), &kt, &text_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
-                    let nl4 = g.layout("다시 열면 마지막 검색어가 남아 있어요", &f.sub, sl.keep.left - self.px(12.0) - l0, self.px(18.0))?;
-                    dc.DrawTextLayout(gfx::pt(l0t, sl.keep_note), &nl4, &note_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
-                    let knob = (self.knob.value(), self.knob_tint.value(), self.knob_press.value());
-                    draw_toggle(g, sl.keep, knob, self.hover == Hit::KeepQuery || self.kb_focus == Some(4), s)?;
+                    // 토글 줄은 같은 모양: 제목, 토글 왼쪽 12까지 설명, 버튼 줄 가운데 토글
+                    for (title, note, title_y, note_y, r, toggle, focus) in [
+                        ("검색어 유지", "다시 열면 마지막 검색어가 남아 있어요", sl.keep_title, sl.keep_note, sl.keep, Toggle::KeepQuery, 4),
+                        ("DLC 표시", "작곡가 옆에 DLC 이름을 표기해요", sl.dlc_title, sl.dlc_note, sl.dlc, Toggle::ShowDlc, 5),
+                    ] {
+                        let tl = g.layout(title, &f.item_bold, self.px(200.0), self.px(20.0))?;
+                        dc.DrawTextLayout(gfx::pt(l0t, title_y), &tl, &text_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                        let nl = g.layout(note, &f.sub, r.left - self.px(12.0) - l0, self.px(18.0))?;
+                        dc.DrawTextLayout(gfx::pt(l0t, note_y), &nl, &note_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                        let m = &self.toggles[toggle as usize];
+                        draw_toggle(g, r, (m.knob.value(), m.tint.value(), m.press.value()), self.hover == Hit::Toggle(toggle) || self.kb_focus == Some(focus), s)?;
+                    }
                 } else if let (Sheet::Card, Some((title, sub, button))) = (self.sheet, self.notice()) {
                     let top = ct;
                     let tw = r0 - l0 - self.px(lay::CARD_BTN_W + 12.0);
@@ -3580,9 +3671,7 @@ impl Popup {
                     let tw = kl.fav.left - self.px(8.0) - tx;
                     let tl = g.layout(&song.name, &f.title, tw, self.px(19.0))?;
                     dc.DrawTextLayout(gfx::pt(tx, y + self.px(6.67)), &tl, &text_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
-                    let sub = format!("{}  ·  {}", song.composer, song.dlc);
-                    let sl_ = g.layout(&sub, &f.sub, tw, self.px(16.0))?;
-                    dc.DrawTextLayout(gfx::pt(tx, y + self.px(26.67)), &sl_, &sub_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+                    self.draw_sub(tx, y + self.px(26.67), tw, &song.composer, self.sub_tail(song, false).as_deref(), &sub_b)?;
                     draw_button(g, &f.item, kl.done, "완료", self.hover == Hit::Done, s)?;
                     // 별 버튼: 완료와 같은 바탕에 별, 꺼지면 테두리만 글자색, 켜지면 테두리·채움이 노랑 (`StarMotion`)
                     // 18 DIP 상자에 16 단위 별, 켤 땐 가운데를 중심으로 눌렸다 돌아오고 버튼 가운데에서 점이 튐
