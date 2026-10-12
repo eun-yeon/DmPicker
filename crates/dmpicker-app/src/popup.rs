@@ -24,6 +24,7 @@ use crate::gfx::{
     FAVORITE, FILL_HOVER, FILL_SELECTED, FILL_STRONG, FILL_TRACK, PLATE_ALPHA, SUB, TEXT, TINT,
 };
 use crate::hotkey::Hotkey;
+use crate::icons::Icon;
 use crate::playlist::{self, Entry, Failure, Library, Pattern, Playlist, Recent, Reply};
 use crate::sys;
 
@@ -76,19 +77,6 @@ const STAR_POP_SECS: f32 = 0.35;
 const STAR_POP_EASE: Ease = Ease(0.34, 1.96, 0.64, 1.0);
 /// 튀는 점이 나타나고 멀어지는 곡선 (`Spark::at`)
 const SPARK_EASE: Ease = Ease(0.0, 0.0, 0.58, 1.0);
-/// 별 꼭짓점 (16 단위, 가운데 8, 8), 18 DIP 상자에 맞춰 그림
-const STAR_POINTS: [(f32, f32); 10] = [
-    (8.00, 1.85),
-    (9.85, 6.10),
-    (14.47, 6.55),
-    (11.00, 9.62),
-    (12.00, 14.15),
-    (8.00, 11.80),
-    (4.00, 14.15),
-    (5.00, 9.62),
-    (1.53, 6.55),
-    (6.15, 6.10),
-];
 
 /// 바 오른쪽 버튼 순서 (`bead_circle`)
 const BEAD_HISTORY: usize = 0;
@@ -121,6 +109,10 @@ mod lay {
     pub const CARD_BTN_W: f32 = 112.0;
     pub const COND_W: f32 = 52.0; // 글은 가운데, 오른쪽 끝이 16 정렬선
     pub const TEXT_FADE: f32 = 16.0; // 입력 칸 글이 가려진 쪽 가장자리를 흐리는 최대 폭
+    /// 아이콘 상자, 256 단위 경로를 이 크기로 줄여 그림 (선 굵기 약 1.25)
+    pub const ICON: f32 = 20.0;
+    /// 키워드 칩 ×만 작게, 굵은 ×라 선 굵기 약 1
+    pub const CHIP_X: f32 = 11.0;
     pub const PANEL_MAX: f32 = PAD * 2.0 + ROW_H * ROWS as f32; // 304
     /// 히스토리 맨 위 탭 띠: 위 8 + 세그먼트 32, 그 아래 8은 줄 목록의 PAD (6줄이면 344)
     pub const TABS_H: f32 = PAD + 32.0;
@@ -143,9 +135,6 @@ struct Fonts {
     item_bold: IDWriteTextFormat,
     item_regular: IDWriteTextFormat,
     small: IDWriteTextFormat,
-    icon: Option<IDWriteTextFormat>,
-    /// 히스토리 시계, 같은 크기면 톱니보다 잉크가 적어 작고 가늘어 보여서 조금 크게
-    icon_history: Option<IDWriteTextFormat>,
 }
 
 struct Effects {
@@ -1035,7 +1024,6 @@ impl Popup {
 
     fn init_resources(&mut self) -> Result<()> {
         let g = self.gfx.as_ref().unwrap();
-        let icon_family = ["Segoe Fluent Icons", "Segoe MDL2 Assets"].into_iter().find(|f| g.font_exists(f));
         let s = self.scale;
         self.fonts = Some(Fonts {
             input: g.ui_format(18.0 * s, DWRITE_FONT_WEIGHT_NORMAL)?,
@@ -1047,8 +1035,6 @@ impl Popup {
             item_bold: g.ui_format(13.0 * s, DWRITE_FONT_WEIGHT_SEMI_BOLD)?,
             item_regular: g.ui_format(13.0 * s, DWRITE_FONT_WEIGHT_NORMAL)?,
             small: g.ui_format(11.0 * s, DWRITE_FONT_WEIGHT_SEMI_BOLD)?,
-            icon: icon_family.and_then(|f| g.text_format(f, 19.0 * s, DWRITE_FONT_WEIGHT_NORMAL).ok()),
-            icon_history: icon_family.and_then(|f| g.text_format(f, 20.5 * s, DWRITE_FONT_WEIGHT_NORMAL).ok()),
         });
 
         // 모양 마스크: 작은 블러 + 알파 임계값, 거의 닿을 때만 모양이 녹아 붙음
@@ -3348,33 +3334,11 @@ impl Popup {
             let cy = (bar.top + bar.bottom) / 2.0;
             let text_b = g.brush(TEXT)?;
             let sub_b = g.brush(SUB)?;
-            // 끝과 이음이 둥근 선 (돋보기, #, 칩 ×, 별)
-            let round = g.factory.CreateStrokeStyle(
-                &D2D1_STROKE_STYLE_PROPERTIES1 {
-                    startCap: D2D1_CAP_STYLE_ROUND,
-                    endCap: D2D1_CAP_STYLE_ROUND,
-                    lineJoin: D2D1_LINE_JOIN_ROUND,
-                    ..Default::default()
-                },
-                None,
-            )?;
-            let ix = bar.left + self.px(24.0);
+            let icon_box = self.px(lay::ICON);
+            // 입력 칸 앞: 검색은 돋보기, 키워드 입력은 같은 자리에 #
             let keywords = self.view == View::Keywords;
-            if keywords {
-                // 키워드 입력: 돋보기 자리에 같은 크기의 #, 세로 두 줄은 살짝 기울임
-                let p = |x: f32, y: f32| gfx::pt(ix + x * s, cy + y * s);
-                let lines = [
-                    vec![p(-1.8, -7.0), p(-3.4, 7.0)],
-                    vec![p(3.4, -7.0), p(1.8, 7.0)],
-                    vec![p(-6.5, -2.5), p(7.0, -2.5)],
-                    vec![p(-7.0, 2.5), p(6.5, 2.5)],
-                ];
-                dc.DrawGeometry(&g.strokes(&[], &lines)?, &sub_b, 1.5 * s, &round);
-            } else {
-                let (lx, ly, lr) = (ix - self.px(1.5), cy - self.px(1.5), self.px(6.0));
-                let handle = vec![gfx::pt(ix + self.px(3.0), cy + self.px(3.0)), gfx::pt(ix + self.px(7.5), cy + self.px(7.5))];
-                dc.DrawGeometry(&g.strokes(&[(gfx::pt(lx, ly), lr)], &[handle])?, &sub_b, 1.5 * s, &round);
-            }
+            let lead = if keywords { Icon::Hash } else { Icon::MagnifyingGlass };
+            g.fill_icon(lead, bar.left + self.px(24.0), cy, icon_box, &sub_b)?;
 
             // 곡 이동 때 고를 채보 "4B · HD", 보여주기만 함 (설정은 톱니 버튼이나 Tab으로 엶)
             // 레벨 조건 검색 중엔 실제로 적용될 모드·난이도, 키워드 입력 중엔 안 보임
@@ -3468,11 +3432,8 @@ impl Popup {
             // 5) 히스토리·톱니 버튼, 아이콘은 버튼마다 따로 나타남 (`bead_shown`)
             // 그 보기가 열려 있으면 눌린 채, 아니면 호버할 때 밝아짐
             let ia = self.icon_alpha.value();
-            let icons = [
-                (BEAD_HISTORY, Hit::History, View::History, "\u{E81C}", &f.icon_history),
-                (BEAD_GEAR, Hit::Gear, View::Settings, "\u{E713}", &f.icon),
-            ];
-            for (k, hit, view, glyph, icon) in icons {
+            let icons = [(BEAD_HISTORY, Hit::History, View::History, Icon::CardsThree), (BEAD_GEAR, Hit::Gear, View::Settings, Icon::Gear)];
+            for (k, hit, view, icon) in icons {
                 let (bx, by, brr) = beads[k];
                 let ia = ia * self.bead_shown(k);
                 if ia <= 0.01 {
@@ -3484,13 +3445,7 @@ impl Popup {
                     dc.FillEllipse(&circle(bx, by, brr), &hb);
                 }
                 let ink = if lit { TEXT } else { SUB };
-                let ib = g.brush(with_alpha(ink, ia))?;
-                if let Some(icf) = icon {
-                    let il = g.layout_centered(glyph, icf, brr * 2.0, brr * 2.0)?;
-                    dc.DrawTextLayout(gfx::pt(bx - brr, by - brr), &il, &ib, D2D1_DRAW_TEXT_OPTIONS_NONE);
-                } else {
-                    dc.DrawEllipse(&circle(bx, by, self.px(6.0)), &ib, 1.5 * s, None);
-                }
+                g.fill_icon(icon, bx, by, icon_box, &g.brush(with_alpha(ink, ia))?)?;
             }
 
             // 패널 내용은 다 편 시트 자리 기준
@@ -3551,11 +3506,8 @@ impl Popup {
                         // 재킷 자리에 아이콘: 무작위 줄은 셔플, 히스토리의 플레이리스트는 목록
                         Row::Random | Row::Playlist(_) => {
                             dc.FillRoundedRectangle(&rrect(jx, jy, jx + jsz, jy + jsz, jr), &g.brush(white(FILL_HOVER))?);
-                            if let Some(icf) = &f.icon {
-                                let glyph = if row == Row::Random { "\u{E8B1}" } else { "\u{E90B}" };
-                                let il = g.layout_centered(glyph, icf, jsz, jsz)?;
-                                dc.DrawTextLayout(gfx::pt(jx, jy), &il, &text_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
-                            }
+                            let icon = if row == Row::Random { Icon::Shuffle } else { Icon::Playlist };
+                            g.fill_icon(icon, jx + jsz / 2.0, jy + jsz / 2.0, icon_box, &text_b)?;
                         }
                         _ => match &jackets[k] {
                             Some(bmp) => draw_jacket(g, bmp, jx, jy, jsz, jr, if dim { DISABLED.a } else { 1.0 })?,
@@ -3726,20 +3678,18 @@ impl Popup {
                     dc.DrawTextLayout(gfx::pt(tx, y + self.px(6.67)), &tl, &text_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
                     self.draw_sub(tx, y + self.px(26.67), tw, &song.composer, self.sub_tail(song, false).as_deref(), &sub_b)?;
                     draw_button(g, &f.item, kl.done, "완료", self.hover == Hit::Done, s)?;
-                    // 별 버튼: 완료와 같은 바탕에 별, 꺼지면 테두리만 글자색, 켜지면 테두리·채움이 노랑 (`StarMotion`)
-                    // 18 DIP 상자에 16 단위 별, 켤 땐 가운데를 중심으로 눌렸다 돌아오고 버튼 가운데에서 점이 튐
+                    // 별 버튼: 완료와 같은 바탕에 별, 꺼지면 테두리만 글자색, 켜지면 테두리도 노랑으로 바뀌고 노랑 채움을 겹침 (`StarMotion`)
+                    // 켤 땐 가운데를 중심으로 눌렸다 돌아오고 버튼 가운데에서 점이 튐
                     draw_button_fill(g, kl.fav, self.hover == Hit::Favorite, s)?;
                     let (sx, sy) = ((kl.fav.left + kl.fav.right) / 2.0, (kl.fav.top + kl.fav.bottom) / 2.0);
                     let (on, pop) = self.star_now();
                     let on = alpha_step(on);
-                    let unit = 18.0 / 16.0 * s * pop;
-                    let star = g.polygon(&STAR_POINTS.map(|(x, y)| gfx::pt(sx + (x - 8.0) * unit, sy + (y - 8.0) * unit)))?;
-                    if on > 0.0 {
-                        dc.FillGeometry(&star, &g.brush(with_alpha(FAVORITE, on))?, None);
-                    }
                     let mix = |a: f32, b: f32| a + (b - a) * on;
                     let ink = color(mix(TEXT.r, FAVORITE.r), mix(TEXT.g, FAVORITE.g), mix(TEXT.b, FAVORITE.b), mix(TEXT.a, FAVORITE.a));
-                    dc.DrawGeometry(&star, &g.brush(ink)?, 1.5 * unit, &round);
+                    g.fill_icon(Icon::Star, sx, sy, icon_box * pop, &g.brush(ink)?)?;
+                    if on > 0.0 {
+                        g.fill_icon(Icon::StarFill, sx, sy, icon_box * pop, &g.brush(with_alpha(FAVORITE, on))?)?;
+                    }
                     if let Some(m) = &self.star {
                         let t = m.elapsed();
                         for sp in &m.sparks {
@@ -3770,10 +3720,8 @@ impl Popup {
                         let wl = g.layout(word, &f.item, b.left - self.px(4.0) - wx, c.bottom - c.top)?;
                         wl.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
                         dc.DrawTextLayout(gfx::pt(wx, c.top), &wl, &text_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
-                        let (bx, by, d) = ((b.left + b.right) / 2.0, (b.top + b.bottom) / 2.0, 3.0 * s);
-                        let cross = [vec![gfx::pt(bx - d, by - d), gfx::pt(bx + d, by + d)], vec![gfx::pt(bx + d, by - d), gfx::pt(bx - d, by + d)]];
                         let xb = if marked || self.hover == Hit::RemoveKeyword(i) { &text_b } else { &faint_b };
-                        dc.DrawGeometry(&g.strokes(&[], &cross)?, xb, 1.5 * s, &round);
+                        g.fill_icon(Icon::XBold, (b.left + b.right) / 2.0, (b.top + b.bottom) / 2.0, self.px(lay::CHIP_X), xb)?;
                     }
                     if let Some(note) = self.keyword_note() {
                         text_line(note, &f.sub, kl.note, self.px(16.0), &sub_b)?;

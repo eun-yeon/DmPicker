@@ -1,4 +1,4 @@
-//! DirectComposition 위 Direct2D 기반: 팝업 창의 픽셀별 알파 서피스, 효과 도우미, 텍스트 형식,
+//! DirectComposition 위 Direct2D 기반: 팝업 창의 픽셀별 알파 서피스, 효과 도우미, 텍스트 형식, 아이콘,
 //! 검색창과 알림이 같이 쓰는 색과 그림자
 
 use windows::core::{Error, Interface, Result, HSTRING};
@@ -11,6 +11,8 @@ use windows::Win32::Graphics::DirectComposition::*;
 use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
+
+use crate::icons::{Icon, VIEW};
 
 // 색: 어두운 판 위에 불투명도만 다른 흰색
 // 글자·아이콘·채움이 판처럼 배경색을 띠고, 배경이 얼마나 밝든 진하기 순서가 유지됨
@@ -80,6 +82,7 @@ pub struct Gfx {
     // 애니메이션 중엔 프레임마다 객체를 새로 만드는 게 CPU를 제일 많이 써서 캐시함
     brushes: std::cell::RefCell<std::collections::HashMap<[u32; 4], ID2D1SolidColorBrush>>,
     layouts: std::cell::RefCell<std::collections::HashMap<(usize, String, u32, u32), IDWriteTextLayout>>,
+    icons: std::cell::RefCell<std::collections::HashMap<Icon, ID2D1PathGeometry1>>,
 }
 
 impl Gfx {
@@ -146,6 +149,7 @@ impl Gfx {
                 max_fps,
                 brushes: Default::default(),
                 layouts: Default::default(),
+                icons: Default::default(),
             };
             g.bind_target()?;
             g.retune(hwnd);
@@ -224,68 +228,35 @@ impl Gfx {
         self.gradient(&stops, pt(0.0, top), pt(0.0, bottom))
     }
 
-    /// 원 (중심, 반지름)과 열린 꺾은선을 한 경로로 묶어 한 번에 그림
-    /// 반투명 브러시가 선이 겹치거나 만나는 곳에서 두 번 칠해지지 않음
-    pub fn strokes(&self, circles: &[(windows_numerics::Vector2, f32)], lines: &[Vec<windows_numerics::Vector2>]) -> Result<ID2D1PathGeometry1> {
+    /// 아이콘을 가운데 (`cx`, `cy`)에 한 변 `size`인 상자로 채움, 경로는 처음 한 번만 만듦
+    pub fn fill_icon(&self, icon: Icon, cx: f32, cy: f32, size: f32, brush: &ID2D1SolidColorBrush) -> Result<()> {
+        let cached = self.icons.borrow().get(&icon).cloned();
+        let path = match cached {
+            Some(p) => p,
+            None => {
+                let p = crate::icons::geometry(&self.factory, icon)?;
+                self.icons.borrow_mut().insert(icon, p.clone());
+                p
+            }
+        };
+        let k = size / VIEW;
+        let place = windows_numerics::Matrix3x2 { M11: k, M12: 0.0, M21: 0.0, M22: k, M31: cx - VIEW / 2.0 * k, M32: cy - VIEW / 2.0 * k };
         unsafe {
-            let path = self.factory.CreatePathGeometry()?;
-            let sink = path.Open()?;
-            for &(c, r) in circles {
-                sink.BeginFigure(pt(c.X + r, c.Y), D2D1_FIGURE_BEGIN_HOLLOW);
-                for x in [c.X - r, c.X + r] {
-                    sink.AddArc(&D2D1_ARC_SEGMENT {
-                        point: pt(x, c.Y),
-                        size: D2D_SIZE_F { width: r, height: r },
-                        rotationAngle: 0.0,
-                        sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
-                        arcSize: D2D1_ARC_SIZE_SMALL,
-                    });
-                }
-                sink.EndFigure(D2D1_FIGURE_END_CLOSED);
-            }
-            for line in lines {
-                let Some((first, rest)) = line.split_first() else { continue };
-                sink.BeginFigure(*first, D2D1_FIGURE_BEGIN_HOLLOW);
-                for p in rest {
-                    sink.AddLine(*p);
-                }
-                sink.EndFigure(D2D1_FIGURE_END_OPEN);
-            }
-            sink.Close()?;
-            Ok(path)
+            let mut xf = windows_numerics::Matrix3x2::identity();
+            self.dc.GetTransform(&mut xf);
+            self.dc.SetTransform(&(place * xf));
+            self.dc.FillGeometry(&path, brush, None);
+            self.dc.SetTransform(&xf);
         }
-    }
-
-    /// 꼭짓점을 차례로 이은 닫힌 도형, 채우기와 테두리에 같이 씀
-    pub fn polygon(&self, points: &[windows_numerics::Vector2]) -> Result<ID2D1PathGeometry1> {
-        unsafe {
-            let path = self.factory.CreatePathGeometry()?;
-            let sink = path.Open()?;
-            if let Some((first, rest)) = points.split_first() {
-                sink.BeginFigure(*first, D2D1_FIGURE_BEGIN_FILLED);
-                sink.AddLines(rest);
-                sink.EndFigure(D2D1_FIGURE_END_CLOSED);
-            }
-            sink.Close()?;
-            Ok(path)
-        }
+        Ok(())
     }
 
     /// UI 글자 형식, 넣어 둔 프리텐다드로 그림
     pub fn ui_format(&self, size: f32, weight: DWRITE_FONT_WEIGHT) -> Result<IDWriteTextFormat> {
-        self.format(UI_FAMILY, self.ui_fonts.as_ref(), size, weight)
-    }
-
-    /// 설치된 글꼴의 글자 형식 (아이콘)
-    pub fn text_format(&self, family: &str, size: f32, weight: DWRITE_FONT_WEIGHT) -> Result<IDWriteTextFormat> {
-        self.format(family, None, size, weight)
-    }
-
-    fn format(&self, family: &str, fonts: Option<&IDWriteFontCollection>, size: f32, weight: DWRITE_FONT_WEIGHT) -> Result<IDWriteTextFormat> {
         unsafe {
             let f = self.dwrite.CreateTextFormat(
-                &HSTRING::from(family),
-                fonts,
+                &HSTRING::from(UI_FAMILY),
+                self.ui_fonts.as_ref(),
                 weight,
                 DWRITE_FONT_STYLE_NORMAL,
                 DWRITE_FONT_STRETCH_NORMAL,
@@ -297,19 +268,6 @@ impl Gfx {
             let sign = self.dwrite.CreateEllipsisTrimmingSign(&f)?;
             f.SetTrimming(&trimming, &sign)?;
             Ok(f)
-        }
-    }
-
-    pub fn font_exists(&self, family: &str) -> bool {
-        unsafe {
-            let mut coll = None;
-            if self.dwrite.GetSystemFontCollection(&mut coll, false).is_err() {
-                return false;
-            }
-            let Some(coll) = coll else { return false };
-            let mut idx = 0u32;
-            let mut exists = windows::core::BOOL(0);
-            coll.FindFamilyName(&HSTRING::from(family), &mut idx, &mut exists).is_ok() && exists.as_bool()
         }
     }
 

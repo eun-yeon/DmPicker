@@ -10,6 +10,7 @@ mod edit;
 mod gfx;
 mod hands;
 mod hotkey;
+mod icons;
 mod keywords;
 mod pace;
 mod playlist;

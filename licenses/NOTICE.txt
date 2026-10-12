@@ -6,3 +6,6 @@ DJMAX, DJMAX RESPECT V는 NEOWIZ의 상표입니다.
 
 UI 글꼴 Pretendard는 SIL Open Font License 1.1로 배포됩니다.
 전문은 Pretendard-OFL.txt에 있습니다.
+
+아이콘 Phosphor Icons는 MIT License로 배포됩니다.
+전문은 Phosphor-MIT.txt에 있습니다.
