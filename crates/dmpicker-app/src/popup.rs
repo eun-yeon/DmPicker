@@ -342,8 +342,10 @@ pub struct Popup {
     pub diff_choice: Diff,
     /// 최근 고른 곡 id, 최신순 (앱이 불러오고 저장함)
     pub recent: Vec<u32>,
-    /// 다시 열 때 지난 검색어를 남김 (앱이 불러오고 저장함)
+    /// 다시 열 때 지난 검색어와 결과 선택을 남김 (앱이 불러오고 저장함)
     pub keep_query: bool,
+    /// 결과 보기에서 닫을 때 고른 줄과 스크롤, 다음 열기에서만 씀
+    kept_row: Option<(Row, usize)>,
     /// 입력한 글, 캐럿과 선택 (조합 중인 글자는 `preedit`에 따로, 캐럿 자리에 그림)
     edit: Editor,
     preedit: String,
@@ -474,6 +476,7 @@ impl Popup {
             diff_choice: Diff::NM,
             recent: Vec::new(),
             keep_query: false,
+            kept_row: None,
             edit: Editor::default(),
             preedit: String::new(),
             high_surrogate: None,
@@ -656,21 +659,7 @@ impl Popup {
         self.owned = owned;
         self.stale = stale;
 
-        // 닫을 때 조합 중이던 글자까지 보이던 그대로
-        let kept = if self.keep_query { self.query() } else { String::new() };
-        self.edit.clear();
-        self.preedit.clear();
-        self.high_surrogate = None;
-        self.text_scroll = 0.0;
         self.dragging = false;
-        self.results.clear();
-        self.sheet = Sheet::Results;
-        self.sel_of = Sheet::Results;
-        self.searched.clear();
-        self.seen.clear();
-        self.ended = None;
-        self.reset_rows();
-        self.view = View::Results;
         self.kb_focus = None;
         self.hover = Hit::None;
         self.closing = false;
@@ -685,13 +674,7 @@ impl Popup {
         self.icon_alpha.snap(0.0);
         self.panel_h.snap(0.0);
         self.shown.snap(0.0);
-        // 검색어 유지: 지난 글을 다 선택해 둠 (치면 바뀌고 Enter면 같은 검색), 결과는 이번 목록으로 다시 찾음
-        if !kept.is_empty() {
-            self.edit.insert(&kept);
-            self.edit.select_all();
-            self.seen = kept;
-            self.search_now();
-        }
+        self.reset_query();
         self.retarget_panel();
         self.snap_segments();
         let on = self.keep_query as u8 as f32;
@@ -734,6 +717,12 @@ impl Popup {
         if !self.visible || self.closing {
             return;
         }
+        // 검색이 아직 새 글을 따라잡지 못했으면 지난 결과의 선택은 안 남김
+        self.kept_row = if self.keep_query && self.view == View::Results && self.listing() && self.query() == self.searched {
+            self.results.get(self.selected).copied().map(|row| (row, self.scroll))
+        } else {
+            None
+        };
         self.closing = true;
         self.end_hotkey_wait();
         self.end_drag();
@@ -1346,13 +1335,7 @@ impl Popup {
         self.searched.clear();
         self.search_now();
         self.retarget_panel();
-        self.selected = self.rows().iter().position(|r| *r == row).unwrap_or(0);
-        self.scroll = scroll.min(self.rows().len().saturating_sub(lay::ROWS)).min(self.selected);
-        if self.selected >= self.scroll + lay::ROWS {
-            self.scroll = self.selected + 1 - lay::ROWS;
-        }
-        self.scroll_s.snap(self.scroll as f32 * self.px(lay::ROW_H));
-        self.retarget_selection(true);
+        self.restore_row(row, scroll);
         self.hover = Hit::None;
     }
 
@@ -1576,6 +1559,40 @@ impl Popup {
         if self.sel_of == Sheet::History {
             self.reset_rows();
         }
+    }
+
+    /// 다시 열 때 입력과 결과를 준비, 검색어 유지가 켜져 있으면 이번 목록에서 같은 줄을 찾음
+    fn reset_query(&mut self) {
+        // 닫을 때 조합 중이던 글자까지 보이던 그대로
+        let kept = if self.keep_query { self.query() } else { String::new() };
+        let row = self.kept_row.take().filter(|_| self.keep_query);
+        self.clear_input();
+        self.results.clear();
+        self.sheet = Sheet::Results;
+        self.sel_of = Sheet::Results;
+        self.searched.clear();
+        self.reset_rows();
+        self.view = View::Results;
+        if !kept.is_empty() {
+            self.edit.insert(&kept);
+            self.edit.select_all();
+            self.seen = kept;
+            self.search_now();
+            if let Some((row, scroll)) = row {
+                self.restore_row(row, scroll);
+            }
+        }
+    }
+
+    /// 같은 줄을 다시 선택, 없으면 첫 줄, 스크롤은 선택 줄이 보이게만 맞춤
+    fn restore_row(&mut self, row: Row, scroll: usize) {
+        self.selected = self.rows().iter().position(|r| *r == row).unwrap_or(0);
+        self.scroll = scroll.min(self.rows().len().saturating_sub(lay::ROWS)).min(self.selected);
+        if self.selected >= self.scroll + lay::ROWS {
+            self.scroll = self.selected + 1 - lay::ROWS;
+        }
+        self.scroll_s.snap(self.scroll as f32 * self.px(lay::ROW_H));
+        self.retarget_selection(true);
     }
 
     /// 새 결과: 첫 줄 선택, 맨 위부터, 강조도 바로 그 줄로
