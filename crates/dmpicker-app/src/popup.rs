@@ -2161,8 +2161,13 @@ impl Popup {
         self.diff_choice = Diff::ALL[i];
     }
 
+    /// 입력 칸에 글이 있음 (조합 중인 글자 포함)
+    fn typed(&self) -> bool {
+        !self.edit.text().is_empty() || !self.preedit.is_empty()
+    }
+
     /// 두 버튼용 호버 머무름·떠남 시간 처리, 앞 버튼이 먼저 움직이고 다른 버튼은 시차 뒤에 따라감
-    /// 입력 칸에 글이 있으면 (조합 중인 글자 포함) 호버해도 안 나오고 나와 있던 버튼도 들어감
+    /// 입력 칸에 글이 있으면 호버해도 안 나오고 나와 있던 버튼도 들어감
     /// 설정·히스토리 보기에선 늘 나옴
     fn update_reveal(&mut self, now: Instant) {
         if let Some((at, k, to)) = self.reveal_follow {
@@ -2171,7 +2176,7 @@ impl Popup {
                 self.reveal_follow = None;
             }
         }
-        let typed = !self.edit.text().is_empty() || !self.preedit.is_empty();
+        let typed = self.typed();
         if typed {
             self.hover_since = None;
         } else if self.in_zone && !self.beads_out && self.hover_since.is_none() {
@@ -2331,8 +2336,11 @@ impl Popup {
                     self.cycle_diff(if vk == VK_LEFT { -1 } else { 1 });
                     return Some((0, Action::Choice));
                 }
+                // 입력 중엔 톱니가 숨어 있으니 Tab으로도 설정을 안 엶, 설정에서 돌아가는 건 됨
                 if vk == VK_TAB {
-                    self.toggle_settings();
+                    if self.view == View::Settings || !self.typed() {
+                        self.toggle_settings();
+                    }
                     return Some((0, Action::None));
                 }
                 // 입력 칸 편집 단축키는 어느 보기에서나, 조합 중인 글자는 먼저 확정
