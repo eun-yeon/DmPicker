@@ -21,7 +21,7 @@ use crate::catalog::{Catalog, Song};
 use crate::edit::{clean_paste, Editor};
 use crate::gfx::{
     self, circle, color, rect, rounded, rrect, white, with_alpha, Drawing, Gfx, Retarget, BEARING, CARET, DISABLED, FAINT,
-    FILL_HOVER, FILL_SELECTED, FILL_STRONG, FILL_TRACK, PLATE_ALPHA, SUB, TEXT, TINT,
+    FAVORITE, FILL_HOVER, FILL_SELECTED, FILL_STRONG, FILL_TRACK, PLATE_ALPHA, SUB, TEXT, TINT,
 };
 use crate::hotkey::Hotkey;
 use crate::playlist::{self, Entry, Failure, Library, Pattern, Playlist, Recent, Reply};
@@ -68,6 +68,27 @@ const CLOSE_TEXT_GONE: f32 = 0.5;
 const SHEET_RISE: f32 = 6.0;
 const SHEET_IN_SECS: f32 = 0.22;
 const SHEET_OUT_SECS: f32 = 0.16;
+/// 즐겨찾기 별 (`StarMotion`): 색과 채움은 켤 때도 끌 때도 이 시간에 바뀜, 눌림과 점 튀기는 켤 때만
+const STAR_FILL_SECS: f32 = 0.15;
+/// 눌림: 앞 30 %에 이 배율까지 줄었다 나머지에 돌아옴, 구간마다 넘쳤다 돌아옴
+const STAR_POP: f32 = 0.82;
+const STAR_POP_SECS: f32 = 0.35;
+const STAR_POP_EASE: Ease = Ease(0.34, 1.96, 0.64, 1.0);
+/// 튀는 점이 나타나고 멀어지는 곡선 (`Spark::at`)
+const SPARK_EASE: Ease = Ease(0.0, 0.0, 0.58, 1.0);
+/// 별 꼭짓점 (16 단위, 가운데 8, 8), 18 DIP 상자에 맞춰 그림
+const STAR_POINTS: [(f32, f32); 10] = [
+    (8.00, 1.85),
+    (9.85, 6.10),
+    (14.47, 6.55),
+    (11.00, 9.62),
+    (12.00, 14.15),
+    (8.00, 11.80),
+    (4.00, 14.15),
+    (5.00, 9.62),
+    (1.53, 6.55),
+    (6.15, 6.10),
+];
 
 /// 바 오른쪽 버튼 순서 (`bead_circle`)
 const BEAD_HISTORY: usize = 0;
@@ -100,6 +121,8 @@ mod lay {
     pub const CARD_BTN_W: f32 = 112.0;
     pub const COND_W: f32 = 52.0; // 글은 가운데, 오른쪽 끝이 16 정렬선
     pub const PANEL_MAX: f32 = PAD * 2.0 + ROW_H * ROWS as f32; // 304
+    /// 히스토리 맨 위 탭 띠: 위 8 + 세그먼트 32, 그 아래 8은 줄 목록의 PAD (6줄이면 344)
+    pub const TABS_H: f32 = PAD + 32.0;
     /// 키워드 칩 줄 한도: 칩 위 88, 아래 안내 문구·여백 44를 빼고 창 높이에 드는 줄 (칩 28 + 간격 6)
     pub const CHIP_LINES: usize = ((PANEL_MAX.max(SETTINGS_H) - 88.0 - 44.0 + 6.0) / 34.0) as usize; // 6
     /// 플레이리스트 결과 아래 칸의 글 줄 높이와 줄 수 한도, 넘는 코멘트는 말줄임
@@ -151,10 +174,17 @@ pub enum Action {
 enum View {
     Results,
     Settings,
-    /// 최근 고른 곡·플레이리스트, 히스토리 버튼으로 엶
+    /// 최근 고른 곡·플레이리스트와 즐겨찾기, 히스토리 버튼으로 엶
     History,
     /// 곡 하나의 내 키워드, 결과·히스토리 줄을 우클릭하거나 F2로 엶
     Keywords,
+}
+
+/// 히스토리 맨 위 탭, 세그먼트 칸 순서대로
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HistoryTab {
+    Recent,
+    Favorites,
 }
 
 /// 시트에 그리는 내용, 보이거나 나타나는 중에만 바뀌고 사라지는 동안엔 그대로 (`retarget_panel`)
@@ -164,7 +194,7 @@ enum Sheet {
     Card,
     /// 검색 결과 줄
     Results,
-    /// 최근 고른 곡·플레이리스트 줄
+    /// 최근 고른 곡·플레이리스트 또는 즐겨찾기 줄
     History,
     /// 곡 줄과 키워드 칩
     Keywords,
@@ -246,6 +276,103 @@ impl Rng {
     }
 }
 
+/// 별 버튼에서 튀는 점 하나, 켤 때마다 새로 뽑음
+#[derive(Clone, Copy, Debug)]
+struct Spark {
+    /// 나가는 방향 (rad, 아래가 양수)
+    angle: f32,
+    /// 끝까지 가는 거리 (DIP)
+    dist: f32,
+    /// 출발 전 기다리는 시간과 나타났다 사라지는 시간 (초)
+    delay: f32,
+    secs: f32,
+    /// 지름 (DIP)
+    size: f32,
+    /// 끝 배율
+    end: f32,
+}
+
+impl Spark {
+    /// 시작에서 `t`초 뒤의 (거리 비율, 배율, 불투명도), 안 보이면 None
+    /// 앞 20 %에 나타나며 거리의 25 %까지, 나머지에 끝까지 가며 줄고 흐려짐
+    fn at(&self, t: f32) -> Option<(f32, f32, f32)> {
+        let u = (t - self.delay) / self.secs;
+        if u <= 0.0 || u >= 1.0 {
+            return None;
+        }
+        Some(if u < 0.2 {
+            let k = SPARK_EASE.apply(u / 0.2);
+            (0.25 * k, 0.4 + 0.6 * k, k)
+        } else {
+            let k = SPARK_EASE.apply((u - 0.2) / 0.8);
+            (0.25 + 0.75 * k, 1.0 + (self.end - 1.0) * k, 1.0 - k)
+        })
+    }
+}
+
+/// 키워드 시트의 별 버튼 모션, 켜고 끌 때마다 지금 채움에서 새로 시작 (`toggle_sheet_favorite`)
+struct StarMotion {
+    at: Instant,
+    /// 시작할 때 채움 (0 꺼짐 .. 1 켜짐), 목표는 `on`
+    from: f32,
+    on: bool,
+    /// 켤 때만
+    sparks: Vec<Spark>,
+}
+
+impl StarMotion {
+    fn new(from: f32, on: bool, rng: &mut Rng) -> Self {
+        let mut u = || (rng.next() >> 40) as f32 / (1u64 << 24) as f32;
+        // 점 8개: 45°마다 ±16°, 거리 22 x 0.68..1.18, 시간 0.6초 x 0.78..1.22, 지연 0..70 ms,
+        // 지름 2.8 x 0.6..1.4, 끝 배율 0.35..0.75
+        let sparks = if on {
+            (0..8)
+                .map(|i| Spark {
+                    angle: (i as f32 * 45.0 + (u() * 2.0 - 1.0) * 16.0).to_radians(),
+                    dist: 22.0 * (0.68 + u() * 0.5),
+                    delay: u() * 0.07,
+                    secs: 0.6 * (0.78 + u() * 0.44),
+                    size: 2.8 * (0.6 + u() * 0.8),
+                    end: 0.35 + u() * 0.4,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Self { at: Instant::now(), from, on, sparks }
+    }
+
+    /// 시작에서 흐른 시간 (초), 아래 값들은 이 시간 `t`로 셈
+    fn elapsed(&self) -> f32 {
+        self.at.elapsed().as_secs_f32()
+    }
+
+    /// 채움 0 .. 1, 끌 때도 같은 시간에 빠짐
+    fn fill(&self, t: f32) -> f32 {
+        let to = self.on as u8 as f32;
+        self.from + (to - self.from) * Ease::OUT.apply((t / STAR_FILL_SECS).min(1.0))
+    }
+
+    /// 아이콘 배율, 켤 때만 눌렸다 돌아옴
+    fn pop(&self, t: f32) -> f32 {
+        let t = t / STAR_POP_SECS;
+        if !self.on || t >= 1.0 {
+            1.0
+        } else if t < 0.3 {
+            1.0 + (STAR_POP - 1.0) * STAR_POP_EASE.apply(t / 0.3)
+        } else {
+            STAR_POP + (1.0 - STAR_POP) * STAR_POP_EASE.apply((t - 0.3) / 0.7)
+        }
+    }
+
+    /// 채움·눌림·점이 다 끝남
+    fn done(&self, t: f32) -> bool {
+        let pop = if self.on { STAR_POP_SECS } else { 0.0 };
+        let sparks = self.sparks.iter().map(|s| s.delay + s.secs).fold(0.0, f32::max);
+        t >= STAR_FILL_SECS.max(pop).max(sparks)
+    }
+}
+
 /// 무작위 줄이 뽑는 줄: 고를 수 있는 곡이나 패턴
 fn picks(rows: &[Row]) -> impl Iterator<Item = Row> + '_ {
     rows.iter().copied().filter(|r| matches!(r, Row::Song(_) | Row::Chart(..)))
@@ -309,6 +436,10 @@ enum Hit {
     KeepQuery,
     CardButton,
     Row(usize),
+    /// 히스토리 맨 위 탭의 한 칸
+    Tab(HistoryTab),
+    /// 키워드 시트의 별 (즐겨찾기) 버튼
+    Favorite,
     /// 키워드 시트의 완료 버튼
     Done,
     /// i번째 키워드 칩의 × 버튼
@@ -345,6 +476,8 @@ struct SettingsLayout {
 
 /// 물리 px 기준 키워드 시트: 클릭 영역과 각 글줄의 위쪽
 struct KeywordLayout {
+    /// 완료 버튼 왼쪽의 별 버튼
+    fav: D2D_RECT_F,
     done: D2D_RECT_F,
     label: f32,
     chips_top: f32,
@@ -372,7 +505,7 @@ pub struct Popup {
     hotkey_note: Option<(&'static str, Instant)>,
     pub mode_choice: Mode,
     pub diff_choice: Diff,
-    /// 최근 고른 곡·플레이리스트와 사본, 최신순
+    /// 최근 고른 곡·플레이리스트와 사본, 즐겨찾기
     library: Library,
     /// 플레이리스트 주소를 검색했을 때만 Some
     playlist: Option<PlaylistView>,
@@ -391,7 +524,9 @@ pub struct Popup {
     results: Vec<Row>,
     /// 결과가 BPM 조건 검색이라 아랫줄에 DLC 대신 BPM
     bpm_rows: bool,
-    /// 히스토리 보기의 줄, 열 때마다 최근 고른 곡·플레이리스트로 채움
+    /// 히스토리의 마지막 탭, 다시 열어도 그대로
+    history_tab: HistoryTab,
+    /// 히스토리 보기의 줄, 열 때마다 고른 탭의 목록으로 채움
     history: Vec<Row>,
     /// 표시 중인 항목 사본, 닫히는 동안 최근 기록이 재정렬돼도 그대로
     history_entries: Vec<Recent>,
@@ -427,7 +562,9 @@ pub struct Popup {
     close: Tween,           // 닫는 동안 0에서 1로
     sel_y: Spring,          // 선택 강조 위쪽, 패널 px (높이는 한 줄)
     scroll_s: Spring,       // 목록 오프셋 px, scroll x 줄 간격을 따라감
-    seg: [Tween; 2],        // 세그먼트 손잡이 [모드, 난이도]: 왼쪽 끝, 칸 단위
+    seg: [Tween; 3],        // 세그먼트 손잡이 [모드, 난이도, 히스토리 탭]: 왼쪽 끝, 칸 단위
+    list_shown: Tween,      // 히스토리 줄 목록 보임 0 .. 1, 탭을 바꾸면 옛 목록이 사라진 뒤 나타남
+    star: Option<StarMotion>, // 키워드 시트 별 버튼 모션, 시트를 닫으면 버림
     knob: Tween,            // 토글 노브 자리 0 끔 .. 1 켬 (살짝 넘침)
     knob_tint: Tween,       // 토글 색 0 끔 .. 1 켬
     knob_press: Tween,      // 노브 세로 배율, 누르는 동안 줄어듦
@@ -444,6 +581,10 @@ pub struct Popup {
     last_mouse: Option<(i32, i32)>, // 마지막 마우스 이동의 클라이언트 좌표
     // 리소스
     jackets: HashMap<u32, Option<ID2D1Bitmap1>>,
+    /// 히스토리 시트에 지난 프레임에 그린 줄 목록, 탭을 바꾸면 이걸 흐려 보냄
+    last_list: Option<ID2D1CommandList>,
+    /// 탭을 바꿔 흐려지며 올라가는 옛 목록과 그 불투명도
+    old_list: Option<(ID2D1CommandList, Tween)>,
     fonts: Option<Fonts>,
     fx: Option<Effects>,
 }
@@ -523,6 +664,11 @@ fn segment_at(r: &D2D_RECT_F, x: f32) -> usize {
     (((x - r.left) / (r.right - r.left)) * 4.0).clamp(0.0, 3.0) as usize
 }
 
+/// 불투명도를 1/64 단위로 (흐려지는 동안 브러시 캐시가 안 커지게)
+fn alpha_step(a: f32) -> f32 {
+    (a * 64.0).round() / 64.0
+}
+
 impl Popup {
     pub fn new(hwnd: HWND, catalog: Catalog) -> Self {
         let now = Instant::now();
@@ -550,6 +696,7 @@ impl Popup {
             high_surrogate: None,
             results: Vec::new(),
             bpm_rows: false,
+            history_tab: HistoryTab::Recent,
             history: Vec::new(),
             history_entries: Vec::new(),
             sel_of: Sheet::Results,
@@ -577,7 +724,9 @@ impl Popup {
             close: Tween::new(0.0),
             sel_y: SEL_SPRING,
             scroll_s: Spring::new(0.0, 600.0, 46.0),
-            seg: [Tween::new(0.0); 2],
+            seg: [Tween::new(0.0); 3],
+            list_shown: Tween::new(1.0),
+            star: None,
             knob: Tween::new(0.0),
             knob_tint: Tween::new(0.0),
             knob_press: Tween::new(1.0),
@@ -593,6 +742,8 @@ impl Popup {
             dragging: false,
             last_mouse: None,
             jackets: HashMap::new(),
+            last_list: None,
+            old_list: None,
             fonts: None,
             fx: None,
         }
@@ -633,6 +784,9 @@ impl Popup {
                 || !self.sel_y.settled()
                 || !self.scroll_s.settled()
                 || self.seg.iter().any(|t| !t.done())
+                || !self.list_shown.done()
+                || self.old_list.as_ref().is_some_and(|(_, fade)| !fade.done())
+                || self.star.as_ref().is_some_and(|m| !m.done(m.elapsed()))
                 || [self.knob, self.knob_tint, self.knob_press].iter().any(|t| !t.done())
                 || self.hover_since.is_some()
                 || self.leave_since.is_some())
@@ -708,6 +862,8 @@ impl Popup {
         self.fonts = None;
         self.fx = None;
         self.jackets.clear();
+        self.last_list = None;
+        self.old_list = None;
     }
 
     /// 그리기 리소스를 시작할 때 미리 만들어 첫 열기가 기다리지 않게 함
@@ -942,9 +1098,9 @@ impl Popup {
     }
 
     /// 그릴 시트: 지금 높이에서, 나타나고 사라질 땐 시트와 내용이 같이 흐려지며 위로 비켜남
-    /// 불투명도는 1/64 단위 (브러시 캐시가 안 커지게)
+    /// 불투명도는 1/64 단위 (`alpha_step`)
     fn sheet_geom(&self) -> SheetGeom {
-        let alpha = (self.shown.value() * 64.0).round() / 64.0;
+        let alpha = alpha_step(self.shown.value());
         let dy = -SHEET_RISE * self.scale * (1.0 - alpha);
         let top = self.panel_top() + dy;
         SheetGeom { rect: rect(self.px(lay::MARGIN), top, self.px(lay::MARGIN + lay::W), top + self.panel_h.value.max(0.0)), alpha, dy }
@@ -1044,6 +1200,9 @@ impl Popup {
         let done_w = (self.measure("완료", |f| &f.item) + self.px(28.0)).round();
         let cy = y(lay::PAD) + self.px(lay::ROW_H) / 2.0;
         let done = rect(done_r - done_w, cy - self.px(15.0), done_r, cy + self.px(15.0));
+        // 별 버튼은 완료 왼쪽 8에 30 x 30, 같은 줄 가운데
+        let fav_r = done.left - self.px(8.0);
+        let fav = rect(fav_r - self.px(30.0), done.top, fav_r, done.bottom);
         // 곡 줄 아래 8에 라벨 (줄 높이 16), 그 아래 8부터 칩 (높이 28, 세로 간격 6)
         // 안내 문구는 칩 아래 12 (줄 높이 16), 맨 아래 여백은 양옆과 같은 16
         let (h, gap) = (self.px(28.0), self.px(6.0));
@@ -1064,7 +1223,24 @@ impl Popup {
         let chips_bottom = chips_top + (h + gap) * lines as f32 - gap;
         let note = chips_bottom + self.px(12.0);
         let bottom = if self.keyword_note().is_some() { note + self.px(16.0) } else { chips_bottom };
-        KeywordLayout { done, label: y(lay::PAD + lay::ROW_H + 8.0), chips_top, chips, note, height: bottom + self.px(lay::INSET) - top }
+        KeywordLayout { fav, done, label: y(lay::PAD + lay::ROW_H + 8.0), chips_top, chips, note, height: bottom + self.px(lay::INSET) - top }
+    }
+
+    /// 히스토리 탭 (세그먼트): 패널 안쪽 8에 높이 32, 양 끝이 줄 강조와 같음
+    fn tabs_rect(&self) -> D2D_RECT_F {
+        let top = self.panel_top();
+        let (l, r) = (self.px(lay::MARGIN) + self.px(lay::PAD), self.px(lay::MARGIN + lay::W) - self.px(lay::PAD));
+        rect(l, top + self.px(lay::PAD), r, top + self.px(lay::TABS_H))
+    }
+
+    /// 시트 `s`의 줄 목록 위 탭 띠 높이, 히스토리에만 있음
+    fn tabs_h(&self, s: Sheet) -> f32 {
+        if s == Sheet::History { self.px(lay::TABS_H) } else { 0.0 }
+    }
+
+    /// 시트 `s`의 첫 줄 위쪽 (패널 위에서), 히스토리는 탭 띠 아래
+    fn list_top(&self, s: Sheet) -> f32 {
+        self.tabs_h(s) + self.px(lay::PAD)
     }
 
     /// 칩 자리: 16 정렬선 사이를 흐르며 줄바꿈, 칩마다 (왼쪽, 너비, 줄)
@@ -1163,12 +1339,16 @@ impl Popup {
             Sheet::Keywords => self.keyword_layout().height,
             Sheet::Card => self.px(lay::CARD_H),
             Sheet::Results if self.playlist_waiting() => 0.0,
+            // 탭을 바꿔 옛 목록이 사라지는 동안엔 이전 목표 높이 유지 (진행 중인 높이 모션은 이어짐), 새 목록이 나타나기 시작하면 새 높이로
+            // 다른 시트에서 히스토리로 올 땐 바로 그 높이
+            Sheet::History if self.sheet == Sheet::History && self.list_waiting() && self.panel_h.target > 0.0 => self.panel_h.target,
             _ if !self.listing() => 0.0,
             s => {
                 // 플레이리스트 결과는 줄 목록 밑에 아래 칸이 붙음, 고른 줄이 바뀌면 높이도 따라감
+                // 히스토리는 줄 목록 위에 탭 띠
                 let foot = self.foot_of(s);
                 let n = self.rows().len().min(page_above(foot.as_ref()));
-                self.px(lay::PAD + lay::ROW_H * n.max(1) as f32 + foot.map_or(lay::PAD, |f| f.height()))
+                self.tabs_h(s) + self.px(lay::PAD + lay::ROW_H * n.max(1) as f32 + foot.map_or(lay::PAD, |f| f.height()))
             }
         }
     }
@@ -1266,6 +1446,9 @@ impl Popup {
         let y = y - sg.dy;
         if self.view == View::Keywords {
             let kl = self.keyword_layout();
+            if inside(&kl.fav, x, y) {
+                return Hit::Favorite;
+            }
             if inside(&kl.done, x, y) {
                 return Hit::Done;
             }
@@ -1302,9 +1485,16 @@ impl Popup {
             }
             return Hit::Inside;
         }
-        // 검색어를 지운 뒤 사라지는 줄은 호버·클릭 대상 아님
+        // 히스토리 탭은 칸마다 반씩
+        if self.view == View::History {
+            let r = self.tabs_rect();
+            if inside(&r, x, y) {
+                return Hit::Tab(if x < (r.left + r.right) / 2.0 { HistoryTab::Recent } else { HistoryTab::Favorites });
+            }
+        }
+        // 검색어를 지운 뒤 사라지는 줄, 탭을 바꾼 뒤 반도 안 보이는 새 줄은 호버·클릭 대상 아님
         // 스크롤 중엔 줄이 아직 `scroll` 위치가 아니라 그려진 위치에 있음
-        if self.listing() {
+        if self.listing() && self.list_ready() {
             if let Some(i) = self.row_at(y, self.scroll_s.value) {
                 return Hit::Row(i);
             }
@@ -1313,9 +1503,12 @@ impl Popup {
     }
 
     /// 목록이 `off` px 스크롤됐을 때 내용 자리 `y`의 결과 줄 (없으면 None)
+    /// 히스토리 줄 목록은 탭을 바꾼 뒤 내려앉는 중이면 그려진 자리로 (`list_fade`)
     fn row_at(&self, y: f32, off: f32) -> Option<usize> {
         let pitch = self.px(lay::ROW_H);
-        let top = self.panel_top() + self.px(lay::PAD);
+        let s = self.sheet_now();
+        let y = if s == Sheet::History { y - self.list_fade(self.list_shown.value()).1 } else { y };
+        let top = self.panel_top() + self.list_top(s);
         if y < top || y >= top + pitch * self.visible_rows() as f32 {
             return None;
         }
@@ -1357,6 +1550,32 @@ impl Popup {
     /// 키워드 시트의 곡 (키워드는 `user_keys`)
     fn keyword_song(&self) -> Option<&Song> {
         self.keyword_edit.as_ref().map(|k| &self.catalog.songs[k.song])
+    }
+
+    /// 키워드 시트의 곡이 즐겨찾기인지
+    fn sheet_favorite(&self) -> bool {
+        self.keyword_song().is_some_and(|s| self.library.is_favorite(s.id))
+    }
+
+    /// 키워드 시트의 곡을 즐겨찾기에 넣거나 빼고, 바뀐 상태를 돌려줌
+    /// 별 모션은 지금 보이는 채움에서 새로 시작, 켤 때마다 점을 새로 뽑음
+    fn toggle_sheet_favorite(&mut self) -> bool {
+        let Some(id) = self.keyword_song().map(|s| s.id) else { return false };
+        let on = self.library.toggle_favorite(id);
+        let from = self.star.as_ref().map_or(!on as u8 as f32, |m| m.fill(m.elapsed()));
+        self.star = Some(StarMotion::new(from, on, &mut self.rng));
+        on
+    }
+
+    /// 별 버튼의 (채움 0 .. 1, 아이콘 배율), 모션이 없으면 지금 상태 그대로
+    fn star_now(&self) -> (f32, f32) {
+        match &self.star {
+            Some(m) => {
+                let t = m.elapsed();
+                (m.fill(t), m.pop(t))
+            }
+            None => (self.sheet_favorite() as u8 as f32, 1.0),
+        }
     }
 
     /// 한 번 더 Backspace를 누르면 지울 칩
@@ -1461,6 +1680,7 @@ impl Popup {
     /// 검색창을 닫거나 다시 열 때도 불림, 쓰던 키워드가 검색어로 남지 않게
     fn restore_keyword_query(&mut self) -> Option<(Row, usize)> {
         let k = self.keyword_edit.take()?;
+        self.star = None;
         self.clear_input();
         self.edit = k.edit;
         self.seen = self.edit.text().to_owned();
@@ -1477,6 +1697,10 @@ impl Popup {
         self.preedit.clear();
         self.notify_composition(CPS_CANCEL);
         let Some((row, scroll)) = self.restore_keyword_query() else { return };
+        // 시트에서 즐겨찾기를 바꿨을 수 있음
+        if self.view == View::History && self.history_tab == HistoryTab::Favorites {
+            self.fill_history();
+        }
         self.searched.clear();
         self.search_now();
         self.retarget_panel();
@@ -1490,7 +1714,8 @@ impl Popup {
         // F2나 메뉴 키 (Apps, Shift+F10), 시트에선 F2만 닫음
         let open_key = !ctrl && !alt && ((!shift && matches!(vk, VK_F2 | VK_APPS)) || (shift && vk == VK_F10));
         if self.view != View::Keywords {
-            if open_key {
+            // 탭을 바꾼 뒤 새 목록이 반 넘게 보이기 전엔 안 엶 (`list_ready`)
+            if open_key && self.list_ready() {
                 self.open_keywords(self.selected);
             }
             return open_key;
@@ -1502,7 +1727,12 @@ impl Popup {
                 k.remove = None;
             }
         }
-        if vk == VK_ESCAPE || (open_key && vk == VK_F2) {
+        // Ctrl+D는 별 버튼과 같음, 누른 채 반복되는 키는 안 셈
+        if ctrl && !alt && !shift && vk == VIRTUAL_KEY(b'D' as u16) {
+            if !repeat {
+                self.toggle_sheet_favorite();
+            }
+        } else if vk == VK_ESCAPE || (open_key && vk == VK_F2) {
             self.close_keywords();
         } else if vk == VK_RETURN {
             self.complete_composition();
@@ -1522,7 +1752,7 @@ impl Popup {
     }
 
     /// 보여 줄 내용이 있으면 한 프레임에 그 내용으로, 없으면 직전 내용 그대로 사라짐 (`retarget_panel`)
-    /// 히스토리는 열 때마다 최근 곡으로 다시 채움, 키워드 시트는 닫고 넘어감
+    /// 히스토리는 열 때마다 고른 탭으로 다시 채움, 키워드 시트는 닫고 넘어감
     fn set_view(&mut self, v: View) {
         if self.view == View::Keywords {
             self.close_keywords();
@@ -1556,6 +1786,47 @@ impl Popup {
 
     fn toggle_history(&mut self) {
         self.set_view(if self.view == View::History { View::Results } else { View::History });
+    }
+
+    /// 히스토리 탭을 바꾸면 목록과 선택을 처음부터 맞춤
+    fn set_history_tab(&mut self, tab: HistoryTab) {
+        if self.history_tab == tab {
+            return;
+        }
+        self.history_tab = tab;
+        self.swap_list();
+        self.fill_history();
+        self.retarget_panel();
+    }
+
+    /// 탭을 바꿈: 보이던 줄 목록은 흐려지며 올라가고 (`old_list`), 새 목록은 그 뒤에 내려앉음
+    /// 옛 목록이 사라지는 중에 또 바꾸면 그 목록이 마저 사라짐
+    fn swap_list(&mut self) {
+        let shown = self.list_shown.value();
+        if let Some(list) = self.last_list.take().filter(|_| shown > 0.0) {
+            let mut fade = Tween::new(shown);
+            fade.go(0.0, SHEET_OUT_SECS, Ease::STANDARD);
+            self.old_list = Some((list, fade));
+        }
+        self.list_shown.snap(0.0);
+        self.list_shown.go_delayed(1.0, SHEET_OUT_SECS, SHEET_IN_SECS, Ease::DECEL);
+    }
+
+    /// 탭을 바꾼 뒤 새 줄 목록이 아직 안 그려짐 (옛 목록이 사라지는 중)
+    fn list_waiting(&self) -> bool {
+        self.list_shown.target() > 0.0 && self.list_fade(self.list_shown.value()).0 <= 0.0
+    }
+
+    /// 히스토리 줄 목록을 보임 `a`일 때 그리는 (불투명도, 다 나온 자리에서 비켜난 거리 px, 위가 음수)
+    /// 시트처럼 1/64 단위, 나타날 땐 위에서 내려앉고 사라질 땐 올라감, 그리기와 줄 판정이 같이 씀
+    fn list_fade(&self, a: f32) -> (f32, f32) {
+        let a = alpha_step(a);
+        (a, -SHEET_RISE * self.scale * (1.0 - a))
+    }
+
+    /// 줄을 누르거나 고르거나 키워드 시트를 열 수 있음, 시트처럼 탭을 바꾼 뒤 새 목록이 반 넘게 보여야 함
+    fn list_ready(&self) -> bool {
+        self.view != View::History || self.list_fade(self.list_shown.value()).0 >= 0.5
     }
 
     /// 새 단축키를 기다림 (설정 보기에서만, 거기선 조합 중인 글자가 없음)
@@ -1933,19 +2204,26 @@ impl Popup {
         random.into_iter().chain(hits.into_iter().map(row)).collect()
     }
 
-    /// 히스토리 줄: 지금 목록에서 고를 수 있는 곡과 플레이리스트
+    /// 히스토리 줄: 고른 탭에서 지금 목록에 있는 곡과 플레이리스트
     fn fill_history(&mut self) {
-        self.history_entries.clone_from(&self.library.recent);
         let owned = self.owned.as_ref();
-        self.history = self
-            .history_entries
-            .iter()
-            .enumerate()
-            .filter_map(|(i, e)| match e {
-                Recent::Song(id) => self.catalog.pick(*id, owned).map(Row::Song),
-                Recent::Playlist { .. } => Some(Row::Playlist(i)),
-            })
-            .collect();
+        self.history = match self.history_tab {
+            HistoryTab::Recent => {
+                self.history_entries.clone_from(&self.library.recent);
+                self.history_entries
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, e)| match e {
+                        Recent::Song(id) => self.catalog.pick(*id, owned).map(Row::Song),
+                        Recent::Playlist { .. } => Some(Row::Playlist(i)),
+                    })
+                    .collect()
+            }
+            HistoryTab::Favorites => {
+                self.history_entries.clear();
+                self.library.favorites.iter().filter_map(|&id| self.catalog.pick(id, owned).map(Row::Song)).collect()
+            }
+        };
         if self.sel_of == Sheet::History {
             self.reset_rows();
         }
@@ -2003,8 +2281,9 @@ impl Popup {
         self.view != View::Keywords && (!self.searched.trim().is_empty() || self.view == View::History)
     }
 
+    /// 고르는 목록 (`sel_of`)의 `i`번째 줄 자리 위쪽, 패널 위에서
     fn row_y(&self, i: usize) -> f32 {
-        self.px(lay::PAD) + self.px(lay::ROW_H) * i as f32
+        self.list_top(self.sel_of) + self.px(lay::ROW_H) * i as f32
     }
 
     /// 강조를 선택된 줄 자리로 옮김, 높이는 그대로 미끄러짐
@@ -2124,8 +2403,13 @@ impl Popup {
         }
     }
 
+    /// 세그먼트마다 고른 칸: 모드, 난이도, 히스토리 탭
+    fn segment_choices(&self) -> [usize; 3] {
+        [self.mode_choice.index(), self.diff_choice.index(), self.history_tab as usize]
+    }
+
     fn snap_segments(&mut self) {
-        for (k, idx) in [self.mode_choice.index(), self.diff_choice.index()].into_iter().enumerate() {
+        for (k, idx) in self.segment_choices().into_iter().enumerate() {
             self.seg[k].snap(idx as f32);
         }
     }
@@ -2133,7 +2417,7 @@ impl Popup {
     /// 손잡이를 지금 선택으로 보냄, 한 덩어리로 처음엔 빠르게 미끄러지다 부드럽게 멈춤
     /// 라벨 색도 손잡이를 따라감
     fn retarget_segments(&mut self) {
-        for (k, idx) in [self.mode_choice.index(), self.diff_choice.index()].into_iter().enumerate() {
+        for (k, idx) in self.segment_choices().into_iter().enumerate() {
             let to = idx as f32;
             if (self.seg[k].target() - to).abs() < 1e-3 {
                 continue;
@@ -2336,6 +2620,11 @@ impl Popup {
                     self.cycle_diff(if vk == VK_LEFT { -1 } else { 1 });
                     return Some((0, Action::Choice));
                 }
+                // 히스토리 탭은 ←/→로 바꿈, 입력 중엔 캐럿을 옮기니 안 바꿈
+                if self.view == View::History && !self.typed() && matches!(vk, VK_LEFT | VK_RIGHT) {
+                    self.set_history_tab(if vk == VK_LEFT { HistoryTab::Recent } else { HistoryTab::Favorites });
+                    return Some((0, Action::None));
+                }
                 // 입력 중엔 톱니가 숨어 있으니 Tab으로도 설정을 안 엶, 설정에서 돌아가는 건 됨
                 if vk == VK_TAB {
                     if self.view == View::Settings || !self.typed() {
@@ -2422,6 +2711,7 @@ impl Popup {
                         }
                         VK_ESCAPE => Action::Hide,
                         VK_RETURN if self.card().is_some() => Action::Scan,
+                        VK_RETURN if !self.list_ready() => Action::None,
                         VK_RETURN => self.choose(self.selected),
                         VK_UP => {
                             self.move_sel(-1);
@@ -2626,6 +2916,14 @@ impl Popup {
                         unsafe {
                             SetCapture(self.hwnd);
                         }
+                        Action::None
+                    }
+                    Hit::Favorite => {
+                        self.toggle_sheet_favorite();
+                        Action::None
+                    }
+                    Hit::Tab(tab) => {
+                        self.set_history_tab(tab);
                         Action::None
                     }
                     Hit::Done => {
@@ -2869,6 +3167,7 @@ impl Popup {
         let k = 1.0 - (1.0 - CLOSE_SCALE) * (1.0 - fade);
         let (ox, oy) = (self.px(lay::MARGIN + lay::W / 2.0), self.px(lay::MARGIN + lay::BAR_H / 2.0));
         let shrink = windows_numerics::Matrix3x2 { M11: k, M12: 0.0, M21: 0.0, M22: k, M31: ox * (1.0 - k), M32: oy * (1.0 - k) };
+        let mut last_list = None;
 
         unsafe {
             let dc = &g.dc;
@@ -2920,40 +3219,28 @@ impl Popup {
             dc.SetTarget(&target);
             let d = Drawing::begin(dc, &IDENTITY);
             dc.Clear(Some(&color(0.0, 0.0, 0.0, 0.0)));
-            let lp_all = D2D1_LAYER_PARAMETERS1 {
-                contentBounds: rect(-1e6, -1e6, 1e6, 1e6),
-                geometricMask: std::mem::ManuallyDrop::new(None),
-                maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-                maskTransform: IDENTITY,
-                opacity: open_t,
-                opacityBrush: std::mem::ManuallyDrop::new(None),
-                layerOptions: D2D1_LAYER_OPTIONS1_NONE,
-            };
-            dc.PushLayer(&lp_all, None);
+            dc.PushLayer(&fade_layer(open_t), None);
             for img in [fx.shadow.output()?, fx.plate.GetOutput()?, fx.rim_light.GetOutput()?] {
                 dc.DrawImage(&img, None, None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
             }
             dc.SetTransform(&shrink);
             // 닫을 땐 글과 줄이 판보다 먼저 흐려짐, 뒤의 게임이 또렷이 비치기 전에 사라짐
             if self.closing {
-                let lp_content = D2D1_LAYER_PARAMETERS1 {
-                    contentBounds: rect(-1e6, -1e6, 1e6, 1e6),
-                    geometricMask: std::mem::ManuallyDrop::new(None),
-                    maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-                    maskTransform: IDENTITY,
-                    opacity: ((fade - CLOSE_TEXT_GONE) / (1.0 - CLOSE_TEXT_GONE)).clamp(0.0, 1.0),
-                    opacityBrush: std::mem::ManuallyDrop::new(None),
-                    layerOptions: D2D1_LAYER_OPTIONS1_NONE,
-                };
-                dc.PushLayer(&lp_content, None);
+                dc.PushLayer(&fade_layer(((fade - CLOSE_TEXT_GONE) / (1.0 - CLOSE_TEXT_GONE)).clamp(0.0, 1.0)), None);
             }
 
             // 4) 검색 바 내용
             let cy = (bar.top + bar.bottom) / 2.0;
             let text_b = g.brush(TEXT)?;
             let sub_b = g.brush(SUB)?;
+            // 끝과 이음이 둥근 선 (돋보기, #, 칩 ×, 별)
             let round = g.factory.CreateStrokeStyle(
-                &D2D1_STROKE_STYLE_PROPERTIES1 { startCap: D2D1_CAP_STYLE_ROUND, endCap: D2D1_CAP_STYLE_ROUND, ..Default::default() },
+                &D2D1_STROKE_STYLE_PROPERTIES1 {
+                    startCap: D2D1_CAP_STYLE_ROUND,
+                    endCap: D2D1_CAP_STYLE_ROUND,
+                    lineJoin: D2D1_LINE_JOIN_ROUND,
+                    ..Default::default()
+                },
                 None,
             )?;
             let ix = bar.left + self.px(24.0);
@@ -3062,6 +3349,150 @@ impl Popup {
                 }
             }
 
+            // 패널 내용은 다 편 시트 자리 기준
+            let ct = self.panel_top();
+            let (l0, r0) = (panel.left + self.px(lay::INSET), panel.right - self.px(lay::INSET));
+            let l0t = l0 - BEARING; // 글자 x, 잉크가 16 정렬선에 맞음
+
+            // 줄 목록 (결과·히스토리): 빈 목록 문구나 선택 강조·줄·아래 칸
+            // 히스토리는 탭을 바꿀 때 흐려 보내려고 따로 기록도 함 (`last_list`)
+            let draw_list = || -> Result<()> {
+                let row0 = self.list_top(self.sheet);
+                if n_rows == 0 {
+                    // 기록이나 즐겨찾기가 있는데 이 목록에 하나도 없을 때도 따로 알림
+                    let empty = match self.sheet {
+                        Sheet::History if self.history_tab == HistoryTab::Favorites && self.library.favorites.is_empty() => {
+                            Some("우클릭 창에서 별을 누른 곡이 여기에 모여요")
+                        }
+                        Sheet::History if self.history_tab == HistoryTab::Favorites => Some("즐겨찾기한 곡이 이 목록에 없어요"),
+                        Sheet::History if self.library.recent.is_empty() => Some("아직 고른 곡이 없어요"),
+                        Sheet::History => Some("이 목록에서 고른 곡이 아직 없어요"),
+                        // 응답을 기다리느라 결과가 비어 사라지는 중이면 문구 없이
+                        _ if self.playlist_waiting() => None,
+                        // 플레이리스트는 못 불러온 이유
+                        _ => Some(self.playlist_note().unwrap_or("일치하는 곡이 없어요")),
+                    };
+                    if let Some(empty) = empty {
+                        let l = g.layout_centered(empty, &f.item, panel.right - panel.left, self.px(lay::ROW_H))?;
+                        dc.DrawTextLayout(gfx::pt(panel.left, ct + row0), &l, &sub_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                    }
+                    return Ok(());
+                }
+                let rows = self.rows_of(self.sheet);
+                // 선택 강조: 한 줄 높이, 모서리가 패널과 동심 (반지름 = PANEL_R - PAD)
+                // 고를 수 없는 줄엔 없음
+                let inset = self.px(lay::PAD);
+                if rows.get(self.selected).is_none_or(|r| r.selectable()) {
+                    let hl = g.brush(white(FILL_SELECTED))?;
+                    let t = ct + self.sel_y.value;
+                    dc.FillRoundedRectangle(&rrect(panel.left + inset, t, panel.right - inset, t + pitch, self.px(lay::PANEL_R - lay::PAD)), &hl);
+                }
+
+                let floor_b = g.brush(FAINT)?;
+                let off_b = g.brush(DISABLED)?;
+                let jsz = self.px(32.0);
+                let jr = self.px(lay::PANEL_R - lay::PAD - 8.0);
+                let lvl_w = self.px(self.level_w());
+                // 줄은 줄 영역 안에서 미끄러짐 (멈추면 딱 보이는 줄만이라 잘림 없음)
+                let top = ct + row0;
+                dc.PushAxisAlignedClip(&rect(panel.left, top, panel.right, top + pitch * n_page as f32), D2D1_ANTIALIAS_MODE_ALIASED);
+                for (k, &j) in shown.iter().enumerate() {
+                    let row = rows[j];
+                    let y = ct + (row0 + pitch * j as f32 - off);
+                    let jx = panel.left + inset + self.px(8.0);
+                    let jy = y + (self.px(lay::ROW_H) - jsz) / 2.0;
+                    // 고를 수 없는 줄은 제자리에 흐리게
+                    let dim = matches!(row, Row::Unavailable(_));
+                    match row {
+                        // 재킷 자리에 아이콘: 무작위 줄은 셔플, 히스토리의 플레이리스트는 목록
+                        Row::Random | Row::Playlist(_) => {
+                            dc.FillRoundedRectangle(&rrect(jx, jy, jx + jsz, jy + jsz, jr), &g.brush(white(FILL_HOVER))?);
+                            if let Some(icf) = &f.icon {
+                                let glyph = if row == Row::Random { "\u{E8B1}" } else { "\u{E90B}" };
+                                let il = g.layout_centered(glyph, icf, jsz, jsz)?;
+                                dc.DrawTextLayout(gfx::pt(jx, jy), &il, &text_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                            }
+                        }
+                        _ => match &jackets[k] {
+                            Some(bmp) => draw_jacket(g, bmp, jx, jy, jsz, jr, if dim { DISABLED.a } else { 1.0 })?,
+                            // 곡 데이터에 없는 곡은 빈 재킷 자리
+                            None if dim && ids[k].is_none() => {
+                                dc.FillRoundedRectangle(&rrect(jx, jy, jx + jsz, jy + jsz, jr), &g.brush(white(FILL_TRACK))?);
+                            }
+                            None => {}
+                        },
+                    }
+                    // 제목, 아랫줄
+                    let (title, sub) = match row {
+                        Row::Random => {
+                            let sub = self.playlist_random_note().unwrap_or_else(|| self.rolls.note(rows));
+                            (Cow::Borrowed("무작위로 고르기"), sub)
+                        }
+                        Row::Playlist(_) => {
+                            let (title, sub) = self.history_playlist_text(j).unwrap_or_default();
+                            (Cow::Owned(title), sub)
+                        }
+                        Row::Unavailable(e) => {
+                            let name = self.playlist_row_name(j).unwrap_or_default();
+                            let sub = self.unavailable_song(e).map(|s| format!("{}  ·  {}", s.composer, s.dlc)).unwrap_or_default();
+                            (Cow::Owned(name), sub)
+                        }
+                        Row::Song(i) | Row::Chart(i, ..) => {
+                            let song = &self.catalog.songs[i];
+                            // BPM 조건 검색 결과는 DLC 대신 BPM
+                            let sub = if self.bpm_rows && self.sheet == Sheet::Results {
+                                format!("{}  ·  BPM {}", song.composer, song.bpm)
+                            } else {
+                                format!("{}  ·  {}", song.composer, song.dlc)
+                            };
+                            (Cow::Borrowed(song.name.as_str()), sub)
+                        }
+                    };
+                    let (title_b, line_b) = if dim { (&off_b, &off_b) } else { (&text_b, &sub_b) };
+                    let tx = jx + jsz + self.px(10.0);
+                    let lvl_r = panel.right - inset - self.px(8.0);
+                    let tw = lvl_r - lvl_w - self.px(8.0) - tx;
+                    let (title_y, sub_y) = (y + self.px(6.67), y + self.px(26.67));
+                    let tl = g.layout(&title, &f.title, tw, self.px(19.0))?;
+                    dc.DrawTextLayout(gfx::pt(tx, title_y), &tl, title_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+                    let sl_ = g.layout(&sub, &f.sub, tw, self.px(16.0))?;
+                    dc.DrawTextLayout(gfx::pt(tx, sub_y), &sl_, line_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+
+                    // 레벨 칸: 레벨 "HD 11"은 곡 이름과, 서열표 "13.4"는 아랫줄과 같은 글자 기준선
+                    // 그 모드·난이도 패턴이 없는 곡은 비우고 (플레이리스트는 채보만), 서열표가 없는 패턴은 아래만 비움
+                    // 고를 수 없는 줄은 서열표도 흐리게
+                    let Some((label, floor)) = self.level_text(row) else { continue };
+                    let lx = lvl_r - lvl_w;
+                    let ll = g.layout(&label, &f.item_bold, lvl_w, self.px(20.0))?;
+                    ll.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)?;
+                    dc.DrawTextLayout(gfx::pt(lx, title_y + baseline(&tl) - baseline(&ll)), &ll, title_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                    if let Some(fl) = floor {
+                        let fl = g.layout(&format!("{fl:.1}"), &f.sub, lvl_w, self.px(16.0))?;
+                        fl.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)?;
+                        let fb = if dim { &off_b } else { &floor_b };
+                        dc.DrawTextLayout(gfx::pt(lx, sub_y + baseline(&sl_) - baseline(&fl)), &fl, fb, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                    }
+                }
+                dc.PopAxisAlignedClip();
+
+                // 플레이리스트 결과 아래 칸: 줄 목록 아래 12부터 효과·목표 줄 (16 + 간격 4), 그 아래 코멘트
+                // 코멘트가 없거나 무작위 줄을 고르면 이름과 곡 수를 보조 글자로
+                if let Some(foot) = &foot {
+                    let mut y = ct + (row0 + pitch * n_page as f32) + self.px(lay::FOOT_PAD);
+                    if let Some(meta) = &foot.meta {
+                        let ml = g.layout(meta, &f.sub, r0 - l0, self.px(16.0))?;
+                        ml.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+                        dc.DrawTextLayout(gfx::pt(l0t, y), &ml, &floor_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+                        y += self.px(20.0);
+                    }
+                    if let Some(nl) = self.foot_layout(&foot.note) {
+                        let nb = if foot.comment { &text_b } else { &sub_b };
+                        dc.DrawTextLayout(gfx::pt(l0t, y), &nl, nb, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+                    }
+                }
+                Ok(())
+            };
+
             // 6) 패널 내용 (움직이는 패널 모양으로 자름, 보기를 바꾸면 한 프레임에 바뀜)
             if has_panel {
                 let geo = g.factory.CreateRoundedRectangleGeometry(&rounded(panel, pr))?;
@@ -3079,10 +3510,7 @@ impl Popup {
                 // 중간에 `?`로 나가도 마찬가지
                 let _mask = std::mem::ManuallyDrop::into_inner(std::mem::replace(&mut lp.geometricMask, std::mem::ManuallyDrop::new(None)));
                 // 내용은 다 편 시트 자리에서 시트와 같이 비켜남
-                let ct = self.panel_top();
                 dc.SetTransform(&windows_numerics::Matrix3x2 { M32: shrink.M32 + k * sg.dy, ..shrink });
-                let (l0, r0) = (panel.left + self.px(lay::INSET), panel.right - self.px(lay::INSET));
-                let l0t = l0 - BEARING; // 글자 x, 잉크가 16 정렬선에 맞음
 
                 if self.sheet == Sheet::Settings {
                     let sl = self.settings_layout();
@@ -3098,8 +3526,8 @@ impl Popup {
                         let at = self.seg[k].value();
                         (at, at + 1.0)
                     };
-                    draw_segments(g, f, sl.mode, &Mode::ALL.map(Mode::label), thumb(0), s)?;
-                    draw_segments(g, f, sl.diff, &Diff::ALL.map(Diff::label), thumb(1), s)?;
+                    draw_segments(g, f, sl.mode, &Mode::ALL.map(Mode::label), thumb(0), 9.0, s)?;
+                    draw_segments(g, f, sl.diff, &Diff::ALL.map(Diff::label), thumb(1), 9.0, s)?;
                     let note_b = g.brush(FAINT)?;
                     let lt = g.layout("내 곡 목록", &f.item_bold, self.px(200.0), self.px(20.0))?;
                     dc.DrawTextLayout(gfx::pt(l0t, sl.list_title), &lt, &text_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
@@ -3141,21 +3569,43 @@ impl Popup {
                     draw_button(g, &f.item_bold, self.card_button(), button, matches!(self.hover, Hit::CardButton), s)?;
                 } else if let (Sheet::Keywords, Some(song)) = (self.sheet, self.keyword_song()) {
                     let kl = self.keyword_layout();
-                    // 곡 줄: 결과 줄과 같은 재킷·제목·아랫줄 (선택 강조 없음), 레벨 칸 자리에 완료 버튼
-                    let y = ct + self.row_y(0);
+                    // 곡 줄: 결과 줄과 같은 재킷·제목·아랫줄 (선택 강조 없음), 레벨 칸 자리에 별과 완료 버튼
+                    let y = ct + self.px(lay::PAD);
                     let jsz = self.px(32.0);
                     let (jx, jy) = (panel.left + self.px(lay::PAD) + self.px(8.0), y + (self.px(lay::ROW_H) - jsz) / 2.0);
                     if let Some(bmp) = &kw_jacket {
                         draw_jacket(g, bmp, jx, jy, jsz, self.px(lay::PANEL_R - lay::PAD - 8.0), 1.0)?;
                     }
                     let tx = jx + jsz + self.px(10.0);
-                    let tw = kl.done.left - self.px(8.0) - tx;
+                    let tw = kl.fav.left - self.px(8.0) - tx;
                     let tl = g.layout(&song.name, &f.title, tw, self.px(19.0))?;
                     dc.DrawTextLayout(gfx::pt(tx, y + self.px(6.67)), &tl, &text_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
                     let sub = format!("{}  ·  {}", song.composer, song.dlc);
                     let sl_ = g.layout(&sub, &f.sub, tw, self.px(16.0))?;
                     dc.DrawTextLayout(gfx::pt(tx, y + self.px(26.67)), &sl_, &sub_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
                     draw_button(g, &f.item, kl.done, "완료", self.hover == Hit::Done, s)?;
+                    // 별 버튼: 완료와 같은 바탕에 별, 꺼지면 테두리만 글자색, 켜지면 테두리·채움이 노랑 (`StarMotion`)
+                    // 18 DIP 상자에 16 단위 별, 켤 땐 가운데를 중심으로 눌렸다 돌아오고 버튼 가운데에서 점이 튐
+                    draw_button_fill(g, kl.fav, self.hover == Hit::Favorite, s)?;
+                    let (sx, sy) = ((kl.fav.left + kl.fav.right) / 2.0, (kl.fav.top + kl.fav.bottom) / 2.0);
+                    let (on, pop) = self.star_now();
+                    let on = alpha_step(on);
+                    let unit = 18.0 / 16.0 * s * pop;
+                    let star = g.polygon(&STAR_POINTS.map(|(x, y)| gfx::pt(sx + (x - 8.0) * unit, sy + (y - 8.0) * unit)))?;
+                    if on > 0.0 {
+                        dc.FillGeometry(&star, &g.brush(with_alpha(FAVORITE, on))?, None);
+                    }
+                    let mix = |a: f32, b: f32| a + (b - a) * on;
+                    let ink = color(mix(TEXT.r, FAVORITE.r), mix(TEXT.g, FAVORITE.g), mix(TEXT.b, FAVORITE.b), mix(TEXT.a, FAVORITE.a));
+                    dc.DrawGeometry(&star, &g.brush(ink)?, 1.5 * unit, &round);
+                    if let Some(m) = &self.star {
+                        let t = m.elapsed();
+                        for sp in &m.sparks {
+                            let Some((reach, scale, a)) = sp.at(t) else { continue };
+                            let (dx, dy) = (sp.angle.cos() * sp.dist * reach * s, sp.angle.sin() * sp.dist * reach * s);
+                            dc.FillEllipse(&circle(sx + dx, sy + dy, sp.size / 2.0 * scale * s), &g.brush(with_alpha(FAVORITE, alpha_step(a)))?);
+                        }
+                    }
 
                     // 라벨·빈 칸 문구·안내 문구는 줄 높이 안 가운데, 잉크가 16 정렬선에 맞음
                     let faint_b = g.brush(FAINT)?;
@@ -3186,133 +3636,31 @@ impl Popup {
                     if let Some(note) = self.keyword_note() {
                         text_line(note, &f.sub, kl.note, self.px(16.0), &sub_b)?;
                     }
-                } else if listed && n_rows == 0 {
-                    // 최근 곡이 있는데 이 목록에 하나도 없을 때도 따로 알림
-                    let empty = match self.sheet {
-                        Sheet::History if self.library.recent.is_empty() => Some("아직 고른 곡이 없어요"),
-                        Sheet::History => Some("이 목록에서 고른 곡이 아직 없어요"),
-                        // 응답을 기다리느라 결과가 비어 사라지는 중이면 문구 없이
-                        _ if self.playlist_waiting() => None,
-                        // 플레이리스트는 못 불러온 이유
-                        _ => Some(self.playlist_note().unwrap_or("일치하는 곡이 없어요")),
-                    };
-                    if let Some(empty) = empty {
-                        let l = g.layout_centered(empty, &f.item, panel.right - panel.left, self.px(lay::ROW_H))?;
-                        dc.DrawTextLayout(gfx::pt(panel.left, ct + self.px(lay::PAD)), &l, &sub_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                } else if self.sheet == Sheet::History {
+                    // 탭은 제자리, 탭을 바꾸면 줄 목록만 옛 것이 흐려지며 올라간 뒤 새 것이 내려앉음 (`swap_list`)
+                    let at = self.seg[2].value();
+                    draw_segments(g, f, self.tabs_rect(), &["최근", "즐겨찾기"], (at, at + 1.0), lay::PANEL_R - lay::PAD, s)?;
+                    let old = self.old_list.as_ref().map(|(list, fade)| (Some(list), fade.value()));
+                    for (list, a) in old.into_iter().chain([(None, self.list_shown.value())]) {
+                        // 다 나타난 목록은 레이어 없이 그림
+                        let (a, dy) = self.list_fade(a);
+                        if a <= 0.0 {
+                            continue;
+                        }
+                        dc.SetTransform(&windows_numerics::Matrix3x2 { M32: shrink.M32 + k * (sg.dy + dy), ..shrink });
+                        if a < 1.0 {
+                            dc.PushLayer(&fade_layer(a), None);
+                        }
+                        match list {
+                            Some(list) => dc.DrawImage(list, None, None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER),
+                            None => draw_list()?,
+                        }
+                        if a < 1.0 {
+                            dc.PopLayer();
+                        }
                     }
                 } else if listed {
-                    let rows = self.rows_of(self.sheet);
-                    // 선택 강조: 한 줄 높이, 모서리가 패널과 동심 (반지름 = PANEL_R - PAD)
-                    // 고를 수 없는 줄엔 없음
-                    let inset = self.px(lay::PAD);
-                    if rows.get(self.selected).is_none_or(|r| r.selectable()) {
-                        let hl = g.brush(white(FILL_SELECTED))?;
-                        let t = ct + self.sel_y.value;
-                        dc.FillRoundedRectangle(&rrect(panel.left + inset, t, panel.right - inset, t + pitch, self.px(lay::PANEL_R - lay::PAD)), &hl);
-                    }
-
-                    let floor_b = g.brush(FAINT)?;
-                    let off_b = g.brush(DISABLED)?;
-                    let jsz = self.px(32.0);
-                    let jr = self.px(lay::PANEL_R - lay::PAD - 8.0);
-                    let lvl_w = self.px(self.level_w());
-                    // 줄은 줄 영역 안에서 미끄러짐 (멈추면 딱 보이는 줄만이라 잘림 없음)
-                    let top = ct + self.row_y(0);
-                    dc.PushAxisAlignedClip(&rect(panel.left, top, panel.right, top + pitch * n_page as f32), D2D1_ANTIALIAS_MODE_ALIASED);
-                    for (k, &j) in shown.iter().enumerate() {
-                        let row = rows[j];
-                        let y = ct + (self.row_y(0) + pitch * j as f32 - off);
-                        let jx = panel.left + inset + self.px(8.0);
-                        let jy = y + (self.px(lay::ROW_H) - jsz) / 2.0;
-                        // 고를 수 없는 줄은 제자리에 흐리게
-                        let dim = matches!(row, Row::Unavailable(_));
-                        match row {
-                            // 재킷 자리에 아이콘: 무작위 줄은 셔플, 히스토리의 플레이리스트는 목록
-                            Row::Random | Row::Playlist(_) => {
-                                dc.FillRoundedRectangle(&rrect(jx, jy, jx + jsz, jy + jsz, jr), &g.brush(white(FILL_HOVER))?);
-                                if let Some(icf) = &f.icon {
-                                    let glyph = if row == Row::Random { "\u{E8B1}" } else { "\u{E90B}" };
-                                    let il = g.layout_centered(glyph, icf, jsz, jsz)?;
-                                    dc.DrawTextLayout(gfx::pt(jx, jy), &il, &text_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
-                                }
-                            }
-                            _ => match &jackets[k] {
-                                Some(bmp) => draw_jacket(g, bmp, jx, jy, jsz, jr, if dim { DISABLED.a } else { 1.0 })?,
-                                // 곡 데이터에 없는 곡은 빈 재킷 자리
-                                None if dim && ids[k].is_none() => {
-                                    dc.FillRoundedRectangle(&rrect(jx, jy, jx + jsz, jy + jsz, jr), &g.brush(white(FILL_TRACK))?);
-                                }
-                                None => {}
-                            },
-                        }
-                        // 제목, 아랫줄
-                        let (title, sub) = match row {
-                            Row::Random => {
-                                let sub = self.playlist_random_note().unwrap_or_else(|| self.rolls.note(rows));
-                                (Cow::Borrowed("무작위로 고르기"), sub)
-                            }
-                            Row::Playlist(_) => {
-                                let (title, sub) = self.history_playlist_text(j).unwrap_or_default();
-                                (Cow::Owned(title), sub)
-                            }
-                            Row::Unavailable(e) => {
-                                let name = self.playlist_row_name(j).unwrap_or_default();
-                                let sub = self.unavailable_song(e).map(|s| format!("{}  ·  {}", s.composer, s.dlc)).unwrap_or_default();
-                                (Cow::Owned(name), sub)
-                            }
-                            Row::Song(i) | Row::Chart(i, ..) => {
-                                let song = &self.catalog.songs[i];
-                                // BPM 조건 검색 결과는 DLC 대신 BPM
-                                let sub = if self.bpm_rows && self.sheet == Sheet::Results {
-                                    format!("{}  ·  BPM {}", song.composer, song.bpm)
-                                } else {
-                                    format!("{}  ·  {}", song.composer, song.dlc)
-                                };
-                                (Cow::Borrowed(song.name.as_str()), sub)
-                            }
-                        };
-                        let (title_b, line_b) = if dim { (&off_b, &off_b) } else { (&text_b, &sub_b) };
-                        let tx = jx + jsz + self.px(10.0);
-                        let lvl_r = panel.right - inset - self.px(8.0);
-                        let tw = lvl_r - lvl_w - self.px(8.0) - tx;
-                        let (title_y, sub_y) = (y + self.px(6.67), y + self.px(26.67));
-                        let tl = g.layout(&title, &f.title, tw, self.px(19.0))?;
-                        dc.DrawTextLayout(gfx::pt(tx, title_y), &tl, title_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
-                        let sl_ = g.layout(&sub, &f.sub, tw, self.px(16.0))?;
-                        dc.DrawTextLayout(gfx::pt(tx, sub_y), &sl_, line_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
-
-                        // 레벨 칸: 레벨 "HD 11"은 곡 이름과, 서열표 "13.4"는 아랫줄과 같은 글자 기준선
-                        // 그 모드·난이도 패턴이 없는 곡은 비우고 (플레이리스트는 채보만), 서열표가 없는 패턴은 아래만 비움
-                        // 고를 수 없는 줄은 서열표도 흐리게
-                        let Some((label, floor)) = self.level_text(row) else { continue };
-                        let lx = lvl_r - lvl_w;
-                        let ll = g.layout(&label, &f.item_bold, lvl_w, self.px(20.0))?;
-                        ll.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)?;
-                        dc.DrawTextLayout(gfx::pt(lx, title_y + baseline(&tl) - baseline(&ll)), &ll, title_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
-                        if let Some(fl) = floor {
-                            let fl = g.layout(&format!("{fl:.1}"), &f.sub, lvl_w, self.px(16.0))?;
-                            fl.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)?;
-                            let fb = if dim { &off_b } else { &floor_b };
-                            dc.DrawTextLayout(gfx::pt(lx, sub_y + baseline(&sl_) - baseline(&fl)), &fl, fb, D2D1_DRAW_TEXT_OPTIONS_NONE);
-                        }
-                    }
-                    dc.PopAxisAlignedClip();
-
-                    // 플레이리스트 결과 아래 칸: 줄 목록 아래 12부터 효과·목표 줄 (16 + 간격 4), 그 아래 코멘트
-                    // 코멘트가 없거나 무작위 줄을 고르면 이름과 곡 수를 보조 글자로
-                    if let Some(foot) = &foot {
-                        let mut y = ct + self.row_y(n_page) + self.px(lay::FOOT_PAD);
-                        if let Some(meta) = &foot.meta {
-                            let ml = g.layout(meta, &f.sub, r0 - l0, self.px(16.0))?;
-                            ml.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
-                            dc.DrawTextLayout(gfx::pt(l0t, y), &ml, &floor_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
-                            y += self.px(20.0);
-                        }
-                        if let Some(nl) = self.foot_layout(&foot.note) {
-                            let nb = if foot.comment { &text_b } else { &sub_b };
-                            dc.DrawTextLayout(gfx::pt(l0t, y), &nl, nb, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
-                        }
-                    }
+                    draw_list()?;
                 }
                 dc.SetTransform(&shrink);
                 dc.PopLayer();
@@ -3323,9 +3671,38 @@ impl Popup {
             }
             dc.PopLayer();
             d.end()?;
+
+            // 탭을 바꿀 때 흐려 보낼 히스토리 줄 목록, 이번 프레임 그대로 기록해 둠 (`swap_list`)
+            if self.sheet == Sheet::History && has_panel {
+                let list = dc.CreateCommandList()?;
+                dc.SetTarget(&list);
+                let d = Drawing::begin(dc, &IDENTITY);
+                draw_list()?;
+                d.end()?;
+                list.Close()?;
+                last_list = Some(list);
+            }
+        }
+        self.last_list = last_list;
+        // 다 사라졌거나 히스토리를 떠나면 버림, 돌아와도 다시 안 보임
+        if self.sheet != Sheet::History || self.old_list.as_ref().is_some_and(|(_, fade)| fade.done()) {
+            self.old_list = None;
         }
         self.moving = self.animating();
         self.gfx.as_ref().unwrap().present()
+    }
+}
+
+/// 안을 통째로 `opacity`만큼 흐리는 레이어 (모양 마스크 없음)
+fn fade_layer(opacity: f32) -> D2D1_LAYER_PARAMETERS1 {
+    D2D1_LAYER_PARAMETERS1 {
+        contentBounds: rect(-1e6, -1e6, 1e6, 1e6),
+        geometricMask: std::mem::ManuallyDrop::new(None),
+        maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+        maskTransform: IDENTITY,
+        opacity,
+        opacityBrush: std::mem::ManuallyDrop::new(None),
+        layerOptions: D2D1_LAYER_OPTIONS1_NONE,
     }
 }
 
@@ -3352,13 +3729,21 @@ fn draw_jacket(g: &Gfx, bmp: &ID2D1Bitmap1, x: f32, y: f32, size: f32, rad: f32,
     Ok(())
 }
 
-/// 패널 버튼 (설정, 안내 카드, 키워드 완료): 둥근 채움 (호버·포커스·눌림이면 진하게)과 가운데 글
+/// 패널 버튼 (설정, 안내 카드, 키워드 완료): 둥근 채움 (`draw_button_fill`)과 가운데 글
 fn draw_button(g: &Gfx, font: &IDWriteTextFormat, r: D2D_RECT_F, label: &str, lit: bool, s: f32) -> Result<()> {
+    draw_button_fill(g, r, lit, s)?;
+    unsafe {
+        let l = g.layout_centered(label, font, r.right - r.left, r.bottom - r.top)?;
+        g.dc.DrawTextLayout(gfx::pt(r.left, r.top), &l, &g.brush(TEXT)?, D2D1_DRAW_TEXT_OPTIONS_NONE);
+    }
+    Ok(())
+}
+
+/// 패널 버튼 바탕: 둥근 채움, 호버·포커스·눌림이면 진하게 (글 버튼과 키워드 시트의 별 버튼)
+fn draw_button_fill(g: &Gfx, r: D2D_RECT_F, lit: bool, s: f32) -> Result<()> {
     unsafe {
         let fill = g.brush(white(if lit { FILL_STRONG } else { FILL_SELECTED }))?;
         g.dc.FillRoundedRectangle(&rounded(r, (8.0 * s).round()), &fill);
-        let l = g.layout_centered(label, font, r.right - r.left, r.bottom - r.top)?;
-        g.dc.DrawTextLayout(gfx::pt(r.left, r.top), &l, &g.brush(TEXT)?, D2D1_DRAW_TEXT_OPTIONS_NONE);
     }
     Ok(())
 }
@@ -3383,18 +3768,19 @@ fn draw_toggle(g: &Gfx, r: D2D_RECT_F, (at, tint, press): (f32, f32, f32), lit: 
     Ok(())
 }
 
-/// 세그먼트 컨트롤: 트랙 + 손잡이 (호버 덧칠 없음)
+/// 세그먼트 컨트롤: 트랙 + 손잡이 (호버 덧칠 없음), 손잡이는 둘레 3 안쪽이라 모서리도 3 작음
 fn draw_segments(
     g: &Gfx,
     f: &Fonts,
     r: D2D_RECT_F,
     labels: &[&str],
     thumb: (f32, f32), // 움직이는 손잡이 양 끝, 칸 단위
+    rad: f32,          // 트랙 모서리 (DIP)
     s: f32,
 ) -> Result<()> {
     unsafe {
         let dc = &g.dc;
-        let rad = 9.0 * s;
+        let rad = rad * s;
         let track = g.brush(white(FILL_TRACK))?;
         dc.FillRoundedRectangle(&rounded(r, rad), &track);
         let n = labels.len();

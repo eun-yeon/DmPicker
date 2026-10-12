@@ -37,6 +37,8 @@ pub const FILL_STRONG: f32 = 0.20;
 /// 판: 검색창과 알림 바탕, 이 색을 `PLATE_ALPHA`로 칠해 뒤의 게임이 살짝 비침
 pub const TINT: D2D1_COLOR_F = D2D1_COLOR_F { r: 0.090, g: 0.098, b: 0.114, a: 1.0 }; // #17191D
 pub const PLATE_ALPHA: f32 = 0.92;
+/// 즐겨찾기: 켜진 별의 테두리·채움과 켤 때 튀는 점
+pub const FAVORITE: D2D1_COLOR_F = D2D1_COLOR_F { r: 1.0, g: 0.788, b: 0.290, a: 1.0 }; // #FFC94A
 
 /// 글리프 왼쪽에 물리 px로 1쯤 여백이 있음, 그만큼 앞당겨 그려야 글자가 정렬선에 맞음
 pub const BEARING: f32 = 1.0;
@@ -252,6 +254,21 @@ impl Gfx {
                     sink.AddLine(*p);
                 }
                 sink.EndFigure(D2D1_FIGURE_END_OPEN);
+            }
+            sink.Close()?;
+            Ok(path)
+        }
+    }
+
+    /// 꼭짓점을 차례로 이은 닫힌 도형, 채우기와 테두리에 같이 씀
+    pub fn polygon(&self, points: &[windows_numerics::Vector2]) -> Result<ID2D1PathGeometry1> {
+        unsafe {
+            let path = self.factory.CreatePathGeometry()?;
+            let sink = path.Open()?;
+            if let Some((first, rest)) = points.split_first() {
+                sink.BeginFigure(*first, D2D1_FIGURE_BEGIN_FILLED);
+                sink.AddLines(rest);
+                sink.EndFigure(D2D1_FIGURE_END_CLOSED);
             }
             sink.Close()?;
             Ok(path)

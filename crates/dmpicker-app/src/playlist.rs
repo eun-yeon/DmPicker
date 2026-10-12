@@ -193,22 +193,30 @@ impl Recent {
     }
 }
 
-/// 최근 고른 줄과 그 플레이리스트의 사본
+/// 최근 고른 줄과 플레이리스트 사본, 즐겨찾기한 곡
 #[derive(Default)]
 pub struct Library {
     /// 최신순, 최대 `RECENT_MAX`줄
     pub recent: Vec<Recent>,
+    /// 최근에 추가한 곡부터, 개수 제한 없음
+    pub favorites: Vec<u32>,
     /// 히스토리에 있는 플레이리스트만, 응답이 안 와도 이걸로 보여 줌
     pub copies: HashMap<String, Playlist>,
-    /// `recent.txt`와 `playlists` 폴더가 있는 곳, 없으면 파일에 안 씀
+    /// 기록·즐겨찾기·플레이리스트 사본을 두는 곳, 없으면 파일에 안 씀
     root: Option<PathBuf>,
 }
 
 impl Library {
-    /// 겹치는 줄과 `RECENT_MAX`를 넘는 줄은 버림, 사본이 없거나 깨져도 히스토리 줄은 남김
+    /// 못 읽거나 겹치는 줄은 버림, 최근 기록만 `RECENT_MAX`까지, 사본이 없어도 히스토리 줄은 남김
     pub fn load(root: PathBuf) -> Self {
         let text = std::fs::read_to_string(root.join("recent.txt")).unwrap_or_default();
+        let favorites = std::fs::read_to_string(root.join("favorites.txt")).unwrap_or_default();
         let mut lib = Self { root: Some(root), ..Self::default() };
+        for id in favorites.lines().filter_map(|line| line.trim().parse().ok()) {
+            if !lib.is_favorite(id) {
+                lib.favorites.push(id);
+            }
+        }
         for entry in text.lines().filter_map(Recent::parse) {
             if lib.recent.len() == RECENT_MAX {
                 break;
@@ -225,6 +233,22 @@ impl Library {
             lib.recent.push(entry);
         }
         lib
+    }
+
+    pub fn is_favorite(&self, id: u32) -> bool {
+        self.favorites.contains(&id)
+    }
+
+    /// 없으면 맨 앞에 넣고 있으면 뺀 뒤 저장, 바뀐 뒤 즐겨찾기인지 돌려줌
+    pub fn toggle_favorite(&mut self, id: u32) -> bool {
+        let added = !self.is_favorite(id);
+        if added {
+            self.favorites.insert(0, id);
+        } else {
+            self.favorites.retain(|&i| i != id);
+        }
+        self.save_favorites();
+        added
     }
 
     fn path(&self, id: &str) -> Option<PathBuf> {
@@ -280,6 +304,14 @@ impl Library {
         let result = std::fs::create_dir_all(root).and_then(|_| std::fs::write(root.join("recent.txt"), text));
         if let Err(e) = result {
             eprintln!("save recent: {e}");
+        }
+    }
+
+    fn save_favorites(&self) {
+        let Some(root) = &self.root else { return };
+        let text: String = self.favorites.iter().map(|id| format!("{id}\n")).collect();
+        if let Err(e) = crate::keywords::write(&root.join("favorites.txt"), text.as_bytes()) {
+            eprintln!("save favorites: {e}");
         }
     }
 }
