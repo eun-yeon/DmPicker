@@ -543,7 +543,7 @@ impl Popup {
             library: Library::default(),
             playlist: None,
             playlist_request: None,
-            keep_query: false,
+            keep_query: true,
             kept_row: None,
             edit: Editor::default(),
             preedit: String::new(),
