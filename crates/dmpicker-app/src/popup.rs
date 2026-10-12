@@ -91,6 +91,7 @@ mod lay {
     pub const ROW_H: f32 = 48.0;
     pub const ROWS: usize = 6;
     pub const LEVEL_W: f32 = 60.0; // 줄 오른쪽 끝의 레벨 칸
+    pub const PLAYLIST_LEVEL_W: f32 = 72.0; // 플레이리스트 결과는 모드까지, 가장 긴 "8B · MX 15"가 약 66
     pub const SETTINGS_H: f32 = 348.0; // 맨 아래 줄(버튼 높이 30) 아래 16 (= 오른쪽 여백)
     pub const TOGGLE_W: f32 = 42.0;
     pub const TOGGLE_H: f32 = 24.0;
@@ -104,6 +105,8 @@ mod lay {
     /// 플레이리스트 결과 아래 칸의 글 줄 높이와 줄 수 한도, 넘는 코멘트는 말줄임
     pub const NOTE_LINE: f32 = 19.0;
     pub const NOTE_LINES: usize = 5;
+    /// 아래 칸 위아래 여백, 줄 높이 안 여백까지 더하면 글자 위아래가 16으로 같음 (= 양옆)
+    pub const FOOT_PAD: f32 = 12.0;
 }
 
 struct Fonts {
@@ -216,8 +219,10 @@ struct PlaylistView {
     id: String,
     /// 받은 응답이나 사본, 둘 다 없으면 None
     data: Option<Playlist>,
-    /// 줄 대신 보여 줄 안내 문구 (불러오는 중, 실패)
+    /// 줄 대신 보여 줄 실패 안내
     note: Option<&'static str>,
+    /// 사본 없이 응답을 기다리는 동안 패널을 숨김
+    waiting: bool,
     /// 사본 없이 응답을 기다리는 동안 고를 줄과 스크롤, 응답이 오면 그 줄을 고름
     restore: Option<(Row, usize)>,
 }
@@ -465,10 +470,10 @@ struct Foot {
 }
 
 impl Foot {
-    /// 줄 목록 끝부터 패널 아래까지 (DIP): 위 8, 효과 줄 16 + 간격 4, 글 줄, 맨 아래 16
+    /// 줄 목록 끝부터 패널 아래까지 (DIP): 위 12, 효과 줄 16 + 간격 4, 글 줄, 맨 아래 12
     fn height(&self) -> f32 {
         let meta = if self.meta.is_some() { 20.0 } else { 0.0 };
-        8.0 + meta + lay::NOTE_LINE * self.lines as f32 + lay::INSET
+        lay::FOOT_PAD + meta + lay::NOTE_LINE * self.lines as f32 + lay::FOOT_PAD
     }
 }
 
@@ -1157,6 +1162,7 @@ impl Popup {
             Sheet::Settings => self.px(lay::SETTINGS_H),
             Sheet::Keywords => self.keyword_layout().height,
             Sheet::Card => self.px(lay::CARD_H),
+            Sheet::Results if self.playlist_waiting() => 0.0,
             _ if !self.listing() => 0.0,
             s => {
                 // 플레이리스트 결과는 줄 목록 밑에 아래 칸이 붙음, 고른 줄이 바뀌면 높이도 따라감
@@ -1704,13 +1710,14 @@ impl Popup {
         self.playlist_request.take()
     }
 
-    /// 플레이리스트 주소 검색: 받아 둔 내용이나 사본이 있으면 바로 보여 주고 새로 받아 오게 요청
+    /// 플레이리스트 주소 검색: 받아 둔 내용이나 사본은 바로 보여 주고 없으면 응답까지 숨김
+    /// 어느 쪽이든 새로 받아 오게 요청
     fn begin_playlist(&mut self, id: &str) {
         let shown = self.playlist.take().filter(|p| p.id == id).and_then(|p| p.data);
         let data = shown.or_else(|| self.library.copies.get(id).cloned());
         self.results = data.as_ref().map(|p| self.playlist_rows(p)).unwrap_or_default();
-        let note = data.is_none().then_some(playlist::LOADING);
-        self.playlist = Some(PlaylistView { id: id.into(), data, note, restore: None });
+        let waiting = data.is_none();
+        self.playlist = Some(PlaylistView { id: id.into(), data, note: None, waiting, restore: None });
         self.playlist_request = Some(id.into());
     }
 
@@ -1760,7 +1767,7 @@ impl Popup {
         match reply.result {
             Ok(data) => {
                 self.results = self.playlist_rows(&data);
-                self.playlist = Some(PlaylistView { id: reply.id, data: Some(data), note: None, restore: None });
+                self.playlist = Some(PlaylistView { id: reply.id, data: Some(data), note: None, waiting: false, restore: None });
             }
             Err(error) => {
                 // 404면 위에서 내용을 지웠고, 그 밖의 실패는 사본이 있으면 그대로 보여 줌
@@ -1768,15 +1775,17 @@ impl Popup {
                     self.results.clear();
                 }
                 p.note = p.data.is_none().then_some(error.note());
+                p.waiting = false;
             }
         }
+        // 기다리는 동안 숨긴 패널은 아직 결과 시트가 아닐 수 있어 시트를 먼저 맞춘 뒤 줄을 고름
+        self.retarget_panel();
         if self.sel_of == Sheet::Results {
             self.reset_rows();
             if let Some((row, scroll)) = restore {
                 self.restore_row(row, scroll);
             }
         }
-        self.retarget_panel();
     }
 
     /// 히스토리의 플레이리스트 줄: 주소를 친 것처럼 결과로 열고 마지막으로 고른 패턴을 고름
@@ -1799,9 +1808,14 @@ impl Popup {
         self.playlist.as_ref()?.data.as_ref()
     }
 
-    /// 줄 자리에 보일 안내 문구, 사본으로 대신 보여 줄 수 있으면 None
+    /// 줄 자리에 보일 실패 안내, 사본으로 대신 보여 줄 수 있으면 None
     fn playlist_note(&self) -> Option<&'static str> {
         self.playlist.as_ref()?.note
+    }
+
+    /// 사본 없이 첫 응답을 기다리는 중, 그동안 결과 패널을 숨김
+    fn playlist_waiting(&self) -> bool {
+        self.playlist.as_ref().is_some_and(|p| p.waiting)
     }
 
     /// 플레이리스트 결과의 무작위 줄 아랫줄: 이름, 뽑을 곡 수, 다음에 뽑을 수 있는 곡이 적으면 남은 수
@@ -1816,6 +1830,38 @@ impl Popup {
     /// 플레이리스트 결과를 보는 중 (바의 채보 글자를 숨김), 입력 중인 주소가 아니라 검색한 결과 기준
     fn playlist_results(&self) -> bool {
         self.view == View::Results && self.playlist.as_ref().is_some_and(|p| playlist::id(&self.searched) == Some(&p.id))
+    }
+
+    /// 그리는 시트가 플레이리스트 결과, 아래 칸처럼 검색어를 지워 사라지는 동안에도 그대로
+    fn playlist_sheet(&self) -> bool {
+        self.sheet == Sheet::Results && self.playlist_data().is_some()
+    }
+
+    /// 줄 오른쪽 레벨 칸 너비 (DIP), 플레이리스트 결과는 모드까지 들어가게 넓힘
+    fn level_w(&self) -> f32 {
+        if self.playlist_sheet() { lay::PLAYLIST_LEVEL_W } else { lay::LEVEL_W }
+    }
+
+    /// 줄 레벨 칸의 글과 서열표, 무작위 줄·히스토리의 플레이리스트 줄은 None
+    /// 플레이리스트 결과는 바에 모드가 안 보이고 항목마다 달라서 "4B · SC 15"
+    /// 고를 수 없는 줄도 항목의 패턴으로, 레벨을 모르면 "4B · SC"까지
+    /// 그 밖엔 "SC 15", 그 모드·난이도 패턴이 없는 곡은 None
+    fn level_text(&self, row: Row) -> Option<(String, Option<f32>)> {
+        let (song, m, d) = match row {
+            Row::Chart(i, m, d) => (Some(&self.catalog.songs[i]), m, d),
+            Row::Song(i) => (Some(&self.catalog.songs[i]), self.mode_choice, self.diff_choice),
+            Row::Unavailable(e) => {
+                let p = self.playlist_data()?.entries.get(e)?.pattern;
+                (self.unavailable_song(e), p.mode, p.diff)
+            }
+            Row::Random | Row::Playlist(_) => return None,
+        };
+        let level = song.and_then(|s| Some((s.level(m, d)?, s.floor(m, d))));
+        match (self.playlist_sheet(), level) {
+            (true, Some((l, fl))) => Some((format!("{} · {} {l}", m.label(), d.label()), fl)),
+            (true, None) => Some((format!("{} · {}", m.label(), d.label()), None)),
+            (false, level) => level.map(|(l, fl)| (format!("{} {l}", d.label()), fl)),
+        }
     }
 
     /// 결과 `i`번째 줄의 플레이리스트 항목, 무작위 줄은 None
@@ -1847,10 +1893,10 @@ impl Popup {
         }
     }
 
-    /// 고를 수 없는 줄의 곡, 곡 데이터에 없으면 None (아랫줄 없이 빈 재킷 자리)
-    fn unavailable_song(&self, i: usize) -> Option<&Song> {
-        let entry = self.playlist_entry(i)?;
-        self.catalog.songs.iter().find(|s| s.id == entry.pattern.title)
+    /// 고를 수 없는 줄 `Row::Unavailable(e)`의 곡, 곡 데이터에 없으면 None (아랫줄 없이 빈 재킷 자리)
+    fn unavailable_song(&self, e: usize) -> Option<&Song> {
+        let title = self.playlist_data()?.entries.get(e)?.pattern.title;
+        self.catalog.songs.iter().find(|s| s.id == title)
     }
 
     /// 히스토리 `row`번째 줄의 플레이리스트: 주소 id, 마지막으로 고른 패턴, 사본
@@ -2789,7 +2835,7 @@ impl Popup {
         let ids: Vec<Option<u32>> = shown
             .iter()
             .map(|&j| match self.rows_of(self.sheet)[j] {
-                Row::Unavailable(_) => self.unavailable_song(j).map(|s| s.id),
+                Row::Unavailable(e) => self.unavailable_song(e).map(|s| s.id),
                 row => row.song().map(|i| self.catalog.songs[i].id),
             })
             .collect();
@@ -2939,7 +2985,7 @@ impl Popup {
             let q = self.query();
             if q.is_empty() {
                 let ph = g.brush(FAINT)?;
-                let hint = if keywords { "추가할 키워드를 입력해 주세요" } else { "곡 검색 · 초성 · 작곡가" };
+                let hint = if keywords { "추가할 키워드를 입력해 주세요" } else { "곡 · 초성 · 작곡가 · 디맥지지 플리" };
                 let l = g.layout(hint, &f.placeholder, tw, bar_h)?;
                 l.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
                 // 커서가 첫 글자를 파고들지 않게 살짝 오른쪽에
@@ -3135,13 +3181,17 @@ impl Popup {
                 } else if listed && n_rows == 0 {
                     // 최근 곡이 있는데 이 목록에 하나도 없을 때도 따로 알림
                     let empty = match self.sheet {
-                        Sheet::History if self.library.recent.is_empty() => "아직 고른 곡이 없어요",
-                        Sheet::History => "이 목록에서 고른 곡이 아직 없어요",
-                        // 플레이리스트는 불러오는 중이거나 못 불러온 이유
-                        _ => self.playlist_note().unwrap_or("일치하는 곡이 없어요"),
+                        Sheet::History if self.library.recent.is_empty() => Some("아직 고른 곡이 없어요"),
+                        Sheet::History => Some("이 목록에서 고른 곡이 아직 없어요"),
+                        // 응답을 기다리느라 결과가 비어 사라지는 중이면 문구 없이
+                        _ if self.playlist_waiting() => None,
+                        // 플레이리스트는 못 불러온 이유
+                        _ => Some(self.playlist_note().unwrap_or("일치하는 곡이 없어요")),
                     };
-                    let l = g.layout_centered(empty, &f.item, panel.right - panel.left, self.px(lay::ROW_H))?;
-                    dc.DrawTextLayout(gfx::pt(panel.left, ct + self.px(lay::PAD)), &l, &sub_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                    if let Some(empty) = empty {
+                        let l = g.layout_centered(empty, &f.item, panel.right - panel.left, self.px(lay::ROW_H))?;
+                        dc.DrawTextLayout(gfx::pt(panel.left, ct + self.px(lay::PAD)), &l, &sub_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                    }
                 } else if listed {
                     let rows = self.rows_of(self.sheet);
                     // 선택 강조: 한 줄 높이, 모서리가 패널과 동심 (반지름 = PANEL_R - PAD)
@@ -3157,6 +3207,7 @@ impl Popup {
                     let off_b = g.brush(DISABLED)?;
                     let jsz = self.px(32.0);
                     let jr = self.px(lay::PANEL_R - lay::PAD - 8.0);
+                    let lvl_w = self.px(self.level_w());
                     // 줄은 줄 영역 안에서 미끄러짐 (멈추면 딱 보이는 줄만이라 잘림 없음)
                     let top = ct + self.row_y(0);
                     dc.PushAxisAlignedClip(&rect(panel.left, top, panel.right, top + pitch * n_page as f32), D2D1_ANTIALIAS_MODE_ALIASED);
@@ -3165,7 +3216,7 @@ impl Popup {
                         let y = ct + (self.row_y(0) + pitch * j as f32 - off);
                         let jx = panel.left + inset + self.px(8.0);
                         let jy = y + (self.px(lay::ROW_H) - jsz) / 2.0;
-                        // 고를 수 없는 줄은 제자리에 흐리게, 레벨 칸엔 "없음"
+                        // 고를 수 없는 줄은 제자리에 흐리게
                         let dim = matches!(row, Row::Unavailable(_));
                         match row {
                             // 재킷 자리에 아이콘: 무작위 줄은 셔플, 히스토리의 플레이리스트는 목록
@@ -3186,41 +3237,36 @@ impl Popup {
                                 None => {}
                             },
                         }
-                        // 제목, 아랫줄, 레벨 칸의 (글, 서열표)
-                        let (title, sub, level) = match row {
+                        // 제목, 아랫줄
+                        let (title, sub) = match row {
                             Row::Random => {
                                 let sub = self.playlist_random_note().unwrap_or_else(|| self.rolls.note(rows));
-                                (Cow::Borrowed("무작위로 고르기"), sub, None)
+                                (Cow::Borrowed("무작위로 고르기"), sub)
                             }
                             Row::Playlist(_) => {
                                 let (title, sub) = self.history_playlist_text(j).unwrap_or_default();
-                                (Cow::Owned(title), sub, None)
+                                (Cow::Owned(title), sub)
                             }
-                            Row::Unavailable(_) => {
+                            Row::Unavailable(e) => {
                                 let name = self.playlist_row_name(j).unwrap_or_default();
-                                let sub = self.unavailable_song(j).map(|s| format!("{}  ·  {}", s.composer, s.dlc)).unwrap_or_default();
-                                (Cow::Owned(name), sub, Some((Cow::Borrowed("없음"), None)))
+                                let sub = self.unavailable_song(e).map(|s| format!("{}  ·  {}", s.composer, s.dlc)).unwrap_or_default();
+                                (Cow::Owned(name), sub)
                             }
                             Row::Song(i) | Row::Chart(i, ..) => {
                                 let song = &self.catalog.songs[i];
-                                let (m, d) = match row {
-                                    Row::Chart(_, m, d) => (m, d),
-                                    _ => (self.mode_choice, self.diff_choice),
-                                };
                                 // BPM 조건 검색 결과는 DLC 대신 BPM
                                 let sub = if self.bpm_rows && self.sheet == Sheet::Results {
                                     format!("{}  ·  BPM {}", song.composer, song.bpm)
                                 } else {
                                     format!("{}  ·  {}", song.composer, song.dlc)
                                 };
-                                let level = song.level(m, d).map(|l| (Cow::Owned(format!("{} {l}", d.label())), song.floor(m, d)));
-                                (Cow::Borrowed(song.name.as_str()), sub, level)
+                                (Cow::Borrowed(song.name.as_str()), sub)
                             }
                         };
                         let (title_b, line_b) = if dim { (&off_b, &off_b) } else { (&text_b, &sub_b) };
                         let tx = jx + jsz + self.px(10.0);
                         let lvl_r = panel.right - inset - self.px(8.0);
-                        let tw = lvl_r - self.px(lay::LEVEL_W) - self.px(8.0) - tx;
+                        let tw = lvl_r - lvl_w - self.px(8.0) - tx;
                         let (title_y, sub_y) = (y + self.px(6.67), y + self.px(26.67));
                         let tl = g.layout(&title, &f.title, tw, self.px(19.0))?;
                         dc.DrawTextLayout(gfx::pt(tx, title_y), &tl, title_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
@@ -3228,24 +3274,26 @@ impl Popup {
                         dc.DrawTextLayout(gfx::pt(tx, sub_y), &sl_, line_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
 
                         // 레벨 칸: 레벨 "HD 11"은 곡 이름과, 서열표 "13.4"는 아랫줄과 같은 글자 기준선
-                        // 그 모드·난이도 패턴이 없는 곡은 비우고, 서열표가 없는 패턴은 아래만 비움
-                        let Some((label, floor)) = level else { continue };
-                        let lx = lvl_r - self.px(lay::LEVEL_W);
-                        let ll = g.layout(&label, &f.item_bold, self.px(lay::LEVEL_W), self.px(20.0))?;
+                        // 그 모드·난이도 패턴이 없는 곡은 비우고 (플레이리스트는 채보만), 서열표가 없는 패턴은 아래만 비움
+                        // 고를 수 없는 줄은 서열표도 흐리게
+                        let Some((label, floor)) = self.level_text(row) else { continue };
+                        let lx = lvl_r - lvl_w;
+                        let ll = g.layout(&label, &f.item_bold, lvl_w, self.px(20.0))?;
                         ll.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)?;
                         dc.DrawTextLayout(gfx::pt(lx, title_y + baseline(&tl) - baseline(&ll)), &ll, title_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
                         if let Some(fl) = floor {
-                            let fl = g.layout(&format!("{fl:.1}"), &f.sub, self.px(lay::LEVEL_W), self.px(16.0))?;
+                            let fl = g.layout(&format!("{fl:.1}"), &f.sub, lvl_w, self.px(16.0))?;
                             fl.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)?;
-                            dc.DrawTextLayout(gfx::pt(lx, sub_y + baseline(&sl_) - baseline(&fl)), &fl, &floor_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                            let fb = if dim { &off_b } else { &floor_b };
+                            dc.DrawTextLayout(gfx::pt(lx, sub_y + baseline(&sl_) - baseline(&fl)), &fl, fb, D2D1_DRAW_TEXT_OPTIONS_NONE);
                         }
                     }
                     dc.PopAxisAlignedClip();
 
-                    // 플레이리스트 결과 아래 칸: 줄 목록 아래 8부터 효과·목표 줄 (16 + 간격 4), 그 아래 코멘트
+                    // 플레이리스트 결과 아래 칸: 줄 목록 아래 12부터 효과·목표 줄 (16 + 간격 4), 그 아래 코멘트
                     // 코멘트가 없거나 무작위 줄을 고르면 이름과 곡 수를 보조 글자로
                     if let Some(foot) = &foot {
-                        let mut y = ct + self.row_y(n_page) + self.px(8.0);
+                        let mut y = ct + self.row_y(n_page) + self.px(lay::FOOT_PAD);
                         if let Some(meta) = &foot.meta {
                             let ml = g.layout(meta, &f.sub, r0 - l0, self.px(16.0))?;
                             ml.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;

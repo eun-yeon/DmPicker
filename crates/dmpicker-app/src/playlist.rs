@@ -15,7 +15,6 @@ use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 
 /// 응답이 도착함, 검색창 창으로 옴 (main.rs의 WM_APP 메시지와 안 겹치게)
 pub const READY: u32 = WM_APP + 3;
-pub const LOADING: &str = "플레이리스트를 불러오는 중이에요";
 pub const NOT_FOUND: &str = "볼 수 없는 플레이리스트예요";
 const LATER: &str = "잠시 뒤 다시 시도해 주세요";
 const FAILED: &str = "플레이리스트를 불러오지 못했어요";
