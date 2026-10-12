@@ -1388,15 +1388,18 @@ impl Popup {
             self.keyword_backspace(repeat);
         } else {
             // 시트에선 입력 편집만, 보기 전환·모드 바꾸기·곡 고르기는 막음
-            return alt || matches!(vk, VK_TAB | VK_UP | VK_DOWN | VK_PRIOR | VK_NEXT | VK_APPS | VK_F10 | VK_F2);
+            return alt || matches!(vk, VK_UP | VK_DOWN | VK_PRIOR | VK_NEXT | VK_APPS | VK_F10 | VK_F2);
         }
         true
     }
 
     /// 보여 줄 내용이 있으면 한 프레임에 그 내용으로, 없으면 직전 내용 그대로 사라짐 (`retarget_panel`)
-    /// 히스토리는 열 때마다 최근 곡으로 다시 채움, 키워드 시트에선 `close_keywords`로만 나감
+    /// 히스토리는 열 때마다 최근 곡으로 다시 채움, 키워드 시트는 닫고 넘어감
     fn set_view(&mut self, v: View) {
-        if self.view == v || self.view == View::Keywords {
+        if self.view == View::Keywords {
+            self.close_keywords();
+        }
+        if self.view == v {
             return;
         }
         self.view = v;
