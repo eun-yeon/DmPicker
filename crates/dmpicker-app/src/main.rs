@@ -12,6 +12,7 @@ mod hands;
 mod hotkey;
 mod keywords;
 mod pace;
+mod playlist;
 mod popup;
 mod sys;
 mod toast;
@@ -65,6 +66,7 @@ struct App {
     /// 단축키를 눌러 검색창을 열지 화면을 확인하는 중, 그동안 누른 단축키는 무시함
     peeking: bool,
     peeked: Arc<Mutex<Peeked>>,
+    playlists: playlist::Loader,
 }
 
 /// 단축키 뒤 화면 확인 결과: 선곡 목록이 보였으면 Some(그 목록에서 고를 수 있는 곡, 첫 인식 전엔 None)
@@ -252,32 +254,6 @@ fn save_settings(a: &mut App) -> bool {
     ok
 }
 
-/// 검색창에 보일 최근 고른 곡 수
-const RECENT_MAX: usize = 6;
-
-/// 최근 고른 곡, 한 줄에 곡 id 하나 (최신순)
-fn recent_path() -> PathBuf {
-    store_dir().join("recent.txt")
-}
-
-fn load_recent() -> Vec<u32> {
-    let text = std::fs::read_to_string(recent_path()).unwrap_or_default();
-    text.lines().filter_map(|l| l.trim().parse().ok()).take(RECENT_MAX).collect()
-}
-
-/// 고른 곡을 맨 앞으로, 중복 없이 최대 `RECENT_MAX`개
-fn push_recent(ids: &mut Vec<u32>, id: u32) {
-    ids.retain(|&x| x != id);
-    ids.insert(0, id);
-    ids.truncate(RECENT_MAX);
-}
-
-fn save_recent(ids: &[u32]) {
-    let text: String = ids.iter().map(|id| format!("{id}\n")).collect();
-    let _ = std::fs::create_dir_all(store_dir());
-    let _ = std::fs::write(recent_path(), text);
-}
-
 fn nav_mode(m: dmpicker_search::Mode) -> dmpicker_nav::ButtonMode {
     match m {
         dmpicker_search::Mode::B4 => dmpicker_nav::ButtonMode::B4,
@@ -301,17 +277,21 @@ fn hand_over(a: &mut App) -> Option<driver::Ctx> {
     Some(driver::Ctx { refs, store: a.store.clone(), titles: a.titles.clone(), hotkey: a.popup.hotkey })
 }
 
-fn on_pick(a: &mut App, id: u32, chart: Option<(dmpicker_search::Mode, dmpicker_search::Diff)>) {
+/// `playlist_id`는 플레이리스트 결과에서 골랐을 때 그 플레이리스트
+fn on_pick(a: &mut App, id: u32, chart: Option<(dmpicker_search::Mode, dmpicker_search::Diff)>, playlist_id: Option<String>) {
     let name = a.titles.get(&id).cloned().unwrap_or_default();
-    // 레벨 검색에서 고른 패턴이면 그 채보, 아니면 설정대로 (설정은 안 바꿈)
+    // 레벨 검색·플레이리스트에서 고른 패턴이면 그 채보, 아니면 설정대로 (설정은 안 바꿈)
     let (m, d) = chart.unwrap_or((a.popup.mode_choice, a.popup.diff_choice));
     let (mode, diff) = (nav_mode(m), d.index());
     println!("PICK {id} {name} ({} {})", m.label(), d.label());
     // 검색창이 아는 인식 곡 수로 거르지 않음, 작업이 저장된 목록을 읽음 (짐작은 낡았을 수 있음)
     let Some(ctx) = hand_over(a) else { return };
-    // 이동을 시작한 곡만 최근 곡에 남김
-    push_recent(&mut a.popup.recent, id);
-    save_recent(&a.popup.recent);
+    // 이동을 시작한 곡만 히스토리에 남김, 플레이리스트에서 골랐으면 그 플레이리스트 줄로
+    let entry = match playlist_id {
+        Some(list) => playlist::Recent::Playlist { id: list, last: playlist::Pattern { title: id, mode: m, diff: d } },
+        None => playlist::Recent::Song(id),
+    };
+    a.popup.remember_pick(entry);
     let (stale, hk) = (a.stale.clone(), a.popup.hotkey.label());
     spawn_job(a, move |cancel, say| match driver::run_pick(&ctx, id, mode, diff, cancel) {
         driver::JobResult::Arrived { presses, ms, diff_note } => {
@@ -369,7 +349,8 @@ fn on_scan(a: &mut App) {
 /// 검색창이 돌려준 동작 처리, 그 뒤 검색창을 다시 그림
 fn on_action(a: &mut App, act: Action) {
     match act {
-        Action::Pick(id, chart) => on_pick(a, id, chart),
+        Action::Pick(id, chart) => on_pick(a, id, chart, None),
+        Action::PlaylistPick(id, pattern) => on_pick(a, pattern.title, Some((pattern.mode, pattern.diff)), Some(id)),
         Action::Scan => on_scan(a),
         Action::Hide => a.popup.hide(),
         Action::Choice => {
@@ -391,6 +372,15 @@ fn on_action(a: &mut App, act: Action) {
                 }
             }
         }
+    }
+    request_playlist(a);
+}
+
+/// 검색창이 플레이리스트 주소를 검색했으면 작업 스레드로 받아 오기 시작
+/// 검색이 일어날 수 있는 곳 (동작 처리, 검색창 열기) 뒤마다 부름
+fn request_playlist(a: &mut App) {
+    if let Some(id) = a.popup.take_playlist_request() {
+        a.playlists.request(id, a.popup.hwnd);
     }
 }
 
@@ -448,6 +438,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 a.popup.hide();
             } else {
                 request_open(a);
+                request_playlist(a);
             }
             return LRESULT(0);
         }
@@ -469,6 +460,15 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                     a.popup.hide_now();
                 }
             }
+            request_playlist(a);
+            return LRESULT(0);
+        }
+        if msg == playlist::READY {
+            // 응답을 결과에 넣고 다시 그림
+            while let Some(reply) = a.playlists.take() {
+                a.popup.playlist_reply(reply);
+            }
+            on_action(a, Action::None);
             return LRESULT(0);
         }
         if msg == WM_APP_STATUS {
@@ -553,9 +553,10 @@ fn main() -> Result<()> {
             stale: Arc::new(AtomicBool::new(false)),
             peeking: false,
             peeked: Arc::new(Mutex::new(None)),
+            playlists: playlist::Loader::default(),
         });
         load_settings(&mut app_box.popup);
-        app_box.popup.recent = load_recent();
+        app_box.popup.load_history(store_dir());
         app_box.popup.warm_up();
         APP = Box::into_raw(app_box);
         SetTimer(Some(hwnd), TIMER_FOREGROUND, 250, None);

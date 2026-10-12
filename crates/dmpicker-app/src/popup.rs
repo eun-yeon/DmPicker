@@ -1,6 +1,7 @@
 //! 검색창: 너비 480 px 고정, 알림과 같은 반투명 판, 호버하면 나오는 히스토리·톱니 버튼,
 //! 결과 자리에 뜨는 설정·히스토리 시트, 한글 IME, 키보드·마우스
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -19,10 +20,11 @@ use crate::anim::{Ease, Spring, Tween};
 use crate::catalog::{Catalog, Song};
 use crate::edit::{clean_paste, Editor};
 use crate::gfx::{
-    self, circle, color, rect, rounded, rrect, white, with_alpha, Drawing, Gfx, Retarget, BEARING, CARET, FAINT, FILL_HOVER,
-    FILL_SELECTED, FILL_STRONG, FILL_TRACK, PLATE_ALPHA, SUB, TEXT, TINT,
+    self, circle, color, rect, rounded, rrect, white, with_alpha, Drawing, Gfx, Retarget, BEARING, CARET, DISABLED, FAINT,
+    FILL_HOVER, FILL_SELECTED, FILL_STRONG, FILL_TRACK, PLATE_ALPHA, SUB, TEXT, TINT,
 };
 use crate::hotkey::Hotkey;
+use crate::playlist::{self, Entry, Failure, Library, Pattern, Playlist, Recent, Reply};
 use crate::sys;
 
 const LIMIT: usize = 50;
@@ -99,6 +101,9 @@ mod lay {
     pub const PANEL_MAX: f32 = PAD * 2.0 + ROW_H * ROWS as f32; // 304
     /// 키워드 칩 줄 한도: 칩 위 88, 아래 안내 문구·여백 44를 빼고 창 높이에 드는 줄 (칩 28 + 간격 6)
     pub const CHIP_LINES: usize = ((PANEL_MAX.max(SETTINGS_H) - 88.0 - 44.0 + 6.0) / 34.0) as usize; // 6
+    /// 플레이리스트 결과 아래 칸의 글 줄 높이와 줄 수 한도, 넘는 코멘트는 말줄임
+    pub const NOTE_LINE: f32 = 19.0;
+    pub const NOTE_LINES: usize = 5;
 }
 
 struct Fonts {
@@ -129,6 +134,8 @@ pub enum Action {
     None,
     /// 곡 id, 레벨 검색에서 고른 패턴이면 그 (모드, 난이도) (없으면 설정대로)
     Pick(u32, Option<(Mode, Diff)>),
+    /// 플레이리스트 id와 고른 패턴 (무작위 줄이면 뽑힌 패턴)
+    PlaylistPick(String, Pattern),
     Hide,
     Scan,
     /// 모드·난이도 바뀜 (저장해야 함)
@@ -141,7 +148,7 @@ pub enum Action {
 enum View {
     Results,
     Settings,
-    /// 최근 고른 곡, 히스토리 버튼으로 엶
+    /// 최근 고른 곡·플레이리스트, 히스토리 버튼으로 엶
     History,
     /// 곡 하나의 내 키워드, 결과·히스토리 줄을 우클릭하거나 F2로 엶
     Keywords,
@@ -154,7 +161,7 @@ enum Sheet {
     Card,
     /// 검색 결과 줄
     Results,
-    /// 최근 고른 곡 줄
+    /// 최근 고른 곡·플레이리스트 줄
     History,
     /// 곡 줄과 키워드 칩
     Keywords,
@@ -184,15 +191,35 @@ enum Row {
     Chart(usize, Mode, Diff),
     /// 조건 검색 결과 중 무작위 하나
     Random,
+    /// 플레이리스트에서 고를 수 없는 항목 (`entries` 인덱스), 흐리게 보이기만 함
+    Unavailable(usize),
+    /// 히스토리의 플레이리스트 (`history_entries` 인덱스), 고르면 그 플레이리스트 결과를 엶
+    Playlist(usize),
 }
 
 impl Row {
     fn song(self) -> Option<usize> {
         match self {
             Row::Song(i) | Row::Chart(i, ..) => Some(i),
-            Row::Random => None,
+            Row::Random | Row::Unavailable(_) | Row::Playlist(_) => None,
         }
     }
+
+    /// 선택·호버·클릭이 되는 줄
+    fn selectable(self) -> bool {
+        !matches!(self, Row::Unavailable(_))
+    }
+}
+
+/// 결과로 보고 있는 플레이리스트
+struct PlaylistView {
+    id: String,
+    /// 받은 응답이나 사본, 둘 다 없으면 None
+    data: Option<Playlist>,
+    /// 줄 대신 보여 줄 안내 문구 (불러오는 중, 실패)
+    note: Option<&'static str>,
+    /// 사본 없이 응답을 기다리는 동안 고를 줄과 스크롤, 응답이 오면 그 줄을 고름
+    restore: Option<(Row, usize)>,
 }
 
 /// 시스템 시간으로 시작하는 xorshift64
@@ -214,9 +241,9 @@ impl Rng {
     }
 }
 
-/// 무작위 줄이 뽑는 줄: 무작위 줄 말고 전부 (레벨 조건이면 패턴, BPM 조건만이면 곡)
+/// 무작위 줄이 뽑는 줄: 고를 수 있는 곡이나 패턴
 fn picks(rows: &[Row]) -> impl Iterator<Item = Row> + '_ {
-    rows.iter().copied().filter(|&r| r != Row::Random)
+    rows.iter().copied().filter(|r| matches!(r, Row::Song(_) | Row::Chart(..)))
 }
 
 /// 앱을 켠 뒤 무작위 줄로 뽑은 줄, 검색 조건을 바꿔도 이어짐 (저장 안 함)
@@ -340,8 +367,12 @@ pub struct Popup {
     hotkey_note: Option<(&'static str, Instant)>,
     pub mode_choice: Mode,
     pub diff_choice: Diff,
-    /// 최근 고른 곡 id, 최신순 (앱이 불러오고 저장함)
-    pub recent: Vec<u32>,
+    /// 최근 고른 곡·플레이리스트와 사본, 최신순
+    library: Library,
+    /// 플레이리스트 주소를 검색했을 때만 Some
+    playlist: Option<PlaylistView>,
+    /// 받아 올 플레이리스트 id, 앱이 꺼내서 작업 스레드로 넘김 (`take_playlist_request`)
+    playlist_request: Option<String>,
     /// 다시 열 때 지난 검색어와 결과 선택을 남김 (앱이 불러오고 저장함)
     pub keep_query: bool,
     /// 결과 보기에서 닫을 때 고른 줄과 스크롤, 다음 열기에서만 씀
@@ -355,8 +386,10 @@ pub struct Popup {
     results: Vec<Row>,
     /// 결과가 BPM 조건 검색이라 아랫줄에 DLC 대신 BPM
     bpm_rows: bool,
-    /// 히스토리 보기의 줄, 열 때마다 최근 고른 곡으로 채움
+    /// 히스토리 보기의 줄, 열 때마다 최근 고른 곡·플레이리스트로 채움
     history: Vec<Row>,
+    /// 표시 중인 항목 사본, 닫히는 동안 최근 기록이 재정렬돼도 그대로
+    history_entries: Vec<Recent>,
     /// `selected`·`scroll`이 가리키는 목록 (결과나 히스토리), 보이는 목록이 바뀔 때만 첫 줄로
     sel_of: Sheet,
     rng: Rng,
@@ -419,6 +452,34 @@ struct SheetGeom {
     dy: f32,
 }
 
+/// 플레이리스트 결과 줄 목록 아래 칸 (`foot_of`), 높이·줄 수 계산과 그리기가 같이 씀
+struct Foot {
+    /// 고른 항목의 효과·목표 점수
+    meta: Option<String>,
+    /// 고른 항목의 코멘트, 없으면 플레이리스트 이름과 곡 수
+    note: String,
+    /// `note`가 코멘트면 글자색, 이름·곡 수면 보조색
+    comment: bool,
+    /// `note`의 줄 수, 최대 `NOTE_LINES`
+    lines: usize,
+}
+
+impl Foot {
+    /// 줄 목록 끝부터 패널 아래까지 (DIP): 위 8, 효과 줄 16 + 간격 4, 글 줄, 맨 아래 16
+    fn height(&self) -> f32 {
+        let meta = if self.meta.is_some() { 20.0 } else { 0.0 };
+        8.0 + meta + lay::NOTE_LINE * self.lines as f32 + lay::INSET
+    }
+}
+
+/// 아래 칸 `foot`을 빼고 창 높이 (설정 시트 348)에 드는 줄 수, 아래 칸이 없으면 `ROWS`
+/// 코멘트가 5줄에서 잘려서 효과 줄이 있어도 4줄은 남음
+fn page_above(foot: Option<&Foot>) -> usize {
+    let Some(foot) = foot else { return lay::ROWS };
+    let room = lay::PANEL_MAX.max(lay::SETTINGS_H) - lay::PAD - foot.height();
+    ((room / lay::ROW_H) as usize).min(lay::ROWS)
+}
+
 fn s_to_u16(s: &str) -> usize {
     s.encode_utf16().count()
 }
@@ -474,7 +535,9 @@ impl Popup {
             hotkey_note: None,
             mode_choice: Mode::B4,
             diff_choice: Diff::NM,
-            recent: Vec::new(),
+            library: Library::default(),
+            playlist: None,
+            playlist_request: None,
             keep_query: false,
             kept_row: None,
             edit: Editor::default(),
@@ -483,6 +546,7 @@ impl Popup {
             results: Vec::new(),
             bpm_rows: false,
             history: Vec::new(),
+            history_entries: Vec::new(),
             sel_of: Sheet::Results,
             rng: Rng::new(),
             rolls: Rolls::default(),
@@ -1077,8 +1141,14 @@ impl Popup {
         self.is_open() && (self.dragging || self.hover == Hit::Text)
     }
 
+    /// 지금 보기에 한 번에 보이는 줄 자리 수, 플레이리스트 결과는 아래 칸을 뺀 만큼
+    /// 높이·스크롤·마우스 판정·그리기가 같이 씀
+    fn page(&self) -> usize {
+        page_above(self.foot_of(self.sheet_now()).as_ref())
+    }
+
     fn visible_rows(&self) -> usize {
-        self.rows().len().min(lay::ROWS)
+        self.rows().len().min(self.page())
     }
 
     /// 지금 보기의 패널 높이, 보여 줄 게 없으면 0 (줄이 없으면 문구 한 줄)
@@ -1088,7 +1158,76 @@ impl Popup {
             Sheet::Keywords => self.keyword_layout().height,
             Sheet::Card => self.px(lay::CARD_H),
             _ if !self.listing() => 0.0,
-            _ => self.px(lay::PAD * 2.0 + lay::ROW_H * self.visible_rows().max(1) as f32),
+            s => {
+                // 플레이리스트 결과는 줄 목록 밑에 아래 칸이 붙음, 고른 줄이 바뀌면 높이도 따라감
+                let foot = self.foot_of(s);
+                let n = self.rows().len().min(page_above(foot.as_ref()));
+                self.px(lay::PAD + lay::ROW_H * n.max(1) as f32 + foot.map_or(lay::PAD, |f| f.height()))
+            }
+        }
+    }
+
+    /// 플레이리스트 결과 아래 칸, 검색어를 지워 결과가 사라지는 동안에도 그대로
+    /// 효과·목표와 코멘트는 고를 수 있는 항목을 골랐을 때만
+    fn foot_of(&self, s: Sheet) -> Option<Foot> {
+        if s != Sheet::Results || self.results.is_empty() {
+            return None;
+        }
+        let data = self.playlist_data()?;
+        let entry = match self.results.get(self.selected) {
+            Some(Row::Chart(..)) => self.playlist_entry(self.selected),
+            _ => None,
+        };
+        let meta = entry.and_then(|e| {
+            let effect = e.effect.as_deref().filter(|t| !t.trim().is_empty());
+            // 목표 점수는 소수점 뒤 0 없이 (100, 99.5, 99.25)
+            let target = e.target_score.map(|t| format!("목표 {t}%"));
+            match (effect, target) {
+                (Some(effect), Some(target)) => Some(format!("{effect}  ·  {target}")),
+                (Some(effect), None) => Some(effect.to_owned()),
+                (None, target) => target,
+            }
+        });
+        let comment = entry.and_then(|e| e.note.as_deref()).map(str::trim).filter(|n| !n.is_empty());
+        let note = comment.map_or_else(|| format!("{}  ·  {}곡", data.name, data.entries.len()), str::to_owned);
+        let lines = self.foot_layout(&note).and_then(|l| {
+            let mut m = DWRITE_TEXT_METRICS::default();
+            unsafe { l.GetMetrics(&mut m) }.ok().map(|_| m.lineCount as usize)
+        });
+        let lines = lines.unwrap_or(1).clamp(1, lay::NOTE_LINES);
+        Some(Foot { meta, note, comment: comment.is_some(), lines })
+    }
+
+    /// 아래 칸 글: 16 정렬선 사이에서 줄바꿈, 줄 높이 19 (늘어난 만큼 글자 위아래에 반씩)
+    /// `NOTE_LINES`줄을 넘으면 마지막 줄 끝에 말줄임, 줄 수 (`lineCount`)는 가려진 줄까지 셈
+    fn foot_layout(&self, text: &str) -> Option<IDWriteTextLayout> {
+        let (g, f) = (self.gfx.as_ref()?, self.fonts.as_ref()?);
+        let (l, r) = (self.px(lay::MARGIN + lay::INSET), self.px(lay::MARGIN + lay::W - lay::INSET));
+        let lh = lay::NOTE_LINE * self.scale;
+        // 반 줄 여유를 둬야 소수점 오차로 마지막 줄이 안 잘림
+        let layout = g.layout(text, &f.item, r - l, lh * (lay::NOTE_LINES as f32 + 0.5)).ok()?;
+        unsafe {
+            // 캐시된 레이아웃이라 처음 한 번만 바꿈 (형식은 한 줄, 줄 간격은 글꼴 기본)
+            if layout.GetWordWrapping() != DWRITE_WORD_WRAPPING_EMERGENCY_BREAK {
+                // 버퍼가 줄 수보다 작으면 첫 줄도 안 채워 줌
+                let mut n = 0;
+                let _ = layout.GetLineMetrics(None, &mut n);
+                let mut m = vec![DWRITE_LINE_METRICS::default(); n.max(1) as usize];
+                layout.GetLineMetrics(Some(&mut m), &mut n).ok()?;
+                layout.SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM, lh, m[0].baseline + (lh - m[0].height) / 2.0).ok()?;
+                layout.SetWordWrapping(DWRITE_WORD_WRAPPING_EMERGENCY_BREAK).ok()?;
+            }
+        }
+        Some(layout)
+    }
+
+    /// 고른 줄이 보이게 스크롤을 맞춤, 아래 칸 높이가 바뀌어 보이는 줄 수가 달라져도 빈 자리 없이
+    fn fit_scroll(&mut self) {
+        let page = self.page();
+        let max = self.rows().len().saturating_sub(page);
+        let s = self.scroll.min(self.selected.min(max)).max((self.selected + 1).saturating_sub(page));
+        if s != self.scroll {
+            self.set_scroll(s);
         }
     }
 
@@ -1180,7 +1319,7 @@ impl Popup {
 
     // ---------------------------------------------------------------- 상태 변경
 
-    /// `i`번째 줄 곡의 키워드 시트를 엶, 무작위 줄·설정·안내 카드에선 안 엶
+    /// `i`번째 줄 곡의 키워드 시트를 엶, 고를 수 있는 곡 줄에서만 (설정·안내 카드에선 안 엶)
     fn open_keywords(&mut self, i: usize) -> bool {
         if !matches!(self.sheet_now(), Sheet::Results | Sheet::History) || !self.listing() {
             return false;
@@ -1398,6 +1537,11 @@ impl Popup {
             }
         }
         self.retarget_panel();
+        if v == View::Results && self.listing() {
+            self.fit_scroll();
+            self.scroll_s.snap(self.scroll_s.target);
+            self.retarget_selection(true);
+        }
     }
 
     fn toggle_settings(&mut self) {
@@ -1526,7 +1670,13 @@ impl Popup {
         }
         // 검색어를 지우면 사라지는 동안 지난 결과를 시트에 남겨 둠
         if !q.trim().is_empty() {
-            self.results = self.find(&q);
+            if let Some(id) = playlist::id(&q) {
+                self.begin_playlist(id);
+            } else {
+                self.playlist = None;
+                self.playlist_request = None;
+                self.results = self.find(&q);
+            }
             self.bpm_rows = Filter::parse(&q).is_some_and(|f| f.bpm.is_some());
             if self.sel_of == Sheet::Results {
                 self.reset_rows();
@@ -1535,6 +1685,190 @@ impl Popup {
         self.searched = q;
         self.retarget_panel();
         true
+    }
+
+    /// 히스토리와 플레이리스트 사본을 `root`에서 읽음 (앱이 켤 때 부름)
+    pub fn load_history(&mut self, root: std::path::PathBuf) {
+        self.library = Library::load(root);
+    }
+
+    /// 이동을 시작한 줄만 히스토리에 남김, 보고 있는 플레이리스트면 사본도 씀
+    /// 곡 검색에서 고른 곡은 플레이리스트의 마지막 패턴을 안 바꿈
+    pub fn remember_pick(&mut self, entry: Recent) {
+        let shown = self.playlist.as_ref().filter(|p| entry.playlist_id() == Some(&p.id));
+        self.library.remember(entry, shown.and_then(|p| p.data.as_ref()));
+    }
+
+    /// 검색은 요청만 남기고 작업 스레드는 앱이 시작함
+    pub fn take_playlist_request(&mut self) -> Option<String> {
+        self.playlist_request.take()
+    }
+
+    /// 플레이리스트 주소 검색: 받아 둔 내용이나 사본이 있으면 바로 보여 주고 새로 받아 오게 요청
+    fn begin_playlist(&mut self, id: &str) {
+        let shown = self.playlist.take().filter(|p| p.id == id).and_then(|p| p.data);
+        let data = shown.or_else(|| self.library.copies.get(id).cloned());
+        self.results = data.as_ref().map(|p| self.playlist_rows(p)).unwrap_or_default();
+        let note = data.is_none().then_some(playlist::LOADING);
+        self.playlist = Some(PlaylistView { id: id.into(), data, note, restore: None });
+        self.playlist_request = Some(id.into());
+    }
+
+    /// 고를 수 있는 패턴이면 그 줄: 내 목록에 있는 곡이고 그 모드·난이도 패턴이 있음
+    fn pattern_row(&self, p: Pattern) -> Option<Row> {
+        let i = self.catalog.pick(p.title, self.owned.as_ref())?;
+        self.catalog.songs[i].level(p.mode, p.diff).map(|_| Row::Chart(i, p.mode, p.diff))
+    }
+
+    /// 플레이리스트 순서대로 항목마다 한 줄, 고를 수 있는 줄이 있으면 맨 위에 무작위 줄
+    fn playlist_rows(&self, data: &Playlist) -> Vec<Row> {
+        let rows: Vec<Row> = data
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| self.pattern_row(e.pattern).unwrap_or(Row::Unavailable(i)))
+            .collect();
+        let random = rows.iter().any(|r| r.selectable()).then_some(Row::Random);
+        random.into_iter().chain(rows).collect()
+    }
+
+    /// 작업 스레드의 응답, 사본은 히스토리에 있는 플레이리스트만 갱신
+    /// 지금 입력한 주소의 응답만 결과에 넣고, 고르던 줄을 새 목록에서 다시 고름
+    pub fn playlist_reply(&mut self, reply: Reply) {
+        match &reply.result {
+            Ok(data) => self.library.update(data),
+            Err(Failure::NotFound) => {
+                self.library.forget(&reply.id);
+                self.fill_history();
+                if self.view == View::History {
+                    self.retarget_panel();
+                }
+                if let Some(p) = self.playlist.as_mut().filter(|p| p.id == reply.id) {
+                    p.data = None;
+                }
+            }
+            Err(_) => {}
+        }
+        if self.view == View::Keywords || playlist::id(&self.query()) != Some(reply.id.as_str()) {
+            return;
+        }
+        let Some(p) = self.playlist.as_mut().filter(|p| p.id == reply.id) else { return };
+        let restore = p.restore.or_else(|| {
+            let row = self.results.get(self.selected).copied().filter(|r| r.selectable());
+            row.filter(|_| self.sel_of == Sheet::Results).map(|r| (r, self.scroll))
+        });
+        match reply.result {
+            Ok(data) => {
+                self.results = self.playlist_rows(&data);
+                self.playlist = Some(PlaylistView { id: reply.id, data: Some(data), note: None, restore: None });
+            }
+            Err(error) => {
+                // 404면 위에서 내용을 지웠고, 그 밖의 실패는 사본이 있으면 그대로 보여 줌
+                if error == Failure::NotFound {
+                    self.results.clear();
+                }
+                p.note = p.data.is_none().then_some(error.note());
+            }
+        }
+        if self.sel_of == Sheet::Results {
+            self.reset_rows();
+            if let Some((row, scroll)) = restore {
+                self.restore_row(row, scroll);
+            }
+        }
+        self.retarget_panel();
+    }
+
+    /// 히스토리의 플레이리스트 줄: 주소를 친 것처럼 결과로 열고 마지막으로 고른 패턴을 고름
+    fn open_playlist_history(&mut self, i: usize) {
+        let Some(Recent::Playlist { id, last }) = self.history_entries.get(i).cloned() else { return };
+        self.complete_composition();
+        self.clear_input();
+        self.edit.insert(&playlist::url(&id));
+        self.seen = self.query();
+        self.view = View::Results;
+        self.searched.clear();
+        self.search_now();
+        if let Some(row) = self.pattern_row(last) {
+            self.restore_row(row, 0);
+        }
+    }
+
+    /// 플레이리스트의 이름·전체 항목 수 (`entries.len()`), 사본이나 응답이 있어야 함
+    fn playlist_data(&self) -> Option<&Playlist> {
+        self.playlist.as_ref()?.data.as_ref()
+    }
+
+    /// 줄 자리에 보일 안내 문구, 사본으로 대신 보여 줄 수 있으면 None
+    fn playlist_note(&self) -> Option<&'static str> {
+        self.playlist.as_ref()?.note
+    }
+
+    /// 플레이리스트 결과의 무작위 줄 아랫줄: 이름, 뽑을 곡 수, 다음에 뽑을 수 있는 곡이 적으면 남은 수
+    fn playlist_random_note(&self) -> Option<String> {
+        let data = self.playlist_data()?;
+        let n = picks(&self.results).count();
+        let m = self.rolls.choices(&self.results).0.count();
+        let left = if m < n { format!(" ({m}개 남음)") } else { String::new() };
+        Some(format!("{} · {n}곡 중 하나{left}", data.name))
+    }
+
+    /// 플레이리스트 결과를 보는 중 (바의 채보 글자를 숨김), 입력 중인 주소가 아니라 검색한 결과 기준
+    fn playlist_results(&self) -> bool {
+        self.view == View::Results && self.playlist.as_ref().is_some_and(|p| playlist::id(&self.searched) == Some(&p.id))
+    }
+
+    /// 결과 `i`번째 줄의 플레이리스트 항목, 무작위 줄은 None
+    fn playlist_entry(&self, i: usize) -> Option<&Entry> {
+        if self.view != View::Results {
+            return None;
+        }
+        let data = self.playlist_data()?;
+        match *self.results.get(i)? {
+            Row::Unavailable(entry) => data.entries.get(entry),
+            Row::Chart(song, mode, diff) => {
+                let pattern = Pattern { title: self.catalog.songs[song].id, mode, diff };
+                data.entries.iter().find(|e| e.pattern == pattern)
+            }
+            _ => None,
+        }
+    }
+
+    /// 고를 수 없는 줄도 곡 이름을 표시
+    fn playlist_row_name(&self, i: usize) -> Option<String> {
+        Some(self.song_name(self.playlist_entry(i)?.pattern.title))
+    }
+
+    /// 곡 id의 이름, 곡 데이터에 없는 곡은 번호
+    fn song_name(&self, id: u32) -> String {
+        match self.catalog.songs.iter().find(|s| s.id == id) {
+            Some(s) => s.name.clone(),
+            None => format!("알 수 없는 곡 ({id})"),
+        }
+    }
+
+    /// 고를 수 없는 줄의 곡, 곡 데이터에 없으면 None (아랫줄 없이 빈 재킷 자리)
+    fn unavailable_song(&self, i: usize) -> Option<&Song> {
+        let entry = self.playlist_entry(i)?;
+        self.catalog.songs.iter().find(|s| s.id == entry.pattern.title)
+    }
+
+    /// 히스토리 `row`번째 줄의 플레이리스트: 주소 id, 마지막으로 고른 패턴, 사본
+    fn history_playlist(&self, row: usize) -> Option<(&str, Pattern, Option<&Playlist>)> {
+        let Row::Playlist(i) = *self.history.get(row)? else { return None };
+        let Some(Recent::Playlist { id, last }) = self.history_entries.get(i) else { return None };
+        Some((id.as_str(), *last, self.library.copies.get(id)))
+    }
+
+    /// 히스토리 플레이리스트 줄의 제목과 아랫줄 (곡 수, 마지막으로 고른 곡)
+    /// 사본이 없으면 이름 대신 id, 곡 수는 뺌
+    fn history_playlist_text(&self, row: usize) -> Option<(String, String)> {
+        let (id, last, copy) = self.history_playlist(row)?;
+        let last = format!("마지막 {}", self.song_name(last.title));
+        Some(match copy {
+            Some(p) => (p.name.clone(), format!("{}곡  ·  {last}", p.entries.len())),
+            None => (id.to_owned(), last),
+        })
     }
 
     /// 검색어로 찾은 줄: 조건 검색이면 무작위 줄과 맞는 줄 전부, 아니면 잘 맞는 곡
@@ -1553,9 +1887,19 @@ impl Popup {
         random.into_iter().chain(hits.into_iter().map(row)).collect()
     }
 
-    /// 히스토리 줄: 최근 고른 곡 중 지금 화면 모드에서 고를 수 있는 곡
+    /// 히스토리 줄: 지금 목록에서 고를 수 있는 곡과 플레이리스트
     fn fill_history(&mut self) {
-        self.history = self.catalog.pick_out(&self.recent, self.owned.as_ref()).into_iter().map(Row::Song).collect();
+        self.history_entries.clone_from(&self.library.recent);
+        let owned = self.owned.as_ref();
+        self.history = self
+            .history_entries
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| match e {
+                Recent::Song(id) => self.catalog.pick(*id, owned).map(Row::Song),
+                Recent::Playlist { .. } => Some(Row::Playlist(i)),
+            })
+            .collect();
         if self.sel_of == Sheet::History {
             self.reset_rows();
         }
@@ -1586,11 +1930,15 @@ impl Popup {
 
     /// 같은 줄을 다시 선택, 없으면 첫 줄, 스크롤은 선택 줄이 보이게만 맞춤
     fn restore_row(&mut self, row: Row, scroll: usize) {
-        self.selected = self.rows().iter().position(|r| *r == row).unwrap_or(0);
-        self.scroll = scroll.min(self.rows().len().saturating_sub(lay::ROWS)).min(self.selected);
-        if self.selected >= self.scroll + lay::ROWS {
-            self.scroll = self.selected + 1 - lay::ROWS;
+        // 사본 없이 응답을 기다리는 플레이리스트는 줄이 아직 없어서 응답이 오면 다시 고름
+        if self.view == View::Results {
+            if let Some(p) = self.playlist.as_mut().filter(|p| p.data.is_none()) {
+                p.restore = Some((row, scroll));
+            }
         }
+        self.selected = self.rows().iter().position(|r| *r == row).unwrap_or(0);
+        self.scroll = scroll;
+        self.fit_scroll();
         self.scroll_s.snap(self.scroll as f32 * self.px(lay::ROW_H));
         self.retarget_selection(true);
     }
@@ -1624,21 +1972,25 @@ impl Popup {
     }
 
     /// 고를 줄이 있을 때만 (사라지는 시트는 그대로 둠)
+    /// 고를 수 없는 줄은 건너뜀, 목표 너머에 고를 줄이 없으면 목표에서 지금 줄 쪽으로 가장 가까운 줄
     fn move_sel(&mut self, d: i32) {
         if !self.listing() || self.rows().is_empty() {
             return;
         }
-        let n = self.rows().len() as i32;
-        let ns = (self.selected as i32 + d).clamp(0, n - 1) as usize;
+        let rows = self.rows();
+        let target = (self.selected as i32 + d).clamp(0, rows.len() as i32 - 1) as usize;
+        let ok = |i: &usize| rows[*i].selectable();
+        let ns = if d >= 0 {
+            (target..rows.len()).find(ok).or_else(|| (self.selected + 1..target).rev().find(ok))
+        } else {
+            (0..=target).rev().find(ok).or_else(|| (target + 1..self.selected).find(ok))
+        };
+        let Some(ns) = ns else { return };
         if ns == self.selected {
             return;
         }
         self.selected = ns;
-        if self.selected < self.scroll {
-            self.set_scroll(self.selected);
-        } else if self.selected >= self.scroll + lay::ROWS {
-            self.set_scroll(self.selected + 1 - lay::ROWS);
-        }
+        self.fit_scroll();
         self.retarget_selection(false);
     }
 
@@ -1648,7 +2000,8 @@ impl Popup {
         if !self.listing() {
             return;
         }
-        let max = self.rows().len().saturating_sub(lay::ROWS) as i32;
+        let page = self.page();
+        let max = self.rows().len().saturating_sub(page) as i32;
         let ns = (self.scroll as i32 + d).clamp(0, max) as usize;
         if ns == self.scroll {
             return;
@@ -1662,7 +2015,13 @@ impl Popup {
             Hit::Row(_) => self.row_at(cursor.1 - dy, self.scroll_s.target),
             _ => None,
         };
-        self.selected = under.unwrap_or(ns + slot);
+        // 보이는 줄 안에서 가장 가까운 고를 수 있는 줄, 없으면 지금 선택 그대로
+        let next = under.unwrap_or(ns + slot);
+        let rows = self.rows();
+        if let Some(next) = (ns..(ns + page).min(rows.len())).filter(|&i| rows[i].selectable()).min_by_key(|&i| i.abs_diff(next)) {
+            self.selected = next;
+        }
+        self.fit_scroll();
         self.retarget_selection(false);
     }
 
@@ -1671,7 +2030,7 @@ impl Popup {
         self.scroll_s.target = s as f32 * self.px(lay::ROW_H);
     }
 
-    /// `i`번째 줄을 고름, 무작위 줄이면 하나를 뽑음
+    /// `i`번째 줄을 고름, 무작위 줄이면 하나를 뽑음, 히스토리의 플레이리스트 줄이면 그 결과를 엶
     fn choose(&mut self, i: usize) -> Action {
         if !self.listing() {
             return Action::None; // 검색어를 지운 뒤 남은 결과
@@ -1680,6 +2039,15 @@ impl Popup {
             Some(Row::Random) => self.roll(),
             r => r.copied(),
         };
+        if let Some(Row::Playlist(recent)) = row {
+            self.open_playlist_history(recent);
+            return Action::None;
+        }
+        if self.view == View::Results {
+            if let (Some(Row::Chart(s, mode, diff)), Some(p)) = (row, &self.playlist) {
+                return Action::PlaylistPick(p.id.clone(), Pattern { title: self.catalog.songs[s].id, mode, diff });
+            }
+        }
         match row {
             Some(Row::Song(s)) => Action::Pick(self.catalog.songs[s].id, None),
             Some(Row::Chart(s, m, d)) => Action::Pick(self.catalog.songs[s].id, Some((m, d))),
@@ -2001,11 +2369,11 @@ impl Popup {
                             Action::None
                         }
                         VK_PRIOR => {
-                            self.move_sel(-(lay::ROWS as i32));
+                            self.move_sel(-(self.page() as i32));
                             Action::None
                         }
                         VK_NEXT => {
-                            self.move_sel(lay::ROWS as i32);
+                            self.move_sel(self.page() as i32);
                             Action::None
                         }
                         // 캐럿만 움직이면 다시 검색하지 않음, Ctrl은 단어 단위, Shift는 선택
@@ -2094,9 +2462,11 @@ impl Popup {
                     return Some((0, Action::None));
                 }
                 if let Hit::Row(i) = self.hover {
-                    // 스크롤 중 목록 밖으로 나가는 줄엔 강조 자리가 없음
-                    if i != self.selected && (self.scroll..self.scroll + lay::ROWS).contains(&i) {
+                    // 스크롤 중 목록 밖으로 나가는 줄엔 강조 자리가 없음, 고를 수 없는 줄은 호버해도 그대로
+                    if i != self.selected && self.rows()[i].selectable() && (self.scroll..self.scroll + self.page()).contains(&i) {
                         self.selected = i;
+                        // 아래 칸이 높아져 보이는 줄이 줄면 고른 줄이 가려질 수 있음
+                        self.fit_scroll();
                         self.retarget_selection(false);
                     }
                 }
@@ -2205,7 +2575,7 @@ impl Popup {
                     }
                     // 예전 검색어 결과가 보이던 줄을 누르면 대신 지금 결과를 띄움
                     Hit::Row(_) if self.search_now() => Action::None,
-                    Hit::Row(i) => {
+                    Hit::Row(i) if self.rows()[i].selectable() => {
                         self.selected = i;
                         self.choose(i)
                     }
@@ -2397,15 +2767,24 @@ impl Popup {
         let off = self.scroll_s.value;
         let listed = matches!(self.sheet, Sheet::Results | Sheet::History);
         let n_rows = self.rows_of(self.sheet).len();
+        let foot = self.foot_of(self.sheet);
+        let n_page = n_rows.min(page_above(foot.as_ref()));
         let shown: Vec<usize> = if listed {
             let first = (off / pitch).floor().max(0.0) as usize;
-            let end = ((off / pitch + n_rows.min(lay::ROWS) as f32).ceil() as usize).min(n_rows);
+            let end = ((off / pitch + n_page as f32).ceil() as usize).min(n_rows);
             (first..end).collect()
         } else {
             Vec::new()
         };
-        let ids: Vec<Option<u32>> = shown.iter().map(|&j| self.rows_of(self.sheet)[j].song().map(|i| self.catalog.songs[i].id)).collect();
-        let jackets: Vec<Option<ID2D1Bitmap1>> = ids.into_iter().map(|id| id.and_then(|id| self.jacket(id))).collect();
+        // 고를 수 없는 줄도 곡 데이터에 있는 곡이면 재킷
+        let ids: Vec<Option<u32>> = shown
+            .iter()
+            .map(|&j| match self.rows_of(self.sheet)[j] {
+                Row::Unavailable(_) => self.unavailable_song(j).map(|s| s.id),
+                row => row.song().map(|i| self.catalog.songs[i].id),
+            })
+            .collect();
+        let jackets: Vec<Option<ID2D1Bitmap1>> = ids.iter().map(|id| id.and_then(|id| self.jacket(id))).collect();
         let kw_jacket = self.keyword_song().map(|s| s.id).and_then(|id| self.jacket(id));
 
         let g = self.gfx.as_ref().unwrap();
@@ -2534,8 +2913,9 @@ impl Popup {
 
             // 곡 이동 때 고를 채보 "4B · HD", 보여주기만 함 (설정은 톱니 버튼이나 Tab으로 엶)
             // 레벨 조건 검색 중엔 실제로 적용될 모드·난이도, 키워드 입력 중엔 안 보임
+            // 플레이리스트 결과는 항목마다 채보가 정해져 있어 안 보임
             let cr = self.cond_rect();
-            if !keywords {
+            if !keywords && !self.playlist_results() {
                 let (cm, cd) = match Filter::parse(&self.searched).and_then(|f| f.level).filter(|_| self.view == View::Results) {
                     Some(q) => (q.mode.unwrap_or(self.mode_choice), q.diff),
                     None => (self.mode_choice, self.diff_choice),
@@ -2703,7 +3083,7 @@ impl Popup {
                     let jsz = self.px(32.0);
                     let (jx, jy) = (panel.left + self.px(lay::PAD) + self.px(8.0), y + (self.px(lay::ROW_H) - jsz) / 2.0);
                     if let Some(bmp) = &kw_jacket {
-                        draw_jacket(g, bmp, jx, jy, jsz, self.px(lay::PANEL_R - lay::PAD - 8.0))?;
+                        draw_jacket(g, bmp, jx, jy, jsz, self.px(lay::PANEL_R - lay::PAD - 8.0), 1.0)?;
                     }
                     let tx = jx + jsz + self.px(10.0);
                     let tw = kl.done.left - self.px(8.0) - tx;
@@ -2746,44 +3126,72 @@ impl Popup {
                 } else if listed && n_rows == 0 {
                     // 최근 곡이 있는데 이 목록에 하나도 없을 때도 따로 알림
                     let empty = match self.sheet {
-                        Sheet::History if self.recent.is_empty() => "아직 고른 곡이 없어요",
+                        Sheet::History if self.library.recent.is_empty() => "아직 고른 곡이 없어요",
                         Sheet::History => "이 목록에서 고른 곡이 아직 없어요",
-                        _ => "일치하는 곡이 없어요",
+                        // 플레이리스트는 불러오는 중이거나 못 불러온 이유
+                        _ => self.playlist_note().unwrap_or("일치하는 곡이 없어요"),
                     };
                     let l = g.layout_centered(empty, &f.item, panel.right - panel.left, self.px(lay::ROW_H))?;
                     dc.DrawTextLayout(gfx::pt(panel.left, ct + self.px(lay::PAD)), &l, &sub_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
                 } else if listed {
                     let rows = self.rows_of(self.sheet);
                     // 선택 강조: 한 줄 높이, 모서리가 패널과 동심 (반지름 = PANEL_R - PAD)
-                    let hl = g.brush(white(FILL_SELECTED))?;
+                    // 고를 수 없는 줄엔 없음
                     let inset = self.px(lay::PAD);
-                    let t = ct + self.sel_y.value;
-                    dc.FillRoundedRectangle(&rrect(panel.left + inset, t, panel.right - inset, t + pitch, self.px(lay::PANEL_R - lay::PAD)), &hl);
+                    if rows.get(self.selected).is_none_or(|r| r.selectable()) {
+                        let hl = g.brush(white(FILL_SELECTED))?;
+                        let t = ct + self.sel_y.value;
+                        dc.FillRoundedRectangle(&rrect(panel.left + inset, t, panel.right - inset, t + pitch, self.px(lay::PANEL_R - lay::PAD)), &hl);
+                    }
 
                     let floor_b = g.brush(FAINT)?;
+                    let off_b = g.brush(DISABLED)?;
                     let jsz = self.px(32.0);
                     let jr = self.px(lay::PANEL_R - lay::PAD - 8.0);
                     // 줄은 줄 영역 안에서 미끄러짐 (멈추면 딱 보이는 줄만이라 잘림 없음)
                     let top = ct + self.row_y(0);
-                    dc.PushAxisAlignedClip(&rect(panel.left, top, panel.right, top + pitch * n_rows.min(lay::ROWS) as f32), D2D1_ANTIALIAS_MODE_ALIASED);
+                    dc.PushAxisAlignedClip(&rect(panel.left, top, panel.right, top + pitch * n_page as f32), D2D1_ANTIALIAS_MODE_ALIASED);
                     for (k, &j) in shown.iter().enumerate() {
                         let row = rows[j];
                         let y = ct + (self.row_y(0) + pitch * j as f32 - off);
                         let jx = panel.left + inset + self.px(8.0);
                         let jy = y + (self.px(lay::ROW_H) - jsz) / 2.0;
-                        if row == Row::Random {
-                            // 재킷 자리에 셔플 아이콘
-                            dc.FillRoundedRectangle(&rrect(jx, jy, jx + jsz, jy + jsz, jr), &g.brush(white(FILL_HOVER))?);
-                            if let Some(icf) = &f.icon {
-                                let il = g.layout_centered("\u{E8B1}", icf, jsz, jsz)?;
-                                dc.DrawTextLayout(gfx::pt(jx, jy), &il, &text_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                        // 고를 수 없는 줄은 제자리에 흐리게, 레벨 칸엔 "없음"
+                        let dim = matches!(row, Row::Unavailable(_));
+                        match row {
+                            // 재킷 자리에 아이콘: 무작위 줄은 셔플, 히스토리의 플레이리스트는 목록
+                            Row::Random | Row::Playlist(_) => {
+                                dc.FillRoundedRectangle(&rrect(jx, jy, jx + jsz, jy + jsz, jr), &g.brush(white(FILL_HOVER))?);
+                                if let Some(icf) = &f.icon {
+                                    let glyph = if row == Row::Random { "\u{E8B1}" } else { "\u{E90B}" };
+                                    let il = g.layout_centered(glyph, icf, jsz, jsz)?;
+                                    dc.DrawTextLayout(gfx::pt(jx, jy), &il, &text_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                                }
                             }
-                        } else if let Some(bmp) = &jackets[k] {
-                            draw_jacket(g, bmp, jx, jy, jsz, jr)?;
+                            _ => match &jackets[k] {
+                                Some(bmp) => draw_jacket(g, bmp, jx, jy, jsz, jr, if dim { DISABLED.a } else { 1.0 })?,
+                                // 곡 데이터에 없는 곡은 빈 재킷 자리
+                                None if dim && ids[k].is_none() => {
+                                    dc.FillRoundedRectangle(&rrect(jx, jy, jx + jsz, jy + jsz, jr), &g.brush(white(FILL_TRACK))?);
+                                }
+                                None => {}
+                            },
                         }
-                        // 제목, 아랫줄, 레벨 칸의 (난이도, 레벨, 서열표)
+                        // 제목, 아랫줄, 레벨 칸의 (글, 서열표)
                         let (title, sub, level) = match row {
-                            Row::Random => ("무작위로 고르기", self.rolls.note(rows), None),
+                            Row::Random => {
+                                let sub = self.playlist_random_note().unwrap_or_else(|| self.rolls.note(rows));
+                                (Cow::Borrowed("무작위로 고르기"), sub, None)
+                            }
+                            Row::Playlist(_) => {
+                                let (title, sub) = self.history_playlist_text(j).unwrap_or_default();
+                                (Cow::Owned(title), sub, None)
+                            }
+                            Row::Unavailable(_) => {
+                                let name = self.playlist_row_name(j).unwrap_or_default();
+                                let sub = self.unavailable_song(j).map(|s| format!("{}  ·  {}", s.composer, s.dlc)).unwrap_or_default();
+                                (Cow::Owned(name), sub, Some((Cow::Borrowed("없음"), None)))
+                            }
                             Row::Song(i) | Row::Chart(i, ..) => {
                                 let song = &self.catalog.songs[i];
                                 let (m, d) = match row {
@@ -2796,25 +3204,27 @@ impl Popup {
                                 } else {
                                     format!("{}  ·  {}", song.composer, song.dlc)
                                 };
-                                (song.name.as_str(), sub, song.level(m, d).map(|l| (d, l, song.floor(m, d))))
+                                let level = song.level(m, d).map(|l| (Cow::Owned(format!("{} {l}", d.label())), song.floor(m, d)));
+                                (Cow::Borrowed(song.name.as_str()), sub, level)
                             }
                         };
+                        let (title_b, line_b) = if dim { (&off_b, &off_b) } else { (&text_b, &sub_b) };
                         let tx = jx + jsz + self.px(10.0);
                         let lvl_r = panel.right - inset - self.px(8.0);
                         let tw = lvl_r - self.px(lay::LEVEL_W) - self.px(8.0) - tx;
                         let (title_y, sub_y) = (y + self.px(6.67), y + self.px(26.67));
-                        let tl = g.layout(title, &f.title, tw, self.px(19.0))?;
-                        dc.DrawTextLayout(gfx::pt(tx, title_y), &tl, &text_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+                        let tl = g.layout(&title, &f.title, tw, self.px(19.0))?;
+                        dc.DrawTextLayout(gfx::pt(tx, title_y), &tl, title_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
                         let sl_ = g.layout(&sub, &f.sub, tw, self.px(16.0))?;
-                        dc.DrawTextLayout(gfx::pt(tx, sub_y), &sl_, &sub_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+                        dc.DrawTextLayout(gfx::pt(tx, sub_y), &sl_, line_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
 
                         // 레벨 칸: 레벨 "HD 11"은 곡 이름과, 서열표 "13.4"는 아랫줄과 같은 글자 기준선
                         // 그 모드·난이도 패턴이 없는 곡은 비우고, 서열표가 없는 패턴은 아래만 비움
-                        let Some((diff, lvl, floor)) = level else { continue };
+                        let Some((label, floor)) = level else { continue };
                         let lx = lvl_r - self.px(lay::LEVEL_W);
-                        let ll = g.layout(&format!("{} {lvl}", diff.label()), &f.item_bold, self.px(lay::LEVEL_W), self.px(20.0))?;
+                        let ll = g.layout(&label, &f.item_bold, self.px(lay::LEVEL_W), self.px(20.0))?;
                         ll.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)?;
-                        dc.DrawTextLayout(gfx::pt(lx, title_y + baseline(&tl) - baseline(&ll)), &ll, &text_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                        dc.DrawTextLayout(gfx::pt(lx, title_y + baseline(&tl) - baseline(&ll)), &ll, title_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
                         if let Some(fl) = floor {
                             let fl = g.layout(&format!("{fl:.1}"), &f.sub, self.px(lay::LEVEL_W), self.px(16.0))?;
                             fl.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)?;
@@ -2822,6 +3232,22 @@ impl Popup {
                         }
                     }
                     dc.PopAxisAlignedClip();
+
+                    // 플레이리스트 결과 아래 칸: 줄 목록 아래 8부터 효과·목표 줄 (16 + 간격 4), 그 아래 코멘트
+                    // 코멘트가 없거나 무작위 줄을 고르면 이름과 곡 수를 보조 글자로
+                    if let Some(foot) = &foot {
+                        let mut y = ct + self.row_y(n_page) + self.px(8.0);
+                        if let Some(meta) = &foot.meta {
+                            let ml = g.layout(meta, &f.sub, r0 - l0, self.px(16.0))?;
+                            ml.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+                            dc.DrawTextLayout(gfx::pt(l0t, y), &ml, &floor_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+                            y += self.px(20.0);
+                        }
+                        if let Some(nl) = self.foot_layout(&foot.note) {
+                            let nb = if foot.comment { &text_b } else { &sub_b };
+                            dc.DrawTextLayout(gfx::pt(l0t, y), &nl, nb, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+                        }
+                    }
                 }
                 dc.SetTransform(&shrink);
                 dc.PopLayer();
@@ -2838,7 +3264,8 @@ impl Popup {
     }
 }
 
-/// 레이아웃 첫 줄의 글자 기준선, 위 끝에서 잰 거리 (줄이 더 있어도 첫 줄은 채워짐)
+/// 레이아웃 첫 줄의 글자 기준선, 위 끝에서 잰 거리
+/// 한 줄짜리 글에만 씀, 줄이 더 있으면 버퍼가 모자라 첫 줄도 안 채워지고 0
 fn baseline(l: &IDWriteTextLayout) -> f32 {
     let mut m = [DWRITE_LINE_METRICS::default()];
     let mut n = 0;
@@ -2846,14 +3273,15 @@ fn baseline(l: &IDWriteTextLayout) -> f32 {
     m[0].baseline
 }
 
-/// 재킷을 (`x`, `y`)에서 한 변 `size`로 줄여 둥근 사각형에 채움
-fn draw_jacket(g: &Gfx, bmp: &ID2D1Bitmap1, x: f32, y: f32, size: f32, rad: f32) -> Result<()> {
+/// 재킷을 (`x`, `y`)에서 한 변 `size`로 줄여 둥근 사각형에 채움, 불투명도 `alpha`
+fn draw_jacket(g: &Gfx, bmp: &ID2D1Bitmap1, x: f32, y: f32, size: f32, rad: f32, alpha: f32) -> Result<()> {
     unsafe {
         let bb = g.dc.CreateBitmapBrush(bmp, None, None)?;
         let sz = bmp.GetPixelSize();
         let sc = size / sz.width as f32;
         bb.SetTransform(&windows_numerics::Matrix3x2 { M11: sc, M12: 0.0, M21: 0.0, M22: sc, M31: x, M32: y });
         bb.SetInterpolationMode1(D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
+        bb.SetOpacity(alpha);
         g.dc.FillRoundedRectangle(&rrect(x, y, x + size, y + size, rad), &bb);
     }
     Ok(())

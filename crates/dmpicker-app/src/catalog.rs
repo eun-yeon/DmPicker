@@ -62,8 +62,8 @@ impl Catalog {
         f.find(&self.songs, mode, |i| self.allowed(i, owned))
     }
 
-    /// 곡 id들 중 카탈로그에 있고 고를 수 있는 곡의 `songs` 인덱스, 순서 그대로
-    pub fn pick_out(&self, ids: &[u32], owned: Option<&HashSet<u32>>) -> Vec<usize> {
-        ids.iter().filter_map(|&id| self.songs.iter().position(|s| s.id == id)).filter(|&i| self.allowed(i, owned)).collect()
+    /// 곡 id가 카탈로그에 있고 고를 수 있으면 그 `songs` 인덱스
+    pub fn pick(&self, id: u32, owned: Option<&HashSet<u32>>) -> Option<usize> {
+        self.songs.iter().position(|s| s.id == id).filter(|&i| self.allowed(i, owned))
     }
 }

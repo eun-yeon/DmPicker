@@ -24,6 +24,8 @@ pub const SUB: D2D1_COLOR_F = ink(0.70);
 /// 3순위: 안내 문구, 메모, 없는 레벨
 /// 11-12 px 글자가 읽히는 가장 흐린 값 (판 뒤가 가장 밝아도 4.5:1 이상)
 pub const FAINT: D2D1_COLOR_F = ink(0.55);
+/// 4순위: 고를 수 없는 줄의 글자, 재킷도 이만큼 흐리게
+pub const DISABLED: D2D1_COLOR_F = ink(0.32);
 /// 커서: 순백, 옆 글자보다 한 단계 밝게 (1.5 px 선은 더 흐려 보임)
 pub const CARET: D2D1_COLOR_F = ink(1.0);
 /// 채움 불투명도, 흐린 순으로 TRACK 세그먼트 컨트롤 트랙, HOVER 호버,

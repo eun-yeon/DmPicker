@@ -74,8 +74,8 @@ impl Keywords {
     }
 }
 
-/// 임시 파일에 다 쓴 뒤 바꿔 끼움, 쓰다 끊겨도 원래 파일이 남게
-fn write(path: &Path, raw: &[u8]) -> std::io::Result<()> {
+/// 임시 파일에 다 쓴 뒤 바꿔 끼움, 쓰다 끊겨도 원래 파일이 남게 (플레이리스트 사본도 씀)
+pub fn write(path: &Path, raw: &[u8]) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
