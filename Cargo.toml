@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/dmpicker-search", "crates/dmpicker-engine", "crates/dmpicker-nav", "crates/dmpicker-app"]
+members = ["crates/dmpicker-search", "crates/dmpicker-engine", "crates/dmpicker-nav", "crates/dmpicker-app", "crates/dmpicker-update"]
 
 [workspace.package]
 edition = "2021"

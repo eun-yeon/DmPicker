@@ -236,6 +236,74 @@ fn parse_entry(i: usize, e: &Value) -> Result<Song, String> {
 }
 
 impl Catalog {
+    /// 검증된 곡 정보와 패턴을 검색용 곡으로 변환
+    pub fn from_feed(
+        core: &dmpicker_update::Core,
+        dynamic: &dmpicker_update::Dynamic,
+    ) -> Result<Self, String> {
+        use dmpicker_update::{Difficulty, Mode as FeedMode, PatternKey};
+        if core.songs.len() != dynamic.patterns.len()
+            || core
+                .songs
+                .iter()
+                .any(|s| !dynamic.patterns.contains_key(&s.id))
+        {
+            return Err("feed song ids mismatch".into());
+        }
+        let strings = |values: &[String]| {
+            values
+                .iter()
+                .filter(|s| !s.is_empty() && s.as_str() != "$undefined")
+                .cloned()
+                .collect()
+        };
+        let songs = core
+            .songs
+            .iter()
+            .map(|s| {
+                if s.name.trim().is_empty() || s.name == "$undefined" {
+                    return Err(format!("id {}: missing song name", s.id));
+                }
+                let mut levels = [[None; 4]; 4];
+                let mut floors = [[None; 4]; 4];
+                for ((levels, floors), mode) in
+                    levels.iter_mut().zip(&mut floors).zip(FeedMode::ALL)
+                {
+                    for ((level, floor), difficulty) in
+                        levels.iter_mut().zip(floors).zip(Difficulty::ALL)
+                    {
+                        if let Some(pattern) = dynamic.pattern(PatternKey {
+                            id: s.id,
+                            mode,
+                            difficulty,
+                        }) {
+                            *level = Some(pattern.level.unwrap_or(0));
+                            *floor = pattern.floor.map(|f| f as f32).filter(|f| *f > 0.0);
+                        }
+                    }
+                }
+                Ok(Song {
+                    id: s.id,
+                    name: s.name.clone(),
+                    composer: s.composer.clone(),
+                    dlc: s.dlc.clone(),
+                    dlc_code: s.dlc_code.clone(),
+                    bpm: s.bpm.clone(),
+                    bpm_range: bpm_range(&s.bpm),
+                    genres: strings(&s.genres),
+                    segments: strings(&s.segments),
+                    composer_keys: strings(&s.composer_keys),
+                    tags: strings(&s.tags),
+                    names: strings(&s.names),
+                    user_keys: Vec::new(),
+                    levels,
+                    floors,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(Self { songs })
+    }
+
     /// djmax.gg 곡 데이터 파싱, 아래 객체들의 JSON 배열
     /// `{song:{title,name,composer,dlcCode,dlc,bpm,genres,newTab,patterns},
     ///   searchDoc:{segments,composerKeys}, hasPatternByMode, ...}`

@@ -6,4 +6,5 @@ description = "DJMAX RESPECT V 곡 검색, 한글 조합 중 입력과 초성 �
 
 [dependencies]
 dmpicker-nav = { path = "../dmpicker-nav" }
+dmpicker-update = { path = "../dmpicker-update" }
 serde_json = "1"

@@ -1,0 +1,11 @@
+[package]
+name = "dmpicker-update"
+edition.workspace = true
+version.workspace = true
+description = "곡 데이터와 실행 파일 업데이트 검증"
+
+[dependencies]
+serde_json = "1"
+flate2 = "1"
+sha2 = "0.10"
+minisign-verify = "0.2.5"
