@@ -97,8 +97,8 @@ mod lay {
     pub const CARD_BTN_W: f32 = 112.0;
     pub const COND_W: f32 = 52.0; // 글은 가운데, 오른쪽 끝이 16 정렬선
     pub const PANEL_MAX: f32 = PAD * 2.0 + ROW_H * ROWS as f32; // 304
-    /// 키워드 칩 줄 한도: 칩 위 88, 아래 안내 문구·여백 48을 빼고 창 높이에 드는 줄 (칩 28 + 간격 6)
-    pub const CHIP_LINES: usize = ((PANEL_MAX.max(SETTINGS_H) - 88.0 - 48.0 + 6.0) / 34.0) as usize; // 6
+    /// 키워드 칩 줄 한도: 칩 위 88, 아래 안내 문구·여백 44를 빼고 창 높이에 드는 줄 (칩 28 + 간격 6)
+    pub const CHIP_LINES: usize = ((PANEL_MAX.max(SETTINGS_H) - 88.0 - 44.0 + 6.0) / 34.0) as usize; // 6
 }
 
 struct Fonts {
@@ -987,7 +987,7 @@ impl Popup {
         let cy = y(lay::PAD) + self.px(lay::ROW_H) / 2.0;
         let done = rect(done_r - done_w, cy - self.px(15.0), done_r, cy + self.px(15.0));
         // 곡 줄 아래 8에 라벨 (줄 높이 16), 그 아래 8부터 칩 (높이 28, 세로 간격 6)
-        // 안내 문구는 칩 아래 12 (줄 높이 16), 맨 아래 여백 20
+        // 안내 문구는 칩 아래 12 (줄 높이 16), 맨 아래 여백은 양옆과 같은 16
         let (h, gap) = (self.px(28.0), self.px(6.0));
         let chips_top = y(88.0);
         let words = self.keyword_song().map_or(&[][..], |s| &s.user_keys[..]);
@@ -1006,7 +1006,7 @@ impl Popup {
         let chips_bottom = chips_top + (h + gap) * lines as f32 - gap;
         let note = chips_bottom + self.px(12.0);
         let bottom = if self.keyword_note().is_some() { note + self.px(16.0) } else { chips_bottom };
-        KeywordLayout { done, label: y(lay::PAD + lay::ROW_H + 8.0), chips_top, chips, note, height: bottom + self.px(20.0) - top }
+        KeywordLayout { done, label: y(lay::PAD + lay::ROW_H + 8.0), chips_top, chips, note, height: bottom + self.px(lay::INSET) - top }
     }
 
     /// 칩 자리: 16 정렬선 사이를 흐르며 줄바꿈, 칩마다 (왼쪽, 너비, 줄)
