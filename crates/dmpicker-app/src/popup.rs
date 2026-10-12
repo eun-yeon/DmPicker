@@ -618,6 +618,7 @@ pub struct Popup {
     moving: bool, // 직전 프레임이 애니메이션 중이었음
     caret_t0: Instant,
     text_scroll: f32, // 입력 칸을 가로로 민 거리 px, 캐럿이 보이게 (`render`)
+    text_return: Option<(f32, f32)>, // 버튼이 들어가기 시작할 때의 (민 거리, 바 진행), 그동안 글이 바와 같이 돌아옴
     dragging: bool,   // 입력 칸을 누른 채 끄는 중 (선택)
     last_mouse: Option<(i32, i32)>, // 마지막 마우스 이동의 클라이언트 좌표
     // 리소스
@@ -705,6 +706,12 @@ fn edge_fades(field: (f32, f32), text: (f32, f32), caret: (f32, f32), max: f32) 
     (left.clamp(0.0, max), right.clamp(0.0, max))
 }
 
+/// 버튼이 들어가는 동안 입력 칸을 민 거리, 들어가기 시작할 때의 거리 `s0`를 바 진행 `r` (시작 `r0`)에 비례해 줄임
+/// 바가 넘쳐 `r`이 0 아래로 가면 글도 같이 넘침, 캐럿 x `caret`이 보이는 폭 `room` 안에 오게 자름
+fn return_scroll(s0: f32, r0: f32, r: f32, caret: f32, room: f32) -> f32 {
+    (s0 * r / r0).clamp(caret - room, caret)
+}
+
 fn inside(r: &D2D_RECT_F, x: f32, y: f32) -> bool {
     x >= r.left && x <= r.right && y >= r.top && y <= r.bottom
 }
@@ -788,6 +795,7 @@ impl Popup {
             moving: false,
             caret_t0: now,
             text_scroll: 0.0,
+            text_return: None,
             dragging: false,
             last_mouse: None,
             jackets: HashMap::new(),
@@ -1105,13 +1113,17 @@ impl Popup {
 
     fn bar_rect(&self) -> D2D_RECT_F {
         let m = self.px(lay::MARGIN);
-        let r: f32 = self.reveal.iter().map(|s| s.value.clamp(-0.15, 1.15)).sum();
-        let w = self.px(lay::W) - self.px(lay::BTN_D + lay::BTN_GAP) * r;
+        let w = self.px(lay::W) - self.px(lay::BTN_D + lay::BTN_GAP) * self.bar_reveal();
         let h = self.px(lay::BAR_H);
         let o = self.open_s.value;
         let (sx, sy) = (0.90 + 0.10 * o, 0.70 + 0.30 * o);
         let (cx, cy) = (m + w / 2.0, m + h / 2.0);
         rect(cx - w * sx / 2.0, cy - h * sy / 2.0, cx + w * sx / 2.0, cy + h * sy / 2.0)
+    }
+
+    /// 바가 버튼에 내준 진행, 버튼 하나당 1 (튀어도 조금만 넘침), 바 폭과 글이 돌아오는 거리가 같이 씀
+    fn bar_reveal(&self) -> f32 {
+        self.reveal.iter().map(|s| s.value.clamp(-0.15, 1.15)).sum()
     }
 
     /// 버튼 `k`가 지금 그려지는 위치, 사슬처럼 차례로 짜내듯 나와 살짝 넘침
@@ -1657,7 +1669,7 @@ impl Popup {
         self.seen.clear();
         self.ended = None;
         self.text_scroll = 0.0;
-        self.caret_t0 = Instant::now();
+        self.input_changed();
     }
 
     /// 입력을 검사하고 저장, 되면 입력 칸만 비워 이어서 넣을 수 있게 함
@@ -1932,11 +1944,17 @@ impl Popup {
         }
     }
 
+    /// 입력 글이나 캐럿을 바꾸면 바를 따라 돌아오던 동작을 끝내고 캐럿을 다시 보임
+    fn input_changed(&mut self) {
+        self.text_return = None;
+        self.caret_t0 = Instant::now();
+    }
+
     /// 입력한 글이 바뀜: 글은 바로 보이고 결과는 입력이 멈춘 뒤에 바뀜 (`TIMER_SEARCH`)
     /// 검색어가 비어도 기다림, Enter·Esc·화살표로 글자를 확정하면 IME가 먼저 조합을 끝내고
     /// (글에서 그 글자가 빠짐) 그다음에 입력으로 넘겨주기 때문
     fn requery(&mut self, edit: Edit) {
-        self.caret_t0 = Instant::now();
+        self.input_changed();
         // 키워드 입력은 검색하지 않고 안내 문구만 지움
         if self.view == View::Keywords {
             self.set_keyword_note(None);
@@ -2552,6 +2570,9 @@ impl Popup {
             return;
         }
         self.beads_out = want;
+        // 들어갈 땐 지금 민 거리에서 바와 같이 돌아옴 (`return_scroll`)
+        let r = self.bar_reveal();
+        self.text_return = (!want && r > 0.0).then_some((self.text_scroll, r));
         let (lead, follow, to) = if want { (BEAD_HISTORY, BEAD_GEAR, 1.0) } else { (BEAD_GEAR, BEAD_HISTORY, 0.0) };
         self.reveal[lead].target = to;
         self.reveal_follow = Some((now + BEAD_STAGGER, follow, to));
@@ -2577,6 +2598,7 @@ impl Popup {
                 self.set_keyword_note(None);
                 // 선택이 있으면 먼저 지우고 그 자리에서 조합 (검색은 이어 오는 조합 메시지가 함)
                 self.edit.delete_selection();
+                self.input_changed();
                 self.place_candidate_window();
                 Some((0, Action::None))
             }
@@ -2698,7 +2720,10 @@ impl Popup {
                         self.set_keyword_note(None);
                     }
                     match vk.0 as u8 {
-                        b'A' => self.edit.select_all(),
+                        b'A' => {
+                            self.edit.select_all();
+                            self.input_changed();
+                        }
                         b'C' => {
                             self.copy();
                         }
@@ -2806,7 +2831,7 @@ impl Popup {
                                 VK_HOME => self.edit.home(shift),
                                 _ => self.edit.end(shift),
                             }
-                            self.caret_t0 = Instant::now();
+                            self.input_changed();
                             Action::None
                         }
                         // 조합 중 Backspace는 IME가 자모를 지움, Delete는 확정한 뒤 지움
@@ -2830,7 +2855,7 @@ impl Popup {
                 if self.dragging {
                     self.complete_composition(); // 위치는 조합 글자가 없는 글 기준
                     self.edit.move_to(self.text_index(x), true);
-                    self.caret_t0 = Instant::now();
+                    self.input_changed();
                     return Some((0, Action::None));
                 }
                 if !self.tracking {
@@ -2944,7 +2969,7 @@ impl Popup {
                         self.complete_composition();
                         let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
                         self.edit.move_to(self.text_index(x), shift);
-                        self.caret_t0 = Instant::now();
+                        self.input_changed();
                         self.dragging = true;
                         unsafe {
                             SetCapture(self.hwnd);
@@ -3385,16 +3410,25 @@ impl Popup {
                 l.SetUnderline(true, range)?;
             }
             // 캐럿 (조합 중이면 조합 글자 뒤)이 입력 칸 안에 오게 가로로 밈
+            // 버튼이 들어가는 동안엔 바와 같이 돌아오고 (`return_scroll`), 다 들어가 멈추면 원래대로
             let caret_x = text_x(&l, &q, c + self.preedit.len());
             let end = text_x(&l, &q, q.len());
             let room = tw - self.px(3.0);
-            let mut scroll = self.text_scroll;
-            if caret_x - scroll > room {
-                scroll = caret_x - room;
-            } else if caret_x < scroll {
-                scroll = caret_x;
+            if self.reveal.iter().all(Spring::settled) {
+                self.text_return = None;
             }
-            self.text_scroll = scroll.clamp(0.0, (end - room).max(0.0));
+            self.text_scroll = match self.text_return {
+                Some((s0, r0)) => return_scroll(s0, r0, self.bar_reveal(), caret_x, room),
+                None => {
+                    let mut scroll = self.text_scroll;
+                    if caret_x - scroll > room {
+                        scroll = caret_x - room;
+                    } else if caret_x < scroll {
+                        scroll = caret_x;
+                    }
+                    scroll.clamp(0.0, (end - room).max(0.0))
+                }
+            };
             let ox = tx - self.text_scroll;
             let field = rect(tx - self.px(2.0), bar.top, tx + tw, bar.bottom);
             dc.PushAxisAlignedClip(&field, D2D1_ANTIALIAS_MODE_ALIASED);
