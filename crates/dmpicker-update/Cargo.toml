@@ -2,10 +2,9 @@
 name = "dmpicker-update"
 edition.workspace = true
 version.workspace = true
-description = "곡 데이터와 실행 파일 업데이트 검증"
+description = "곡 데이터 업데이트 검증과 새 실행 파일 버전 확인"
 
 [dependencies]
 serde_json = "1"
 flate2 = "1"
 sha2 = "0.10"
-minisign-verify = "0.2.5"

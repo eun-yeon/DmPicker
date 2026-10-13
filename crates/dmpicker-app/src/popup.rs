@@ -795,6 +795,78 @@ impl Popup {
         }
     }
 
+    /// 닫힌 동안 새 목록으로 교체, 인덱스로 남긴 선택은 곡 id로 다시 찾음
+    pub fn replace_catalog(
+        &mut self,
+        mut next: Catalog,
+        changed_jackets: &HashSet<u32>,
+        owned: Option<HashSet<u32>>,
+    ) -> std::result::Result<(), Box<Catalog>> {
+        if self.visible {
+            return Err(Box::new(next));
+        }
+        self.restore_keyword_query();
+        let remap = |row| match row {
+            Row::Song(i) => self.catalog.songs.get(i).and_then(|s| next.pick(s.id, owned.as_ref())).map(Row::Song),
+            Row::Chart(i, mode, diff) => {
+                let i = self.catalog.songs.get(i).and_then(|s| next.pick(s.id, owned.as_ref()))?;
+                next.songs.get(i)?.level(mode, diff).map(|_| Row::Chart(i, mode, diff))
+            }
+            Row::Random | Row::Unavailable(_) => Some(row),
+            Row::Playlist(_) => None,
+        };
+        let kept_row = self.kept_row.and_then(|(row, scroll)| remap(row).map(|row| (row, scroll)));
+        let restore = self.playlist.as_ref().and_then(|p| p.restore).and_then(|(row, scroll)| remap(row).map(|row| (row, scroll)));
+        next.inherit_keywords(&mut self.catalog);
+        self.catalog = next;
+        self.owned = owned;
+        let ids: HashSet<_> = self.catalog.songs.iter().map(|song| song.id).collect();
+        self.library.recent.retain(|entry| match entry {
+            Recent::Song(id) => ids.contains(id),
+            Recent::Playlist { .. } => true,
+        });
+        self.kept_row = kept_row;
+        if let Some(p) = &mut self.playlist {
+            p.restore = restore;
+        }
+        self.rolls = Rolls::default();
+        self.view = View::Results;
+        self.sheet = Sheet::Results;
+        self.sel_of = Sheet::Results;
+        self.fill_history();
+        let query = self.query();
+        self.results = if query.trim().is_empty() {
+            Vec::new()
+        } else if let Some(id) = playlist::id(&query) {
+            self.playlist.as_ref().filter(|p| p.id == id).and_then(|p| p.data.as_ref())
+                .map(|data| self.playlist_rows(data)).unwrap_or_default()
+        } else {
+            self.playlist = None;
+            self.playlist_request = None;
+            self.find(&query)
+        };
+        self.bpm_rows = Filter::parse(&query).is_some_and(|f| f.bpm.is_some());
+        self.searched.clear();
+        self.reset_rows();
+        self.panel_h.snap(0.0);
+        self.shown.snap(0.0);
+        self.list_shown.snap(1.0);
+        self.last_list = None;
+        self.old_list = None;
+        self.hover = Hit::None;
+        self.jackets.retain(|id, _| !changed_jackets.contains(id));
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn dynamic(&self) -> Option<&dmpicker_update::Dynamic> {
+        self.catalog.dynamic()
+    }
+
+    pub fn has_recognition(&self) -> bool {
+        self.owned.is_some()
+    }
+
     fn px(&self, v: f32) -> f32 {
         (v * self.scale).round()
     }
@@ -1087,7 +1159,10 @@ impl Popup {
             return b.clone();
         }
         let path = self.catalog.jacket_dir.join(format!("{id}.webp"));
-        let bmp = image::open(&path).ok().and_then(|im| {
+        let bmp = dmpicker_update::store::read_limited(&path, dmpicker_update::MAX_JACKET_BYTES).ok().and_then(|bytes| {
+            dmpicker_update::archive::validate_webp(&bytes).ok()?;
+            image::load_from_memory_with_format(&bytes, image::ImageFormat::WebP).ok()
+        }).and_then(|im| {
             let im = im.to_rgba8();
             self.gfx.as_ref()?.bitmap_from_rgba(im.width(), im.height(), im.as_raw()).ok()
         });

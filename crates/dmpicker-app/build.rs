@@ -2,5 +2,10 @@
 fn main() {
     println!("cargo:rerun-if-changed=assets/dmpicker.rc");
     println!("cargo:rerun-if-changed=assets/icon.ico");
-    embed_resource::compile("assets/dmpicker.rc", embed_resource::NONE).manifest_optional().unwrap();
+    let version = format!("{}.0", env!("CARGO_PKG_VERSION"));
+    let macros = [
+        format!("DMPICKER_VERSION={}", version.replace('.', ",")),
+        format!("DMPICKER_VERSION_STRING=\"{version}\""),
+    ];
+    embed_resource::compile("assets/dmpicker.rc", macros).manifest_optional().unwrap();
 }

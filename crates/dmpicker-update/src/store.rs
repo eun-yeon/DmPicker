@@ -8,12 +8,11 @@ use std::time::SystemTime;
 
 use serde_json::{json, Value};
 
-use crate::archive::{decode_json_gzip, validate_webp};
+use crate::archive::validate_webp;
 use crate::model::{validate_release_tag, validate_set_hash, Core, Dynamic, Manifest};
 use crate::{sha256, validate_bytes, Error, Result};
 use crate::{
-    MAX_CORE_BYTES, MAX_DYNAMIC_BYTES, MAX_GZIP_BYTES, MAX_JACKET_BYTES, MAX_MANIFEST_BYTES,
-    MAX_ZIP_BYTES,
+    MAX_CORE_BYTES, MAX_DYNAMIC_BYTES, MAX_JACKET_BYTES, MAX_MANIFEST_BYTES, MAX_ZIP_BYTES,
 };
 
 const LOCAL_JSON_LIMIT: usize = 64 * 1024;
@@ -206,16 +205,7 @@ fn sync_directory(_: &Path) -> Result<()> {
 }
 
 fn is_link(metadata: &Metadata) -> bool {
-    // FILE_ATTRIBUTE_REPARSE_POINT, 심볼릭 링크와 junction 모두 포함
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        metadata.file_attributes() & 0x400 != 0
-    }
-    #[cfg(not(windows))]
-    {
-        metadata.file_type().is_symlink()
-    }
+    metadata.file_type().is_symlink()
 }
 
 fn plain_dir(path: &Path) -> Result<()> {
@@ -256,7 +246,7 @@ pub struct Generation {
 pub fn read_generation(path: &Path) -> Result<Generation> {
     plain_dir(path)?;
     let complete = read_limited(&path.join(COMPLETE), 64)?;
-    let generation = read_data(path, false)?;
+    let generation = read_data(path)?;
     if complete != generation.manifest_hash.as_bytes() {
         return Err(Error::invalid("generation is not complete"));
     }
@@ -302,22 +292,12 @@ pub fn existing_generation(root: &Path, tag: &str) -> Result<Option<Generation>>
     Ok(None)
 }
 
-/// 동봉본은 압축된 JSON과 자켓에 같은 검증 적용
-pub fn read_bundled(path: &Path) -> Result<Generation> {
-    read_data(path, true)
-}
-
-fn read_data(path: &Path, compressed: bool) -> Result<Generation> {
+fn read_data(path: &Path) -> Result<Generation> {
     plain_dir(path)?;
     let manifest_bytes = read_limited(&path.join("manifest.json"), MAX_MANIFEST_BYTES)?;
     let manifest = Manifest::parse(&manifest_bytes)?;
     let read_json =
         |name: &str, asset: &crate::model::JsonAsset, limit: usize| -> Result<Vec<u8>> {
-            if compressed {
-                // 압축을 풀면서 원문 크기·해시까지 확인함
-                let bytes = read_limited(&path.join(&asset.file), MAX_GZIP_BYTES)?;
-                return decode_json_gzip(&bytes, asset, limit);
-            }
             let bytes = read_limited(&path.join(name), limit)?;
             validate_bytes(&bytes, &asset.sha256, asset.bytes, limit)?;
             Ok(bytes)
@@ -387,17 +367,13 @@ fn canonical_jacket_name(name: &str) -> bool {
 
 #[derive(Clone, Debug)]
 pub struct Candidate {
-    pub name: Option<String>,
+    pub name: String,
     pub path: PathBuf,
 }
 
 impl Candidate {
     pub fn load(&self) -> Result<Generation> {
-        if self.name.is_some() {
-            read_generation(&self.path)
-        } else {
-            read_bundled(&self.path)
-        }
+        read_generation(&self.path)
     }
 }
 
@@ -406,14 +382,14 @@ pub struct Selection<T> {
     pub value: T,
 }
 
-/// pointer.json, pointer.bak, COMPLETE 시각 최신순, 동봉본 순으로 처음 열리는 세대
+/// pointer.json, pointer.bak, COMPLETE 시각 최신순으로 처음 열리는 세대
+/// 열 수 있는 세대가 없으면 `None`
 /// `load`에서 loading 표식을 남기고 `Candidate::load`와 준비까지 마쳐야 함
 pub fn choose_generation<T>(
     root: &Path,
-    bundled: &Path,
     blocked: Option<&str>,
     mut load: impl FnMut(&Candidate) -> Result<T>,
-) -> Result<Selection<T>> {
+) -> Result<Option<Selection<T>>> {
     let mut names = Vec::new();
     if plain_dir(root).is_ok() {
         for file in ["pointer.json", "pointer.bak"] {
@@ -444,28 +420,19 @@ pub fn choose_generation<T>(
         names.extend(complete.into_iter().map(|(_, name)| name));
     }
     let mut seen = HashSet::new();
-    let mut candidates = Vec::new();
     for name in names {
         if blocked == Some(name.as_str()) || !seen.insert(name.clone()) {
             continue;
         }
-        candidates.push(Candidate {
+        let candidate = Candidate {
             path: root.join(&name),
-            name: Some(name),
-        });
-    }
-    candidates.push(Candidate {
-        name: None,
-        path: bundled.into(),
-    });
-    let mut last_error = Error::invalid("no valid data generation");
-    for candidate in candidates {
-        match load(&candidate) {
-            Ok(value) => return Ok(Selection { candidate, value }),
-            Err(error) => last_error = error,
+            name,
+        };
+        if let Ok(value) = load(&candidate) {
+            return Ok(Some(Selection { candidate, value }));
         }
     }
-    Err(last_error)
+    Ok(None)
 }
 
 pub struct Staging {
@@ -524,10 +491,6 @@ impl Staging {
         Ok(())
     }
 
-    pub fn write_features(&self, bytes: &[u8]) -> Result<()> {
-        self.write_part("features.bin", bytes)
-    }
-
     fn write_part(&self, name: &str, bytes: &[u8]) -> Result<()> {
         plain_dir(&self.path)?;
         let path = self.path.join(name);
@@ -544,7 +507,7 @@ impl Staging {
         prepare: impl FnOnce(&Generation) -> Result<T>,
     ) -> Result<(Generation, T)> {
         plain_dir(&self.root)?;
-        let mut generation = read_data(&self.path, false)?;
+        let mut generation = read_data(&self.path)?;
         let target = self
             .root
             .join(generation_name(&generation.manifest.release_tag)?);

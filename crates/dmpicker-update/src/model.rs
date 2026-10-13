@@ -108,15 +108,6 @@ impl Manifest {
     pub fn generation_name(&self) -> String {
         format!("gen-{}", self.release_tag)
     }
-
-    /// 파일 이름은 정해진 세 가지에만 한정
-    pub fn asset_url(&self, file: &str) -> Result<String> {
-        validate_release_tag(&self.release_tag)?;
-        if !matches!(file, CORE_FILE | DYNAMIC_FILE | JACKETS_FILE) {
-            return Err(Error::invalid("unknown asset filename"));
-        }
-        Ok(format!("{DATA_RELEASE_BASE}{}/{file}", self.release_tag))
-    }
 }
 
 fn json_asset(value: &Value, file: &str, max: usize) -> Result<JsonAsset> {
@@ -555,6 +546,7 @@ pub(crate) fn song_id(value: &Value) -> Result<u32> {
     value
         .as_u64()
         .and_then(|n| u32::try_from(n).ok())
+        .filter(|&id| id != u32::MAX)
         .ok_or_else(|| Error::invalid("invalid song id"))
 }
 
@@ -562,6 +554,9 @@ pub(crate) fn id_key(value: &str) -> Result<u32> {
     let id = value
         .parse::<u32>()
         .map_err(|_| Error::invalid("invalid song id key"))?;
+    if id == u32::MAX {
+        return Err(Error::invalid("reserved song id key"));
+    }
     if value != id.to_string() {
         return Err(Error::invalid("noncanonical song id key"));
     }

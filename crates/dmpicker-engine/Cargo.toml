@@ -6,6 +6,7 @@ version.workspace = true
 
 [dependencies]
 image = { version = "0.25", default-features = false, features = ["png", "webp"] }
+sha2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [

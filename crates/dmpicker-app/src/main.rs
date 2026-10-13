@@ -10,6 +10,7 @@ mod edit;
 mod gfx;
 mod hands;
 mod hotkey;
+mod http;
 mod icons;
 mod keywords;
 mod pace;
@@ -18,6 +19,7 @@ mod popup;
 mod sys;
 mod toast;
 mod tray;
+mod update;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -61,6 +63,11 @@ struct App {
     store: PathBuf,
     status: Arc<Mutex<Option<Status>>>,
     job: Option<(Arc<AtomicBool>, std::thread::JoinHandle<()>)>, // 실행 중인 작업과 취소 플래그
+    retired_jobs: Vec<std::thread::JoinHandle<()>>,
+    peek_job: Option<std::thread::JoinHandle<()>>,
+    initial_refs: Option<std::thread::JoinHandle<update::InitialLoad>>,
+    generation: u64,
+    updates: update::Updater,
     /// 곡 이동 중 화면이 저장된 목록과 달랐음
     /// 새 목록이 저장되거나 다음 이동이 도착할 때까지 검색창에서 다시 인식을 권함
     stale: Arc<AtomicBool>,
@@ -83,18 +90,10 @@ fn store_dir() -> PathBuf {
     std::env::var("APPDATA").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from(".")).join("DmPicker")
 }
 
-fn data_dir() -> PathBuf {
-    let exe = std::env::current_exe().unwrap_or_default();
-    let mut dir = exe.parent().map(|p| p.to_path_buf()).unwrap_or_default();
-    for _ in 0..5 {
-        if dir.join("data").join("djmaxgg_songs.json").exists() {
-            return dir.join("data");
-        }
-        if !dir.pop() {
-            break;
-        }
-    }
-    PathBuf::from("data")
+fn data_dir() -> std::io::Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    let adjacent = exe.parent().ok_or_else(|| std::io::Error::other("missing executable directory"))?.join("data");
+    Ok(adjacent)
 }
 
 fn sync_hotkey(a: &mut App) {
@@ -165,6 +164,7 @@ fn request_open(a: &mut App) {
     // 닫히는 중인 검색창이 화면 캡처에 섞이지 않게 바로 숨기고 포커스를 게임에 돌려줌
     if a.popup.visible {
         a.popup.hide_now();
+        a.updates.closed();
         // 숨긴 검색창이 다시 합성된 화면에서 빠질 때까지
         unsafe {
             let _ = windows::Win32::Graphics::Dwm::DwmFlush();
@@ -174,15 +174,16 @@ fn request_open(a: &mut App) {
         }
     }
     a.peeking = true;
+    if let Some(handle) = a.peek_job.take() { a.retired_jobs.push(handle); }
     let (slot, hwnd) = (a.peeked.clone(), a.popup.hwnd.0 as isize);
     let (store, titles) = (a.store.clone(), a.titles.clone());
-    std::thread::spawn(move || {
+    a.peek_job = Some(std::thread::spawn(move || {
         let _done = Done(hwnd);
         let t0 = std::time::Instant::now();
         let kind = driver::peek();
         eprintln!("peek: {kind:?} ({} ms)", t0.elapsed().as_millis());
         *slot.lock().unwrap() = kind.map(|k| driver::searchable(&store, k, &titles));
-    });
+    }));
 }
 
 /// drop될 때 검색창 창에 `WM_APP_OPEN`을 보냄, 확인 스레드가 도중에 끝나도 `peeking`이 풀리게
@@ -198,8 +199,9 @@ impl Drop for Done {
 
 /// 새 취소 플래그로 `f`를 작업 스레드에서 실행 (돌던 작업은 취소)
 fn spawn_job(a: &mut App, f: impl FnOnce(&AtomicBool, &dyn Fn(&str, Badge, Option<f32>)) + Send + 'static) {
-    if let Some((c, _)) = a.job.take() {
+    if let Some((c, handle)) = a.job.take() {
         c.store(true, Ordering::Relaxed);
+        a.retired_jobs.push(handle);
     }
     let cancel = Arc::new(AtomicBool::new(false));
     let flag = cancel.clone();
@@ -271,6 +273,7 @@ fn nav_mode(m: dmpicker_search::Mode) -> dmpicker_nav::ButtonMode {
 /// 작업에 필요한 걸 돌려주고, 재킷 참조를 불러오는 중이면 알린 뒤 None
 fn hand_over(a: &mut App) -> Option<driver::Ctx> {
     a.popup.hide();
+    a.updates.closed();
     if let Some(game) = capture::find_game_window() {
         input::request_foreground(game);
     }
@@ -377,6 +380,7 @@ fn on_action(a: &mut App, act: Action) {
             }
         }
     }
+    if !a.popup.is_open() { a.updates.closed(); }
     request_playlist(a);
 }
 
@@ -388,9 +392,110 @@ fn request_playlist(a: &mut App) {
     }
 }
 
+fn jobs_busy(a: &App) -> bool {
+    a.job.as_ref().is_some_and(|(_, h)| !h.is_finished())
+        || a.retired_jobs.iter().any(|h| !h.is_finished())
+        || a.peek_job.as_ref().is_some_and(|h| !h.is_finished())
+        || a.initial_refs.is_some()
+}
+
+fn reap_jobs(a: &mut App) {
+    if a.job.as_ref().is_some_and(|(_, h)| h.is_finished()) {
+        if let Some((_, handle)) = a.job.take() { let _ = handle.join(); }
+    }
+    let mut pending = Vec::new();
+    for handle in a.retired_jobs.drain(..) {
+        if handle.is_finished() { let _ = handle.join(); } else { pending.push(handle); }
+    }
+    a.retired_jobs = pending;
+    if a.peek_job.as_ref().is_some_and(|h| h.is_finished()) {
+        if let Some(handle) = a.peek_job.take() { let _ = handle.join(); }
+    }
+    if a.initial_refs.as_ref().is_some_and(|h| h.is_finished()) {
+        if let Some(handle) = a.initial_refs.take() {
+            if let Ok((generation, result)) = handle.join() {
+                if generation == a.generation {
+                    match result {
+                        Ok(startup) => {
+                            if let Some(refs) = a.updates.initial_loaded(startup) {
+                                if let Ok(mut slot) = a.refs.lock() { *slot = Some(refs); }
+                            }
+                        }
+                        Err(error) => {
+                            a.updates.initial_failed();
+                            eprintln!("jacket refs failed: {error}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 교체 관문과 메모리 교체를 한 번에 처리
+fn apply_ready(a: &mut App) {
+    if a.popup.visible || a.peeking || jobs_busy(a) { return; }
+    let Some(ready) = a.updates.take_ready() else { return; };
+    let had_data = a.updates.active.has_data();
+    let changed = ready.changed_jackets(&a.updates.active);
+    let update::Ready { catalog, active, refs, titles, summary } = ready;
+    if let Err(catalog) = a.popup.replace_catalog(catalog, &changed, None) {
+        a.updates.keep_ready(update::Ready { catalog: *catalog, active, refs, titles, summary });
+        return;
+    }
+    if let Ok(mut slot) = a.refs.lock() { *slot = active.has_data().then_some(refs); }
+    a.titles = titles;
+    if !had_data && active.has_data() {
+        driver::ensure_both(&a.store, &|id| a.titles.get(&id).cloned().unwrap_or_default());
+    }
+    a.generation = a.generation.wrapping_add(1);
+    a.updates.applied(active, &summary);
+}
+
+fn update_tick(a: &mut App) {
+    reap_jobs(a);
+    // 닫히는 애니메이션 중에도 검색창에서 시작한 받기는 멈춤
+    if !a.popup.is_open() { a.updates.closed(); }
+    a.updates.poll();
+    apply_ready(a);
+    start_update(a);
+}
+
+fn start_update(a: &mut App) {
+    let busy = a.peeking || jobs_busy(a);
+    let refs = a.refs.lock().ok().and_then(|slot| slot.clone());
+    a.updates.started(busy, refs);
+}
+
+fn update_opened(a: &mut App) {
+    if !a.popup.is_open() { return; }
+    reap_jobs(a);
+    a.updates.poll();
+    start_update(a);
+    let busy = a.peeking || jobs_busy(a);
+    let refs = a.refs.lock().ok().and_then(|slot| slot.clone());
+    a.updates.opened(busy, refs);
+}
+
+fn show_update_notice(a: &mut App) {
+    if !a.popup.is_open() || a.peeking || jobs_busy(a)
+        || a.status.lock().map_or(true, |slot| slot.is_some()) { return; }
+    if let Some(text) = a.updates.notice(a.popup.has_recognition()) {
+        a.toast.show(&text, Badge::None, Some(4.0));
+        a.updates.notice_shown();
+    }
+}
+
+fn stop_updates(a: &mut App) {
+    if let Some(handle) = a.initial_refs.take() { let _ = handle.join(); }
+    a.updates.stop();
+}
+
 /// 트레이 메뉴의 종료: 돌던 작업을 취소하고 아이콘을 지운 뒤 메시지 루프를 끝냄
-/// 작업은 누르던 키를 떼고 끝나게 1초까지만 기다림, 그래도 안 끝나면 그냥 종료
+/// 데이터 작업은 종료까지 기다림, 인식·이동은 키를 떼도록 1초 더 기다림
 fn quit(a: &mut App) {
+    if let Some((cancel, _)) = &a.job { cancel.store(true, Ordering::Relaxed); }
+    stop_updates(a);
     if let Some((cancel, handle)) = a.job.take() {
         cancel.store(true, Ordering::Relaxed);
         let t0 = std::time::Instant::now();
@@ -400,6 +505,9 @@ fn quit(a: &mut App) {
         if handle.is_finished() {
             let _ = handle.join();
         }
+    }
+    for handle in a.retired_jobs.drain(..) {
+        if handle.is_finished() { let _ = handle.join(); }
     }
     a.tray.remove();
     unsafe { PostQuitMessage(0) };
@@ -411,6 +519,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             if let Some((x, y)) = a.tray.clicked(msg, wp, lp) {
                 // 메뉴가 떠 있는 동안은 메시지 루프가 멈춰 닫기 애니메이션이 안 돎
                 a.popup.hide_now();
+                a.updates.closed();
                 match a.tray.menu(x, y, a.popup.hotkey) {
                     Some(tray::Menu::ResetHotkey) => reset_hotkey(a),
                     Some(tray::Menu::Quit) => quit(a),
@@ -440,6 +549,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             }
             if a.popup.is_open() {
                 a.popup.hide();
+                a.updates.closed();
             } else {
                 request_open(a);
                 request_playlist(a);
@@ -448,11 +558,13 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
         }
         if msg == WM_TIMER && wp.0 == TIMER_FOREGROUND {
             sync_hotkey(a);
+            update_tick(a);
             a.toast.tick();
             return LRESULT(0);
         }
         if msg == WM_APP_OPEN {
             a.peeking = false;
+            if let Some(handle) = a.peek_job.take() { let _ = handle.join(); }
             let found = a.peeked.lock().unwrap().take();
             // 확인하는 동안 다른 창으로 넘어갔으면 (Alt+Tab, 트레이 메뉴) 버림
             let game_front = capture::find_game_window().is_some_and(input::is_foreground);
@@ -463,6 +575,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                     eprintln!("open: no focus, hidden");
                     a.popup.hide_now();
                 }
+                update_opened(a);
+                show_update_notice(a);
             }
             request_playlist(a);
             return LRESULT(0);
@@ -479,6 +593,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             if let Some(st) = a.status.lock().unwrap().take() {
                 a.toast.show(&st.text, st.badge, st.secs);
             }
+            return LRESULT(0);
+        }
+        if msg == WM_ENDSESSION && wp.0 != 0 {
+            quit(a);
             return LRESULT(0);
         }
         if hwnd == a.popup.hwnd && a.popup.is_open() {
@@ -506,9 +624,16 @@ fn main() -> Result<()> {
             return Ok(());
         }
 
-        let dir = data_dir();
-        let mut catalog = match catalog::Catalog::load(&dir) {
-            Ok(c) => c,
+        let dir = match data_dir() {
+            Ok(dir) => dir,
+            Err(error) => {
+                eprintln!("executable directory: {error}");
+                MessageBoxW(None, w!("실행 파일 위치를 읽지 못했어요"), &HSTRING::from(APP_NAME), MB_OK | MB_ICONERROR);
+                return Ok(());
+            }
+        };
+        let mut startup = match update::preview(&store_dir(), &dir) {
+            Ok(data) => data,
             Err(e) => {
                 eprintln!("failed to load catalog from {}: {e}", dir.display());
                 let text = HSTRING::from(format!("곡 데이터를 읽지 못했어요\n{}\n\n실행 파일 옆에 data 폴더가 있는지 확인해 주세요", dir.display()));
@@ -516,36 +641,24 @@ fn main() -> Result<()> {
                 return Ok(());
             }
         };
-        catalog.load_keywords(store_dir().join("keywords.json"));
-        println!("catalog: {} songs from {}", catalog.songs.len(), dir.display());
+        startup.catalog.load_keywords(store_dir().join("keywords.json"));
+        println!("catalog: {} songs from {}", startup.catalog.songs.len(), dir.display());
 
         let ex = WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOREDIRECTIONBITMAP;
         let hwnd = sys::create_popup(w!("DmPickerPopup"), APP_NAME, ex, Some(wndproc))?;
         let toast = Toast::new(Some(wndproc))?;
         let tray = tray::Tray::new(Some(wndproc))?;
 
-        let titles: Arc<HashMap<u32, String>> = Arc::new(catalog.songs.iter().map(|s| (s.id, s.name.clone())).collect());
+        let titles: Arc<HashMap<u32, String>> = Arc::new(startup.catalog.songs.iter().map(|s| (s.id, s.name.clone())).collect());
         // 한쪽 모드에서 인식한 목록을 다른 모드에도 씀
-        driver::ensure_both(&store_dir(), &|id| titles.get(&id).cloned().unwrap_or_default());
-        let refs = Arc::new(Mutex::new(None));
-        {
-            let refs = refs.clone();
-            let jackets = catalog.jacket_dir.clone();
-            let cache = store_dir().join("refs.cache");
-            std::thread::spawn(move || {
-                let _ = std::fs::create_dir_all(cache.parent().unwrap());
-                match dmpicker_engine::RefSet::load_dir_cached(&jackets, &cache) {
-                    Ok(mut r) => {
-                        r.add_builtin_templates();
-                        println!("jacket refs: {}", r.song_count());
-                        *refs.lock().unwrap() = Some(Arc::new(r));
-                    }
-                    Err(e) => println!("jacket refs failed: {e}"),
-                }
-            });
+        if startup.active.has_data() {
+            driver::ensure_both(&store_dir(), &|id| titles.get(&id).cloned().unwrap_or_default());
         }
+        let refs = Arc::new(Mutex::new(startup.refs.clone()));
+        let initial_refs = startup.active.has_data().then(|| update::start_initial(store_dir(), dir.clone(), 0));
+        let updates = update::Updater::new(store_dir(), dir.clone(), &startup);
         let mut app_box = Box::new(App {
-            popup: Popup::new(hwnd, catalog),
+            popup: Popup::new(hwnd, startup.catalog),
             toast,
             tray,
             hotkey_on: false,
@@ -554,6 +667,11 @@ fn main() -> Result<()> {
             store: store_dir(),
             status: Arc::new(Mutex::new(None)),
             job: None,
+            retired_jobs: Vec::new(),
+            peek_job: None,
+            initial_refs,
+            generation: 0,
+            updates,
             stale: Arc::new(AtomicBool::new(false)),
             peeking: false,
             peeked: Arc::new(Mutex::new(None)),
@@ -566,6 +684,7 @@ fn main() -> Result<()> {
         SetTimer(Some(hwnd), TIMER_FOREGROUND, 250, None);
         if let Some(a) = app() {
             sync_hotkey(a);
+            start_update(a);
             println!("ready: {} on the song list", a.popup.hotkey.label());
         }
 
@@ -577,6 +696,7 @@ fn main() -> Result<()> {
             if animating {
                 while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
                     if msg.message == WM_QUIT {
+                        if let Some(a) = app() { stop_updates(a); }
                         return Ok(());
                     }
                     let _ = TranslateMessage(&msg);
@@ -602,6 +722,7 @@ fn main() -> Result<()> {
                 frame_start = std::time::Instant::now();
             } else {
                 if !GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                    if let Some(a) = app() { stop_updates(a); }
                     return Ok(());
                 }
                 let _ = TranslateMessage(&msg);

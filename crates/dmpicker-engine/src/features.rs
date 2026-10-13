@@ -15,8 +15,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use sha2::{Digest, Sha256};
 
 use crate::img::{apply_plane, apply_rgb, Op1d, Rgb, RgbView};
 
@@ -264,24 +267,261 @@ impl RefSet {
         Ok(set)
     }
 
+    /// 검증된 자켓 목록을 처음 읽을 때만 최대 16개 스레드로 특징 계산
+    /// `decode`는 WebP 형식을 지정해 디코딩한 128×128 이미지를 반환해야 함
+    /// 디코딩 못 한 곡은 건너뛰고 취소 오류는 전체 중단
+    pub fn load_jackets(
+        jackets: &[(SongId, String)],
+        decode: impl Fn(SongId) -> io::Result<Rgb> + Sync,
+    ) -> io::Result<Self> {
+        let jackets = checked_jackets(jackets)?;
+        let nthreads = std::thread::available_parallelism()
+            .map_or(4, |n| n.get())
+            .clamp(1, 16);
+        let chunk = jackets.len().div_ceil(nthreads).max(1);
+        let decode = &decode;
+        let results: Vec<io::Result<Vec<RefRow>>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = jackets
+                .chunks(chunk)
+                .map(|part| {
+                    std::thread::Builder::new().spawn_scoped(scope, move || {
+                        let mut rows = Vec::with_capacity(part.len());
+                        for &(id, _) in part {
+                            let image = match decode(id) {
+                                Ok(image) => image,
+                                Err(error) if error.kind() == io::ErrorKind::Interrupted => return Err(error),
+                                Err(error) => {
+                                    eprintln!("jacket {id}: {error}");
+                                    continue;
+                                }
+                            };
+                            if image.width != 128
+                                || image.height != 128
+                                || image.data.len() != 128 * 128 * 3
+                            {
+                                return Err(invalid_cache("invalid jacket dimensions"));
+                            }
+                            rows.push((
+                                id,
+                                Box::new(jacket_feature(image.view())),
+                                Box::new(jacket_feature_gray(image.view())),
+                                is_grey(image.view()),
+                            ));
+                        }
+                        Ok(rows)
+                    })
+                })
+                .collect();
+            // 오류가 나도 남은 스레드까지 모두 회수
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle?
+                        .join()
+                        .map_err(|_| io::Error::other("feature worker panicked"))?
+                })
+                .collect()
+        });
+        let mut set = Self::new();
+        for rows in results {
+            for (id, color, gray, grey_art) in rows? {
+                set.add_features(id, &color, &gray);
+                if grey_art {
+                    set.grey_art.insert(id);
+                }
+            }
+        }
+        set.add_builtin_templates();
+        Ok(set)
+    }
+
     /// [`RefSet::load_dir`]와 같지만 `cache_file`의 바이너리 특징 캐시가 폴더 목록과 맞으면 재사용
-    /// id, 파일 크기, mtime, 특징 버전을 비교, 안 맞으면 다시 계산해서 덮어씀 (쓰기 실패는 무시)
+    /// id, 자켓 내용 해시, 특징 버전을 비교, 안 맞으면 다시 계산해서 덮어씀 (쓰기 실패는 무시)
     pub fn load_dir_cached(
         dir: impl AsRef<Path>,
         cache_file: impl AsRef<Path>,
     ) -> io::Result<Self> {
         let files = list_jackets(dir.as_ref())?;
-        let sig = signature(&files);
-        let mut set = match read_cache(cache_file.as_ref(), sig) {
-            Some(s) => s,
-            None => {
+        let sig = signature(files.iter().map(|f| (f.id, f.hash.as_str())));
+        let mut set = match read_cache(cache_file.as_ref(), &sig) {
+            Ok(s) => s,
+            Err(_) => {
                 let s = compute_refs(&files);
-                let _ = write_cache(cache_file.as_ref(), sig, &s);
+                let _ = write_cache(cache_file.as_ref(), &sig, &s);
                 s
             }
         };
         set.add_builtin_templates();
         Ok(set)
+    }
+
+    /// 검증된 자켓 목록을 순차 갱신, 내용이 같은 곡의 특징은 그대로 복사
+    /// `decode`는 WebP 형식을 지정해 디코딩한 128×128 이미지를 반환해야 함
+    /// 디코딩 못 한 곡은 건너뛰고 취소 오류는 전체 중단
+    pub fn update_jackets(
+        jackets: &[(SongId, String)],
+        previous: Option<(&Self, &[(SongId, String)])>,
+        cancel: &AtomicBool,
+        mut decode: impl FnMut(SongId) -> io::Result<Rgb>,
+    ) -> io::Result<Self> {
+        let jackets = checked_jackets(jackets)?;
+        let old_hashes: HashMap<_, _> = match previous {
+            Some((_, old)) => checked_jackets(old)?.into_iter().collect(),
+            None => HashMap::new(),
+        };
+        let mut set = Self::new();
+        for (id, hash) in jackets {
+            check_cancel(cancel)?;
+            if let Some((old, _)) = previous {
+                if old_hashes.get(&id).copied() == Some(hash) && set.copy_rows(old, id)? {
+                    continue;
+                }
+            }
+            let decoded = decode(id);
+            check_cancel(cancel)?;
+            let image = match decoded {
+                Ok(image) => image,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => return Err(error),
+                Err(error) => {
+                    eprintln!("jacket {id}: {error}");
+                    continue;
+                }
+            };
+            if image.width != 128 || image.height != 128 || image.data.len() != 128 * 128 * 3 {
+                return Err(invalid_cache("invalid jacket dimensions"));
+            }
+            set.add_image(id, image.view());
+        }
+        check_cancel(cancel)?;
+        if !set.contains(RANDOM_ID) {
+            let old_builtin =
+                previous.filter(|(_, hashes)| !hashes.iter().any(|(id, _)| *id == RANDOM_ID));
+            if !matches!(old_builtin, Some((old, _)) if set.copy_rows(old, RANDOM_ID)?) {
+                set.add_builtin_templates();
+            }
+        }
+        Ok(set)
+    }
+
+    fn copy_rows(&mut self, source: &Self, id: SongId) -> io::Result<bool> {
+        let Some(rows) = source.by_id.get(&id) else {
+            return Ok(false);
+        };
+        let count = self
+            .len()
+            .checked_add(rows.len())
+            .ok_or_else(|| invalid_cache("too many feature rows"))?;
+        cache_len(count)?;
+        for row in rows {
+            let row = usize::try_from(*row).map_err(|_| invalid_cache("invalid feature row"))?;
+            let c = row
+                .checked_mul(FEAT_LEN)
+                .ok_or_else(|| invalid_cache("invalid feature row"))?;
+            let g = row
+                .checked_mul(GRAY_LEN)
+                .ok_or_else(|| invalid_cache("invalid feature row"))?;
+            let color: &Feature = source
+                .color
+                .get(
+                    c..c.checked_add(FEAT_LEN)
+                        .ok_or_else(|| invalid_cache("invalid feature row"))?,
+                )
+                .and_then(|values| values.try_into().ok())
+                .ok_or_else(|| invalid_cache("invalid feature row"))?;
+            let gray: &GrayFeature = source
+                .gray
+                .get(
+                    g..g.checked_add(GRAY_LEN)
+                        .ok_or_else(|| invalid_cache("invalid feature row"))?,
+                )
+                .and_then(|values| values.try_into().ok())
+                .ok_or_else(|| invalid_cache("invalid feature row"))?;
+            self.add_features(id, color, gray);
+        }
+        if source.grey_art(id) {
+            self.grey_art.insert(id);
+        }
+        Ok(!rows.is_empty())
+    }
+
+    /// 특징 버전과 자켓 내용 서명이 맞는 캐시를 읽고 내장 자켓을 추가
+    pub fn from_cache_bytes(bytes: &[u8], signature: &str) -> io::Result<Self> {
+        validate_signature(signature)?;
+        if bytes.len() > MAX_CACHE_BYTES {
+            return Err(invalid_cache("feature cache is too large"));
+        }
+        let mut cursor = bytes;
+        if &take::<8>(&mut cursor)? != CACHE_MAGIC
+            || u32::from_le_bytes(take(&mut cursor)?) != FEATURE_VERSION
+            || take::<64>(&mut cursor)?.as_slice() != signature.as_bytes()
+        {
+            return Err(invalid_cache("feature cache signature mismatch"));
+        }
+        let count = usize::try_from(u32::from_le_bytes(take(&mut cursor)?))
+            .map_err(|_| invalid_cache("invalid feature count"))?;
+        if bytes.len() != cache_len(count)? {
+            return Err(invalid_cache("invalid feature cache length"));
+        }
+        let mut set = Self::new();
+        let mut color = Box::new([0.0; FEAT_LEN]);
+        let mut gray = Box::new([0.0; GRAY_LEN]);
+        for _ in 0..count {
+            let id = u32::from_le_bytes(take(&mut cursor)?);
+            let grey_art = match take::<1>(&mut cursor)? {
+                [0] => false,
+                [1] => true,
+                _ => return Err(invalid_cache("invalid feature flag")),
+            };
+            for value in color.iter_mut().chain(gray.iter_mut()) {
+                *value = f32::from_le_bytes(take(&mut cursor)?);
+                if !value.is_finite() {
+                    return Err(invalid_cache("invalid feature value"));
+                }
+            }
+            set.add_features(id, &color, &gray);
+            if grey_art {
+                set.grey_art.insert(id);
+            }
+        }
+        set.add_builtin_templates();
+        Ok(set)
+    }
+
+    /// 다음 실행에서 재사용할 특징 캐시 바이트
+    pub fn to_cache_bytes(&self, signature: &str) -> io::Result<Vec<u8>> {
+        validate_signature(signature)?;
+        let count = self.len();
+        let len = cache_len(count)?;
+        if count.checked_mul(FEAT_LEN) != Some(self.color.len())
+            || count.checked_mul(GRAY_LEN) != Some(self.gray.len())
+        {
+            return Err(invalid_cache("invalid feature rows"));
+        }
+        let mut bytes = Vec::with_capacity(len);
+        bytes.extend_from_slice(CACHE_MAGIC);
+        bytes.extend_from_slice(&FEATURE_VERSION.to_le_bytes());
+        bytes.extend_from_slice(signature.as_bytes());
+        bytes.extend_from_slice(
+            &u32::try_from(count)
+                .map_err(|_| invalid_cache("too many feature rows"))?
+                .to_le_bytes(),
+        );
+        for ((id, color), gray) in self
+            .ids
+            .iter()
+            .zip(self.color.chunks_exact(FEAT_LEN))
+            .zip(self.gray.chunks_exact(GRAY_LEN))
+        {
+            bytes.extend_from_slice(&id.to_le_bytes());
+            bytes.push(u8::from(self.grey_art(*id)));
+            for value in color.iter().chain(gray) {
+                if !value.is_finite() {
+                    return Err(invalid_cache("invalid feature value"));
+                }
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        Ok(bytes)
     }
 
     fn top_from(&self, k: usize, scores: impl Iterator<Item = f32>) -> Vec<Candidate> {
@@ -333,8 +573,7 @@ impl RefSet {
 struct JacketFile {
     id: SongId,
     path: PathBuf,
-    size: u64,
-    mtime_ns: u128,
+    hash: String,
 }
 
 fn list_jackets(dir: &Path) -> io::Result<Vec<JacketFile>> {
@@ -356,20 +595,27 @@ fn list_jackets(dir: &Path) -> io::Result<Vec<JacketFile>> {
         else {
             continue;
         };
-        let md = e.metadata()?;
-        let mtime_ns = md
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map_or(0, |d| d.as_nanos());
+        let mut file = fs::File::open(&path)?;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let size = file.read(&mut buffer)?;
+            if size == 0 {
+                break;
+            }
+            hasher.update(
+                buffer
+                    .get(..size)
+                    .ok_or_else(|| invalid_cache("invalid jacket read"))?,
+            );
+        }
         out.push(JacketFile {
             id,
             path,
-            size: md.len(),
-            mtime_ns,
+            hash: format!("{:x}", hasher.finalize()),
         });
     }
-    out.sort_by_key(|f| f.id);
+    out.sort_by(|a, b| a.id.cmp(&b.id).then(a.path.cmp(&b.path)));
     Ok(out)
 }
 
@@ -420,45 +666,98 @@ fn compute_refs(files: &[JacketFile]) -> RefSet {
     set
 }
 
-/// 캐시 형식이 바뀌면 올림 (02: 기준마다 회색 그림 표시 추가)
-const CACHE_MAGIC: &[u8; 8] = b"PKREFS02";
+/// 자켓 4096곡과 내장 자켓의 특징이 들어가는 상한
+pub const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
+const CACHE_MAGIC: &[u8; 8] = b"PKREFS03";
+const CACHE_HEADER_BYTES: usize = 80;
+const CACHE_ROW_BYTES: usize = 5 + 4 * (FEAT_LEN + GRAY_LEN);
 
-fn signature(files: &[JacketFile]) -> u64 {
-    // 모든 파일의 (버전, id, 크기, mtime)을 FNV-1a로 해시
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    let mut eat = |bytes: &[u8]| {
-        for &b in bytes {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x0100_0000_01b3);
-        }
-    };
-    eat(&FEATURE_VERSION.to_le_bytes());
-    eat(&(FEAT_SIZE as u32).to_le_bytes());
-    for f in files {
-        eat(&f.id.to_le_bytes());
-        eat(&f.size.to_le_bytes());
-        eat(&f.mtime_ns.to_le_bytes());
-    }
-    h
+fn invalid_cache(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-fn write_cache(path: &Path, sig: u64, set: &RefSet) -> io::Result<()> {
-    let n = set.len();
-    let mut buf = Vec::with_capacity(24 + n * (5 + 4 * (FEAT_LEN + GRAY_LEN)));
-    buf.extend_from_slice(CACHE_MAGIC);
-    buf.extend_from_slice(&FEATURE_VERSION.to_le_bytes());
-    buf.extend_from_slice(&sig.to_le_bytes());
-    buf.extend_from_slice(&(n as u32).to_le_bytes());
-    for i in 0..n {
-        buf.extend_from_slice(&set.ids[i].to_le_bytes());
-        buf.push(set.grey_art(set.ids[i]) as u8);
-        for v in &set.color[i * FEAT_LEN..(i + 1) * FEAT_LEN] {
-            buf.extend_from_slice(&v.to_le_bytes());
-        }
-        for v in &set.gray[i * GRAY_LEN..(i + 1) * GRAY_LEN] {
-            buf.extend_from_slice(&v.to_le_bytes());
-        }
+fn validate_signature(signature: &str) -> io::Result<()> {
+    if signature.len() == 64
+        && signature
+            .bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+    {
+        Ok(())
+    } else {
+        Err(invalid_cache("invalid feature signature"))
     }
+}
+
+fn checked_jackets(jackets: &[(SongId, String)]) -> io::Result<Vec<(SongId, &str)>> {
+    if jackets.len() > 4096 {
+        return Err(invalid_cache("too many jackets"));
+    }
+    let mut out = Vec::with_capacity(jackets.len());
+    let mut seen = HashSet::new();
+    for (id, hash) in jackets {
+        validate_signature(hash)?;
+        if !seen.insert(*id) {
+            return Err(invalid_cache("duplicate jacket id"));
+        }
+        out.push((*id, hash.as_str()));
+    }
+    out.sort_unstable_by_key(|(id, _)| *id);
+    Ok(out)
+}
+
+fn check_cancel(cancel: &AtomicBool) -> io::Result<()> {
+    if cancel.load(Ordering::Relaxed) {
+        Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "feature update cancelled",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// 정렬한 자켓 목록의 JSON 해시와 특징 버전을 묶은 서명
+pub fn jacket_signature(jackets: &[(SongId, String)]) -> io::Result<String> {
+    Ok(signature(checked_jackets(jackets)?))
+}
+
+fn signature<'a>(jackets: impl IntoIterator<Item = (SongId, &'a str)>) -> String {
+    let mut set = Sha256::new();
+    set.update(b"[");
+    for (index, (id, hash)) in jackets.into_iter().enumerate() {
+        if index != 0 {
+            set.update(b",")
+        }
+        set.update(format!("[{id},\"{hash}\"]").as_bytes());
+    }
+    set.update(b"]");
+    let mut result = Sha256::new();
+    result.update(FEATURE_VERSION.to_le_bytes());
+    result.update(format!("{:x}", set.finalize()).as_bytes());
+    format!("{:x}", result.finalize())
+}
+
+fn cache_len(count: usize) -> io::Result<usize> {
+    count
+        .checked_mul(CACHE_ROW_BYTES)
+        .and_then(|size| size.checked_add(CACHE_HEADER_BYTES))
+        .filter(|size| *size <= MAX_CACHE_BYTES)
+        .ok_or_else(|| invalid_cache("feature cache is too large"))
+}
+
+fn take<const N: usize>(cursor: &mut &[u8]) -> io::Result<[u8; N]> {
+    let value = cursor
+        .get(..N)
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| invalid_cache("truncated feature cache"))?;
+    *cursor = cursor
+        .get(N..)
+        .ok_or_else(|| invalid_cache("truncated feature cache"))?;
+    Ok(value)
+}
+
+fn write_cache(path: &Path, sig: &str, set: &RefSet) -> io::Result<()> {
+    let buf = set.to_cache_bytes(sig)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -467,37 +766,10 @@ fn write_cache(path: &Path, sig: u64, set: &RefSet) -> io::Result<()> {
     fs::rename(&tmp, path)
 }
 
-fn read_cache(path: &Path, sig: u64) -> Option<RefSet> {
-    let b = fs::read(path).ok()?;
-    if b.len() < 24 || &b[0..8] != CACHE_MAGIC {
-        return None;
-    }
-    let u32_at = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
-    if u32_at(8) != FEATURE_VERSION || u64::from_le_bytes(b[12..20].try_into().unwrap()) != sig {
-        return None;
-    }
-    let n = u32_at(20) as usize;
-    let rec = 5 + 4 * (FEAT_LEN + GRAY_LEN);
-    if b.len() != 24 + n * rec {
-        return None;
-    }
-    let mut set = RefSet::new();
-    let mut c = Box::new([0f32; FEAT_LEN]);
-    let mut g = Box::new([0f32; GRAY_LEN]);
-    for i in 0..n {
-        let o = 24 + i * rec;
-        let id = u32_at(o);
-        let fl = |k: usize| f32::from_le_bytes(b[k..k + 4].try_into().unwrap());
-        for (j, v) in c.iter_mut().enumerate() {
-            *v = fl(o + 5 + 4 * j);
-        }
-        for (j, v) in g.iter_mut().enumerate() {
-            *v = fl(o + 5 + 4 * FEAT_LEN + 4 * j);
-        }
-        set.add_features(id, &c, &g);
-        if b[o + 4] != 0 {
-            set.grey_art.insert(id);
-        }
-    }
-    Some(set)
+fn read_cache(path: &Path, sig: &str) -> io::Result<RefSet> {
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take(MAX_CACHE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    RefSet::from_cache_bytes(&bytes, sig)
 }

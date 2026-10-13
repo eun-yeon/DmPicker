@@ -13,13 +13,38 @@ pub struct Catalog {
     searcher: Searcher,
     pub jacket_dir: PathBuf,
     keywords: Option<Keywords>,
+    dynamic: Option<dmpicker_update::Dynamic>,
 }
 
 impl Catalog {
-    pub fn load(data_dir: &Path) -> Result<Self, String> {
-        let cat = dmpicker_search::Catalog::load(data_dir.join("djmaxgg_songs.json"))?;
+    /// 곡 데이터를 받기 전의 빈 검색 목록
+    pub fn empty(data_dir: &Path) -> Self {
+        let cat = dmpicker_search::Catalog { songs: Vec::new() };
         let searcher = Searcher::new(&cat);
-        Ok(Self { songs: cat.songs, searcher, jacket_dir: data_dir.join("jackets"), keywords: None })
+        Self { songs: cat.songs, searcher, jacket_dir: data_dir.join("jackets"), keywords: None, dynamic: None }
+    }
+
+    /// 검증된 세대의 곡과 패턴을 검색 목록으로 준비
+    pub fn from_feed(core: &dmpicker_update::Core, dynamic: &dmpicker_update::Dynamic, data_dir: &Path) -> Result<Self, String> {
+        let cat = dmpicker_search::Catalog::from_feed(core, dynamic)?;
+        let searcher = Searcher::new(&cat);
+        Ok(Self {
+            songs: cat.songs,
+            searcher,
+            jacket_dir: data_dir.join("jackets"),
+            keywords: None,
+            dynamic: Some(dynamic.clone()),
+        })
+    }
+
+    pub fn dynamic(&self) -> Option<&dmpicker_update::Dynamic> {
+        self.dynamic.as_ref()
+    }
+
+    /// 교체 직전의 키워드와 저장 경로를 옮긴 뒤 새 곡에 다시 적용
+    pub fn inherit_keywords(&mut self, previous: &mut Self) {
+        self.keywords = previous.keywords.take();
+        self.reindex();
     }
 
     /// 곡 데이터와 별도로 읽은 내 키워드를 검색 색인에 합침

@@ -2,17 +2,16 @@
 
 use std::path::Path;
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::exe::Version;
 use crate::model::validate_release_tag;
 use crate::store::{atomic_write, read_limited, validate_generation_name};
-use crate::time::{retry_after_deadline, DAY, HOUR};
-use crate::{valid_hash, Error, Result};
+use crate::time::{DAY, HOUR, retry_after_deadline};
+use crate::{Error, Result, valid_hash};
 
 pub const STATE_FILE: &str = "update-state.json";
 pub const STATE_MAX_BYTES: usize = 64 * 1024;
-pub const APPEARANCE_GAP: i64 = 10 * 60;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CheckError {
@@ -28,17 +27,15 @@ pub struct UpdateState {
     pub next_eligible_at: Option<i64>,
     pub retry_after_until: Option<i64>,
     pub last_exe_check: Option<i64>,
+    pub latest_version: Option<String>,
+    pub notified_version: Option<Version>,
     pub applied_tag: Option<String>,
     pub confirmed_tag: Option<String>,
     pub confirmed_active_tag: Option<String>,
     pub preparing: Option<String>,
     pub loading: Option<String>,
     pub last_error: Option<CheckError>,
-    pub skipped_versions: Vec<Version>,
-    pub applied_version: Option<Version>,
-    pub notified_versions: Vec<Version>,
     pub notified_schema: Option<u64>,
-    pub exe_apply_failed: bool,
 }
 
 fn optional<'a>(object: &'a Map<String, Value>, name: &str) -> Option<&'a Value> {
@@ -116,42 +113,20 @@ impl UpdateState {
                 Ok::<_, Error>(CheckError { stage, http_status })
             })
             .transpose()?;
-        let versions = |name| -> Result<Vec<Version>> {
-            let mut parsed = Vec::new();
-            if let Some(value) = optional(object, name) {
-                for version in value
-                    .as_array()
-                    .ok_or_else(|| Error::invalid(format!("invalid {name}")))?
-                {
-                    let version = Version::parse(
-                        version
-                            .as_str()
-                            .ok_or_else(|| Error::invalid("invalid version"))?,
-                    )?;
-                    if !parsed.contains(&version) {
-                        parsed.push(version);
-                    }
-                }
-            }
-            Ok(parsed)
+        let version = |name| -> Result<Option<Version>> {
+            optional_string(object, name)?
+                .map(|value| Version::parse(&value))
+                .transpose()
         };
-        let skipped_versions = versions("skippedVersions")?;
-        let notified_versions = versions("notifiedVersions")?;
+        let latest_version = optional_string(object, "latestVersion")?;
+        if let Some(tag) = &latest_version {
+            Version::parse(tag)?;
+        }
         let notified_schema = optional(object, "notifiedSchema")
             .map(|v| {
                 v.as_u64()
                     .ok_or_else(|| Error::invalid("invalid notifiedSchema"))
             })
-            .transpose()?;
-        let exe_apply_failed = optional(object, "exeApplyFailed")
-            .map(|v| {
-                v.as_bool()
-                    .ok_or_else(|| Error::invalid("invalid exeApplyFailed"))
-            })
-            .transpose()?
-            .unwrap_or(false);
-        let applied_version = optional_string(object, "appliedVersion")?
-            .map(|s| Version::parse(&s))
             .transpose()?;
         Ok(Self {
             last_check_start: optional_time(object, "lastCheckStart")?,
@@ -160,17 +135,15 @@ impl UpdateState {
             next_eligible_at: optional_time(object, "nextEligibleAt")?,
             retry_after_until: optional_time(object, "retryAfterUntil")?,
             last_exe_check: optional_time(object, "lastExeCheck")?,
+            latest_version,
+            notified_version: version("notifiedVersion")?,
             applied_tag,
             confirmed_tag,
             confirmed_active_tag,
             preparing,
             loading,
             last_error,
-            skipped_versions,
-            applied_version,
-            notified_versions,
             notified_schema,
-            exe_apply_failed,
         })
     }
 
@@ -182,6 +155,8 @@ impl UpdateState {
             "nextEligibleAt": self.next_eligible_at,
             "retryAfterUntil": self.retry_after_until,
             "lastExeCheck": self.last_exe_check,
+            "latestVersion": self.latest_version,
+            "notifiedVersion": self.notified_version.map(|version| version.to_string()),
             "appliedTag": self.applied_tag,
             "confirmedTag": self.confirmed_tag,
             "confirmedActiveTag": self.confirmed_active_tag,
@@ -191,11 +166,7 @@ impl UpdateState {
                 "stage": error.stage,
                 "httpStatus": error.http_status,
             })),
-            "skippedVersions": self.skipped_versions.iter().map(ToString::to_string).collect::<Vec<_>>(),
-            "appliedVersion": self.applied_version.map(|v| v.to_string()),
-            "notifiedVersions": self.notified_versions.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "notifiedSchema": self.notified_schema,
-            "exeApplyFailed": self.exe_apply_failed,
         }))?;
         if bytes.len() > STATE_MAX_BYTES {
             return Err(Error::invalid("update state too large"));
@@ -250,7 +221,7 @@ impl UpdateState {
         self.last_error = None;
     }
 
-    /// exe 확인 요청을 실제로 시작할 때 기록
+    /// exe 확인을 끝까지 마친 뒤 기록, 취소되면 기록 안 함
     pub fn record_exe_check(&mut self, now: i64) {
         self.last_exe_check = Some(now);
     }
@@ -324,20 +295,30 @@ impl UpdateState {
         Ok(())
     }
 
-    pub fn skip_version(&mut self, version: Version) {
-        if !self.skipped_versions.contains(&version) {
-            self.skipped_versions.push(version);
+    /// 지금 앱보다 높고 이미 확인한 버전보다 새로울 때만 기록
+    pub fn record_exe_available(&mut self, tag: &str, current: Version) -> Result<()> {
+        let version = Version::parse(tag)?;
+        if version <= current {
+            return Ok(());
         }
+        if let Some(latest) = &self.latest_version {
+            if version <= Version::parse(latest)? {
+                return Ok(());
+            }
+        }
+        self.latest_version = Some(tag.to_owned());
+        Ok(())
     }
 
     pub fn needs_exe_notice(&self, version: Version) -> bool {
-        !self.notified_versions.contains(&version)
+        self.notified_version
+            .is_none_or(|notified| version > notified)
     }
 
-    /// 준비 알림을 실제로 보여 준 뒤 기록
+    /// 새 버전 알림을 실제로 보여 준 뒤 기록
     pub fn record_exe_notice(&mut self, version: Version) {
         if self.needs_exe_notice(version) {
-            self.notified_versions.push(version);
+            self.notified_version = Some(version);
         }
     }
 
@@ -349,42 +330,6 @@ impl UpdateState {
     pub fn record_schema_notice(&mut self, schema: u64) {
         self.notified_schema = Some(schema);
     }
-
-    /// 다음 실행에서 적용 실패 알림을 보여 준 뒤 지움
-    pub fn clear_exe_apply_failure(&mut self) {
-        self.exe_apply_failed = false;
-    }
-
-    pub fn record_exe_apply_failure(&mut self) {
-        self.exe_apply_failed = true;
-    }
-
-    /// 새 exe를 원래 이름으로 바꾼 결과만 기록
-    /// 먼저 기록하면 이름 바꾸기 전에 꺼졌을 때 되돌림으로 오판함
-    pub fn record_exe_rename(&mut self, version: Version, succeeded: bool) {
-        self.exe_apply_failed = !succeeded;
-        if succeeded {
-            self.applied_version = Some(version);
-        }
-    }
-
-    /// 수동 되돌림이면 문제 버전만 건너뜀
-    pub fn detect_rollback(&mut self, current: Version) -> Option<Version> {
-        let applied = self.applied_version.take()?;
-        if current < applied {
-            self.skip_version(applied);
-            Some(applied)
-        } else {
-            None
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Tick {
-    pub game_present: bool,
-    pub jobs_busy: bool,
-    pub appearance_delay: u8,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -392,14 +337,13 @@ pub enum CheckAction {
     #[default]
     None,
     Start {
+        check_data: bool,
         check_exe: bool,
     },
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct Scheduler {
-    game_present: bool,
-    appearance_at: Option<i64>,
     in_flight: bool,
 }
 
@@ -415,46 +359,57 @@ fn waiting(deadline: Option<i64>, now: i64) -> bool {
 }
 
 impl Scheduler {
-    /// 게임 창이 새로 생기면 0~10초 뒤 (마지막 확인 시작이 10분 안이면 건너뜀)
-    /// 게임 창이 있는 동안엔 `next_eligible_at`이 지나면, Retry-After는 둘 다 지킴
-    /// 반환 후 상태를 저장하고 worker 시작, 틱에서는 파일이나 네트워크에 접근하지 않음
-    pub fn advance(&mut self, state: &mut UpdateState, now: i64, event: Tick) -> CheckAction {
-        let appeared = event.game_present && !self.game_present;
-        self.game_present = event.game_present;
-        if !event.game_present {
-            self.appearance_at = None;
+    /// 앱 시작은 Retry-After만 지키고 성공·실패 간격은 무시
+    pub fn startup(&mut self, state: &mut UpdateState, now: i64, jobs_busy: bool) -> CheckAction {
+        self.start(
+            state,
+            now,
+            jobs_busy,
+            !waiting(state.retry_after_until, now),
+        )
+    }
+
+    /// 검색창 열기에서 데이터와 exe 기한을 따로 확인
+    /// 받은 세대가 없어도 Retry-After는 지키고 성공·실패 간격만 무시
+    pub fn due(
+        &mut self,
+        state: &mut UpdateState,
+        now: i64,
+        jobs_busy: bool,
+        force_data: bool,
+    ) -> CheckAction {
+        let check_data = !waiting(state.retry_after_until, now)
+            && (force_data
+                || (!waiting(state.next_eligible_at, now)
+                    && !recent(state.last_success, now, HOUR)));
+        self.start(state, now, jobs_busy, check_data)
+    }
+
+    fn start(
+        &mut self,
+        state: &mut UpdateState,
+        now: i64,
+        jobs_busy: bool,
+        check_data: bool,
+    ) -> CheckAction {
+        if self.in_flight || jobs_busy {
             return CheckAction::None;
         }
-        if appeared {
-            self.appearance_at = if recent(state.last_check_start, now, APPEARANCE_GAP) {
-                None
-            } else {
-                Some(now.saturating_add(i64::from(event.appearance_delay.min(10))))
-            };
-        }
-        if self.in_flight || event.jobs_busy || waiting(state.retry_after_until, now) {
-            return CheckAction::None;
-        }
-        let appearance_due = match self.appearance_at {
-            Some(at) if at > now && at.saturating_sub(now) <= 10 => return CheckAction::None,
-            Some(_) => true,
-            None => false,
-        };
-        if !appearance_due && waiting(state.next_eligible_at, now) {
-            return CheckAction::None;
-        }
-        self.appearance_at = None;
-        self.in_flight = true;
-        state.last_check_start = Some(now);
         let check_exe = !recent(state.last_exe_check, now, DAY);
-        CheckAction::Start { check_exe }
+        if !check_data && !check_exe {
+            return CheckAction::None;
+        }
+        self.in_flight = true;
+        if check_data {
+            state.last_check_start = Some(now);
+        }
+        CheckAction::Start {
+            check_data,
+            check_exe,
+        }
     }
 
     pub fn finish(&mut self) {
         self.in_flight = false;
-    }
-
-    pub fn in_flight(&self) -> bool {
-        self.in_flight
     }
 }

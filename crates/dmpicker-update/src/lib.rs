@@ -8,7 +8,6 @@ pub mod state;
 pub mod store;
 pub mod time;
 
-pub use exe::{TRUSTED_COMMENT_PREFIX, TRUSTED_COMMENT_SUFFIX};
 pub use model::{
     Core, CoreSong, Difficulty, Dynamic, Manifest, Mode, Needs, Pattern, PatternAxes, PatternInfo,
     PatternKey,
@@ -22,23 +21,18 @@ pub const EXE_RELEASE_BASE: &str = "https://github.com/eun-yeon/DmPicker/release
 pub const CORE_FILE: &str = "core.json.gz";
 pub const DYNAMIC_FILE: &str = "dynamic.json.gz";
 pub const JACKETS_FILE: &str = "jackets.zip";
-pub const EXE_PUBLIC_KEY: &str = "RWR60PowI9+nVnDAt2j9Wc3LIZeoSpafouuAfAS2CTtWnx2N2UtoNEeJ";
 pub const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 pub const MAX_GZIP_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_CORE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_DYNAMIC_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_ZIP_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_JACKET_BYTES: usize = 64 * 1024;
-pub const MAX_EXE_BYTES: usize = 32 * 1024 * 1024;
-pub const MAX_SIGNATURE_BYTES: usize = 4 * 1024;
 pub const MAX_SONGS: usize = 4096;
 pub const MAX_STRING_BYTES: usize = 1024;
 pub const MAX_ARRAY_ITEMS: usize = 256;
-pub const MAX_REDIRECTS: usize = 5;
 pub const MANIFEST_TIMEOUT_SECS: u64 = 10;
 pub const JSON_TIMEOUT_SECS: u64 = 30;
 pub const JACKETS_TIMEOUT_SECS: u64 = 300;
-pub const EXE_TIMEOUT_SECS: u64 = 120;
 
 #[derive(Debug)]
 pub enum Error {

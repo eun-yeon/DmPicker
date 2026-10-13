@@ -1,16 +1,12 @@
 //! djmax.gg 플레이리스트: 주소·응답 읽기, 히스토리와 사본 저장, 작업 스레드에서 받아 오기
 
 use std::collections::{HashMap, HashSet};
-use std::ffi::c_void;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::{Duration, Instant};
 
 use dmpicker_search::{Diff, Mode};
 use serde_json::{json, Value};
-use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
-use windows::Win32::Networking::WinHttp::*;
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 
 /// 응답이 도착함, 검색창 창으로 옴 (main.rs의 WM_APP 메시지와 안 겹치게)
@@ -391,80 +387,17 @@ fn notify(hwnd: isize) {
     }
 }
 
-/// WinHTTP 핸들, 범위를 벗어나면 닫음
-struct Http(*mut c_void);
-
-impl Http {
-    /// 못 만든 핸들 (null)은 실패
-    fn new(raw: *mut c_void) -> Result<Self, Failure> {
-        if raw.is_null() {
-            Err(Failure::Failed)
-        } else {
-            Ok(Self(raw))
-        }
-    }
-}
-
-impl Drop for Http {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = WinHttpCloseHandle(self.0);
-        }
-    }
-}
-
-/// `id`의 항목 목록을 받아 읽음, 끝날 때까지 막혀서 작업 스레드에서만 부름
+/// 항목 목록을 작업 스레드에서 받아 읽음
 fn fetch(id: &str) -> Result<Playlist, Failure> {
     // 요청 경로에 그대로 들어감
     if !valid_id(id) {
         return Err(Failure::Failed);
     }
-    let failed = |_| Failure::Failed;
-    unsafe {
-        let agent = HSTRING::from(concat!("DmPicker/", env!("CARGO_PKG_VERSION")));
-        let session = Http::new(WinHttpOpen(&agent, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, PCWSTR::null(), PCWSTR::null(), 0))?;
-        // 이름 풀이·연결·보내기·받기 단계마다 3초
-        WinHttpSetTimeouts(session.0, 3000, 3000, 3000, 3000).map_err(failed)?;
-        let conn = Http::new(WinHttpConnect(session.0, w!("djmax.gg"), 443, 0))?;
-        let path = HSTRING::from(format!("/api/playlist/{id}/entries"));
-        let req = Http::new(WinHttpOpenRequest(
-            conn.0,
-            w!("GET"),
-            &path,
-            PCWSTR::null(),
-            PCWSTR::null(),
-            std::ptr::null(),
-            WINHTTP_FLAG_SECURE,
-        ))?;
-        // 헤더를 조금씩 보내도 전체 응답 헤더 대기는 10초로 제한
-        WinHttpSetOption(Some(req.0), WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT, Some(&10_000u32.to_ne_bytes())).map_err(failed)?;
-        WinHttpSendRequest(req.0, None, None, 0, 0, 0).map_err(failed)?;
-        WinHttpReceiveResponse(req.0, std::ptr::null_mut()).map_err(failed)?;
-        let (mut status, mut size) = (0u32, 4u32);
-        let query = WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER;
-        let status_buf = Some((&mut status as *mut u32).cast());
-        WinHttpQueryHeaders(req.0, query, PCWSTR::null(), status_buf, &mut size, std::ptr::null_mut()).map_err(failed)?;
-        match status {
-            200 => {}
-            404 => return Err(Failure::NotFound),
-            429 | 503 => return Err(Failure::Later),
-            _ => return Err(Failure::Failed),
-        }
-        let start = Instant::now();
-        let mut bytes = Vec::new();
-        let mut buf = [0u8; 8192];
-        loop {
-            let mut n = 0;
-            WinHttpReadData(req.0, buf.as_mut_ptr().cast(), buf.len() as u32, &mut n).map_err(failed)?;
-            if n == 0 {
-                break;
-            }
-            bytes.extend_from_slice(&buf[..n as usize]);
-            // 1 MiB를 넘거나 8초 넘게 걸리는 응답은 버림
-            if bytes.len() > 1_048_576 || start.elapsed() > Duration::from_secs(8) {
-                return Err(Failure::Failed);
-            }
-        }
-        Playlist::parse(id, &bytes).ok_or(Failure::Failed)
-    }
+    let url = format!("https://djmax.gg/api/playlist/{id}/entries");
+    let bytes = crate::http::playlist(&url).map_err(|error| match error.status {
+        Some(404) => Failure::NotFound,
+        Some(429 | 503) => Failure::Later,
+        _ => Failure::Failed,
+    })?;
+    Playlist::parse(id, &bytes).ok_or(Failure::Failed)
 }
