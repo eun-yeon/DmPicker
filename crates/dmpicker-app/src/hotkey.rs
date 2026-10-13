@@ -13,8 +13,9 @@ const fn hk(mods: HOT_KEY_MODIFIERS, vk: VIRTUAL_KEY) -> Hotkey {
     Hotkey { mods, vk }
 }
 
-/// Windows가 쓰는 조합: 창 메뉴, 창 닫기
-const SYSTEM: [Hotkey; 2] = [hk(MOD_ALT, VK_SPACE), hk(MOD_ALT, VK_F4)];
+/// Windows가 쓰는 조합: 창 닫기
+/// 창 메뉴(Alt + Space)는 받음, 단축키는 게임이 앞에 있을 때만 등록돼서 게임 창 메뉴만 안 열림
+const SYSTEM: [Hotkey; 1] = [hk(MOD_ALT, VK_F4)];
 
 const CTRL_SHIFT: HOT_KEY_MODIFIERS = HOT_KEY_MODIFIERS(MOD_CONTROL.0 | MOD_SHIFT.0);
 
@@ -66,7 +67,7 @@ fn key_name(vk: VIRTUAL_KEY) -> Option<String> {
 }
 
 impl Hotkey {
-    pub const DEFAULT: Hotkey = hk(MOD_CONTROL, VK_SPACE);
+    pub const DEFAULT: Hotkey = hk(MOD_ALT, VK_SPACE);
 
     /// 누른 조합을 단축키로 받을지, 못 받으면 검색창에 보일 이유
     /// `mods`에 `MOD_WIN`이 있을 수 있음 (Win 조합은 거부)
