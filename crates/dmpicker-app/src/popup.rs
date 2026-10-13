@@ -118,6 +118,9 @@ mod lay {
     pub const PANEL_MAX: f32 = PAD * 2.0 + ROW_H * ROWS as f32; // 304
     /// 히스토리 맨 위 탭 띠: 위 8 + 세그먼트 32, 그 아래 8은 줄 목록의 PAD (6줄이면 344)
     pub const TABS_H: f32 = PAD + 32.0;
+    /// 뽑은 기록 맨 위 띠: 위 8 + 무작위 줄 + 라벨 (위 8, 줄 높이 16), 그 아래 8은 줄 목록의 PAD
+    /// 첫 줄이 키워드 칩처럼 패널 위 88에서 시작 (6줄이면 384, 설정 시트보다 낮음)
+    pub const ROLLS_HEAD_H: f32 = PAD + ROW_H + 8.0 + 16.0;
     /// 키워드 칩 줄 한도: 칩 위 88, 아래 안내 문구·여백 44를 빼고 창 높이에 드는 줄 (칩 28 + 간격 6)
     pub const CHIP_LINES: usize = ((PANEL_MAX.max(SETTINGS_H) - 88.0 - 44.0 + 6.0) / 34.0) as usize; // 8
     /// 플레이리스트 결과 아래 칸의 글 줄 높이와 줄 수 한도, 넘는 코멘트는 말줄임
@@ -174,6 +177,8 @@ enum View {
     History,
     /// 곡 하나의 내 키워드, 결과·히스토리 줄을 우클릭하거나 F2로 엶
     Keywords,
+    /// 무작위 줄로 나온 곡, 결과·히스토리의 무작위 줄을 우클릭하거나 F2로 엶
+    Rolls,
 }
 
 /// 히스토리 맨 위 탭, 세그먼트 칸 순서대로
@@ -194,6 +199,8 @@ enum Sheet {
     History,
     /// 곡 줄과 키워드 칩
     Keywords,
+    /// 무작위 줄과 나온 곡 줄
+    Rolls,
 }
 
 /// 결과 자리에 뜨는 안내 카드, 모두 같은 높이 (`CARD_H`)
@@ -228,7 +235,7 @@ struct KeywordEdit {
     note: Option<&'static str>,
 }
 
-/// 히스토리에서 찾는 동안 원래 검색어와 결과 선택을 보관
+/// 히스토리·뽑은 기록에서 찾는 동안 원래 검색어와 결과 선택을 보관
 struct HistoryEdit {
     /// 열기 전 입력, 히스토리에선 입력 칸으로 그 탭을 찾음
     edit: Editor,
@@ -236,6 +243,20 @@ struct HistoryEdit {
     searched: String,
     /// 고르던 결과 줄과 스크롤
     row: Option<(Row, usize)>,
+}
+
+/// 뽑은 기록 시트 상태와 닫으면 돌아갈 보기·입력·검색어
+struct RollEdit {
+    from: View,
+    /// 열기 전 입력·검색어와 무작위 줄 자리, 닫으면 무작위 줄을 다시 고름
+    saved: HistoryEdit,
+    /// 연 곳 목록의 줄, 이 안에서 나온 곡만 보여 줌
+    /// 검색으로 좁혀도 초기화 범위는 이 목록 전체
+    scope: Vec<Row>,
+    /// 나온 곡 최근 순, 찾는 글이 있으면 맞는 줄만
+    rows: Vec<Row>,
+    /// 찾기 전 기록 수
+    total: usize,
 }
 
 /// 결과 한 줄
@@ -473,19 +494,34 @@ fn picks(rows: &[Row]) -> impl Iterator<Item = Row> + '_ {
 /// 앱을 켠 뒤 무작위 줄로 뽑은 줄, 검색 조건을 바꿔도 이어짐 (저장 안 함)
 #[derive(Default)]
 struct Rolls {
-    /// 뽑은 줄, 지금 결과를 다 뽑으면 그 결과의 것만 지움
-    picked: HashSet<Row>,
+    /// 뽑은 줄과 뽑은 순번, 지금 결과를 다 뽑으면 그 결과의 것만 지움
+    picked: HashMap<Row, u64>,
+    /// 마지막으로 매긴 순번, 기록을 지워도 안 줄어듦
+    order: u64,
     /// 직전에 뽑은 줄, 새 바퀴의 첫 뽑기에서 뺌
     last: Option<Row>,
 }
 
 impl Rolls {
+    /// `rows`에 든 줄의 이력만 지움, 처음부터 다시 뽑으니 직전 줄도 잊음
+    fn reset(&mut self, rows: &[Row]) {
+        self.picked.retain(|p, _| !rows.contains(p));
+        self.last = None;
+    }
+
+    /// `rows`에 든 뽑은 줄, 최근에 뽑은 것부터
+    fn recent(&self, rows: &[Row]) -> Vec<Row> {
+        let mut picked: Vec<_> = self.picked.iter().filter(|(row, _)| rows.contains(row)).collect();
+        picked.sort_unstable_by_key(|(_, order)| std::cmp::Reverse(**order));
+        picked.into_iter().map(|(&row, _)| row).collect()
+    }
+
     /// 다음에 뽑을 수 있는 줄과 새 바퀴 여부, 이력은 안 바꿈
     /// 안 뽑은 줄이 없으면 새 바퀴라 직전 줄만 뺌 (줄이 하나뿐이면 그것)
     fn choices<'a>(&'a self, rows: &'a [Row]) -> (impl Iterator<Item = Row> + 'a, bool) {
-        let restart = picks(rows).all(|r| self.picked.contains(&r));
+        let restart = picks(rows).all(|r| self.picked.contains_key(&r));
         let skip = if restart && picks(rows).nth(1).is_some() { self.last } else { None };
-        let choices = picks(rows).filter(move |&r| if restart { Some(r) != skip } else { !self.picked.contains(&r) });
+        let choices = picks(rows).filter(move |&r| if restart { Some(r) != skip } else { !self.picked.contains_key(&r) });
         (choices, restart)
     }
 
@@ -497,10 +533,11 @@ impl Rolls {
             return None;
         }
         if restart {
-            self.picked.retain(|p| !rows.contains(p));
+            self.picked.retain(|p, _| !rows.contains(p));
         }
         let row = choices[(r % choices.len() as u64) as usize];
-        self.picked.insert(row);
+        self.order += 1;
+        self.picked.insert(row, self.order);
         self.last = Some(row);
         Some(row)
     }
@@ -534,6 +571,10 @@ enum Hit {
     Favorite,
     /// 키워드 시트의 완료 버튼
     Done,
+    /// 뽑은 기록 시트의 초기화 버튼, 지울 기록이 있을 때만
+    ClearRolls,
+    /// 뽑은 기록 시트의 완료 버튼
+    DoneRolls,
     /// i번째 키워드 칩의 × 버튼
     RemoveKeyword(usize),
 }
@@ -618,6 +659,14 @@ struct KeywordLayout {
     height: f32, // 시트 높이
 }
 
+/// 물리 px 기준 뽑은 기록 시트: 맨 위 무작위 줄의 두 버튼과 라벨 줄 위쪽, 줄 목록은 `list_top`부터
+struct RollLayout {
+    /// 완료 버튼 왼쪽의 초기화 버튼
+    clear: D2D_RECT_F,
+    done: D2D_RECT_F,
+    label: f32,
+}
+
 pub struct Popup {
     pub hwnd: HWND,
     gfx: Option<Gfx>,
@@ -676,9 +725,9 @@ pub struct Popup {
     history_entries: Vec<Recent>,
     /// 히스토리 줄을 찾은 글, 히스토리를 나가 시트가 사라지는 동안에도 그대로
     history_query: String,
-    /// 히스토리 보기 (거기서 연 키워드 시트 포함)에서만 Some
+    /// 히스토리 보기 (거기서 연 키워드·뽑은 기록 시트 포함)에서만 Some
     history_edit: Option<HistoryEdit>,
-    /// `selected`·`scroll`이 가리키는 목록 (결과나 히스토리), 보이는 목록이 바뀔 때만 첫 줄로
+    /// `selected`·`scroll`이 가리키는 목록 (결과, 히스토리, 뽑은 기록), 보이는 목록이 바뀔 때만 첫 줄로
     sel_of: Sheet,
     rng: Rng,
     /// 무작위 줄로 뽑은 이력
@@ -698,6 +747,7 @@ pub struct Popup {
     kb_focus: Option<usize>, // 설정 키보드 포커스: 0 모드, 1 난이도, 2 다시 인식, 3 단축키, 4 검색어 유지, 5 DLC 표시
     toggle_down: Option<Toggle>, // 누른 토글 (떼면 바뀜)
     keyword_edit: Option<KeywordEdit>,
+    roll_edit: Option<RollEdit>,
     hover: Hit,
     // 애니메이션
     open_s: Spring,      // 띄울 때 0에서 1로 (살짝 튐)
@@ -901,6 +951,7 @@ impl Popup {
             kb_focus: None,
             toggle_down: None,
             keyword_edit: None,
+            roll_edit: None,
             hover: Hit::None,
             open_s: OPEN_SPRING,
             reveal: [Spring::new(0.0, 300.0, 17.0); 2],
@@ -946,6 +997,7 @@ impl Popup {
         if self.visible {
             return Err(Box::new(next));
         }
+        self.restore_roll_query();
         self.restore_keyword_query();
         self.restore_history_query();
         let remap = |row| match row {
@@ -998,6 +1050,7 @@ impl Popup {
     /// 받아 둔 곡 데이터가 없던 첫 받기, 열려 있어도 바로 새 목록으로 바꾸고 치던 검색어로 다시 찾음
     /// 빈 목록이라 옮길 선택·재킷이 없음, `owned`는 새 제목으로 다시 계산한 이번 열기의 고를 수 있는 곡
     pub fn fill_catalog(&mut self, mut next: Catalog, owned: Option<HashSet<u32>>) {
+        self.restore_roll_query();
         next.inherit_keywords(&mut self.catalog);
         self.catalog = next;
         self.owned = owned;
@@ -1210,6 +1263,7 @@ impl Popup {
     /// 검색창을 띄움, `owned`는 보이는 목록에서 고를 수 있는 곡 (첫 인식 전엔 None)
     /// `stale`이면 곡 이동 중 화면이 저장된 목록과 달랐음
     pub fn show(&mut self, owned: Option<HashSet<u32>>, stale: bool) {
+        self.restore_roll_query();
         self.restore_keyword_query();
         self.restore_history_query();
         if !self.prepare() {
@@ -1319,6 +1373,7 @@ impl Popup {
         for b in self.beams.iter().flat_map(Beams::all) {
             b.stop();
         }
+        self.restore_roll_query();
         self.restore_keyword_query();
         self.restore_history_query();
         unsafe {
@@ -1487,7 +1542,7 @@ impl Popup {
         self.panel_h.target = to;
         self.shown.go(1.0, SHEET_IN_SECS, Ease::DECEL);
         let sheet = self.sheet_now();
-        if matches!(sheet, Sheet::Results | Sheet::History) && sheet != self.sel_of {
+        if matches!(sheet, Sheet::Results | Sheet::History | Sheet::Rolls) && sheet != self.sel_of {
             self.sel_of = sheet;
             self.reset_rows();
         }
@@ -1508,6 +1563,7 @@ impl Popup {
     /// 지금 보기가 시트에 그릴 내용
     fn sheet_now(&self) -> Sheet {
         match self.view {
+            View::Rolls => Sheet::Rolls,
             View::Settings => Sheet::Settings,
             View::History => Sheet::History,
             View::Keywords => Sheet::Keywords,
@@ -1519,6 +1575,7 @@ impl Popup {
     /// 시트 `s`의 줄
     fn rows_of(&self, s: Sheet) -> &[Row] {
         match s {
+            Sheet::Rolls => self.roll_rows(),
             Sheet::History => &self.history,
             Sheet::Keywords => &[],
             _ => &self.results,
@@ -1536,11 +1593,11 @@ impl Popup {
         rect(b.right - self.px(8.0 + lay::COND_W), cy - self.px(15.0), b.right - self.px(8.0), cy + self.px(15.0))
     }
 
-    /// 바에 채보 "4B · HD"가 보임, 키워드 입력 중과 결과 화면의 플레이리스트 주소엔 안 보임
+    /// 바에 채보 "4B · HD"가 보임, 키워드 입력 중·뽑은 기록과 결과 화면의 플레이리스트 주소엔 안 보임
     /// 주소는 검색을 기다리지 않고 지금 글로 봄, 붙여 넣는 순간 입력 칸도 같이 넓어져 글이 나중에 안 튐
     fn shows_cond(&self) -> bool {
         match self.view {
-            View::Keywords => false,
+            View::Keywords | View::Rolls => false,
             View::Results => playlist::id(self.edit.text()).is_none(),
             View::Settings | View::History => true,
         }
@@ -1591,11 +1648,7 @@ impl Popup {
     fn keyword_layout(&self) -> KeywordLayout {
         let top = self.panel_top();
         let y = |v: f32| top + self.px(v);
-        // 완료 버튼은 레벨 칸 자리: 오른쪽 끝을 맞추고 줄 가운데, 높이 30에 글 좌우로 14
-        let done_r = self.px(lay::MARGIN + lay::W) - self.px(lay::PAD) - self.px(8.0);
-        let done_w = (self.measure("완료", |f| &f.item) + self.px(28.0)).round();
-        let cy = y(lay::PAD) + self.px(lay::ROW_H) / 2.0;
-        let done = rect(done_r - done_w, cy - self.px(15.0), done_r, cy + self.px(15.0));
+        let done = self.done_button();
         // 별 버튼은 완료 왼쪽 8에 30 x 30, 같은 줄 가운데
         let fav_r = done.left - self.px(8.0);
         let fav = rect(fav_r - self.px(30.0), done.top, fav_r, done.bottom);
@@ -1622,6 +1675,26 @@ impl Popup {
         KeywordLayout { fav, done, label: y(lay::PAD + lay::ROW_H + 8.0), chips_top, chips, note, height: bottom + self.px(lay::INSET) - top }
     }
 
+    /// 시트 맨 위 줄의 글 버튼: 오른쪽 끝을 `right`에 맞추고 줄 가운데, 높이 30에 글 좌우로 14
+    fn head_button(&self, right: f32, label: &str) -> D2D_RECT_F {
+        let w = (self.measure(label, |f| &f.item) + self.px(28.0)).round();
+        let cy = self.panel_top() + self.px(lay::PAD) + self.px(lay::ROW_H) / 2.0;
+        rect(right - w, cy - self.px(15.0), right, cy + self.px(15.0))
+    }
+
+    /// 키워드·뽑은 기록 시트의 완료 버튼, 레벨 칸 자리
+    fn done_button(&self) -> D2D_RECT_F {
+        self.head_button(self.px(lay::MARGIN + lay::W) - self.px(lay::PAD) - self.px(8.0), "완료")
+    }
+
+    /// 뽑은 기록 시트: 무작위 줄 오른쪽에 완료와 그 왼쪽 8에 초기화, 라벨은 키워드 시트 라벨 자리
+    /// 그리기와 판정이 같이 씀
+    fn roll_layout(&self) -> RollLayout {
+        let done = self.done_button();
+        let clear = self.head_button(done.left - self.px(8.0), "초기화");
+        RollLayout { clear, done, label: self.panel_top() + self.px(lay::PAD + lay::ROW_H + 8.0) }
+    }
+
     /// 히스토리 탭 (세그먼트): 패널 안쪽 8에 높이 32, 양 끝이 줄 강조와 같음
     fn tabs_rect(&self) -> D2D_RECT_F {
         let top = self.panel_top();
@@ -1629,14 +1702,18 @@ impl Popup {
         rect(l, top + self.px(lay::PAD), r, top + self.px(lay::TABS_H))
     }
 
-    /// 시트 `s`의 줄 목록 위 탭 띠 높이, 히스토리에만 있음
-    fn tabs_h(&self, s: Sheet) -> f32 {
-        if s == Sheet::History { self.px(lay::TABS_H) } else { 0.0 }
+    /// 시트 `s`의 줄 목록 위 띠 높이, 히스토리는 탭, 뽑은 기록은 무작위 줄과 라벨
+    fn head_h(&self, s: Sheet) -> f32 {
+        match s {
+            Sheet::History => self.px(lay::TABS_H),
+            Sheet::Rolls => self.px(lay::ROLLS_HEAD_H),
+            _ => 0.0,
+        }
     }
 
-    /// 시트 `s`의 첫 줄 위쪽 (패널 위에서), 히스토리는 탭 띠 아래
+    /// 시트 `s`의 첫 줄 위쪽 (패널 위에서), 히스토리·뽑은 기록은 위 띠 아래
     fn list_top(&self, s: Sheet) -> f32 {
-        self.tabs_h(s) + self.px(lay::PAD)
+        self.head_h(s) + self.px(lay::PAD)
     }
 
     /// 칩 자리: 16 정렬선 사이를 흐르며 줄바꿈, 칩마다 (왼쪽, 너비, 줄)
@@ -1738,10 +1815,10 @@ impl Popup {
             _ if !self.listing() => 0.0,
             s => {
                 // 플레이리스트 결과는 줄 목록 밑에 아래 칸이 붙음, 고른 줄이 바뀌면 높이도 따라감
-                // 히스토리는 줄 목록 위에 탭 띠
+                // 히스토리·뽑은 기록은 줄 목록 위에 띠
                 let foot = self.foot_of(s);
                 let n = self.rows().len().min(page_above(foot.as_ref()));
-                self.tabs_h(s) + self.px(lay::PAD + lay::ROW_H * n.max(1) as f32 + foot.map_or(lay::PAD, |f| f.height()))
+                self.head_h(s) + self.px(lay::PAD + lay::ROW_H * n.max(1) as f32 + foot.map_or(lay::PAD, |f| f.height()))
             }
         }
     }
@@ -1851,6 +1928,16 @@ impl Popup {
             }
             return Hit::Inside;
         }
+        // 기록이 없으면 초기화는 흐리게 보이기만 함, 줄 목록은 아래 결과 줄 판정
+        if self.view == View::Rolls {
+            let rl = self.roll_layout();
+            if self.can_clear_rolls() && inside(&rl.clear, x, y) {
+                return Hit::ClearRolls;
+            }
+            if inside(&rl.done, x, y) {
+                return Hit::DoneRolls;
+            }
+        }
         if self.view == View::Settings {
             let sl = self.settings_layout();
             if inside(&sl.mode, x, y) {
@@ -1911,18 +1998,18 @@ impl Popup {
     // ---------------------------------------------------------------- 상태 변경
 
     /// `i`번째 줄 곡의 키워드 시트를 엶, 고를 수 있는 곡 줄에서만 (설정·안내 카드에선 안 엶)
+    /// 무작위 줄이면 뽑은 기록 시트를 엶
     fn open_keywords(&mut self, i: usize) -> bool {
         if !matches!(self.sheet_now(), Sheet::Results | Sheet::History) || !self.listing() {
             return false;
         }
         let Some(&row) = self.rows().get(i) else { return false };
-        let Some(song) = row.song() else { return false };
-        self.complete_composition();
-        self.end_drag();
-        self.release_toggle();
-        unsafe {
-            let _ = KillTimer(Some(self.hwnd), TIMER_SEARCH);
+        if row == Row::Random {
+            self.open_rolls();
+            return true;
         }
+        let Some(song) = row.song() else { return false };
+        self.finish_input();
         self.keyword_edit = Some(KeywordEdit {
             song,
             from: self.view,
@@ -1937,6 +2024,123 @@ impl Popup {
         self.hover = Hit::None;
         self.retarget_panel();
         true
+    }
+
+    /// 무작위 줄의 뽑은 기록 시트를 엶, 열기 전 입력·검색어는 보관하고 입력 칸으로 나온 곡을 찾음
+    fn open_rolls(&mut self) {
+        self.finish_input();
+        self.roll_edit = Some(RollEdit {
+            from: self.view,
+            scope: self.rows().to_vec(),
+            saved: HistoryEdit {
+                edit: std::mem::take(&mut self.edit),
+                searched: std::mem::take(&mut self.searched),
+                row: Some((Row::Random, self.scroll)),
+            },
+            rows: Vec::new(),
+            total: 0,
+        });
+        self.clear_input();
+        self.view = View::Rolls;
+        self.fill_rolls();
+        self.retarget_panel();
+        self.hover = Hit::None;
+    }
+
+    /// 뽑은 기록 줄: 연 곳 목록에서 나온 곡, 최근 순
+    /// 입력한 글이 있으면 그중 맞는 줄만
+    fn fill_rolls(&mut self) {
+        let Some(r) = &self.roll_edit else { return };
+        let mut rows = self.rolls.recent(&r.scope);
+        let total = rows.len();
+        let q = self.query();
+        if !q.trim().is_empty() {
+            let ids: HashSet<_> = rows.iter().filter_map(|r| r.song()).map(|i| self.catalog.songs[i].id).collect();
+            let hits: HashSet<_> = self.find_in(&q, Some(&ids)).into_iter().collect();
+            let songs: HashSet<_> = hits.iter().filter_map(|r| r.song()).collect();
+            // 이름 검색은 같은 곡의 기록을 남기고, 패턴 조건은 나온 패턴에만 적용함
+            rows.retain(|r| match *r {
+                Row::Song(i) => songs.contains(&i),
+                Row::Chart(i, ..) => hits.contains(r) || hits.contains(&Row::Song(i)),
+                _ => false,
+            });
+        }
+        let r = self.roll_edit.as_mut().unwrap();
+        r.rows = rows;
+        r.total = total;
+        self.reset_rows();
+    }
+
+    fn roll_rows(&self) -> &[Row] {
+        self.roll_edit.as_ref().map_or(&[], |r| &r.rows)
+    }
+
+    /// 검색에 맞는 줄 수와 검색 전 기록 수
+    fn roll_counts(&self) -> (usize, usize) {
+        self.roll_edit.as_ref().map_or((0, 0), |r| (r.rows.len(), r.total))
+    }
+
+    /// 라벨 줄 오른쪽 곡 수, 찾는 중이면 맞는 수도
+    /// 기록이 없으면 찾는 중이어도 "0곡"
+    fn roll_count_text(&self) -> String {
+        let (n, total) = self.roll_counts();
+        if self.searched.trim().is_empty() || total == 0 { format!("{total}곡") } else { format!("{n} / {total}곡") }
+    }
+
+    /// 시트 맨 위 무작위 줄의 아랫줄, 연 곳 목록의 무작위 줄과 같은 문구
+    fn roll_note(&self) -> String {
+        let Some(r) = &self.roll_edit else { return String::new() };
+        let note = self.playlist_random_note(&r.scope).filter(|_| r.from == View::Results);
+        note.unwrap_or_else(|| self.rolls.note(&r.scope))
+    }
+
+    fn roll_empty_text(&self) -> Option<&'static str> {
+        match self.roll_counts() {
+            (_, 0) => Some("아직 나온 곡이 없어요"),
+            (0, _) => Some("나온 곡 중에 맞는 곡이 없어요"),
+            _ => None,
+        }
+    }
+
+    fn can_clear_rolls(&self) -> bool {
+        self.roll_counts().1 > 0
+    }
+
+    /// 연 곳 목록에서 나온 기록을 지움, 찾는 글로 좁혀 안 보이는 것까지
+    fn clear_rolls(&mut self) {
+        if !self.can_clear_rolls() {
+            return;
+        }
+        self.rolls.reset(&self.roll_edit.as_ref().unwrap().scope);
+        self.fill_rolls();
+        self.retarget_panel();
+    }
+
+    /// 열기 전 입력·검색어와 보기로 되돌리고 무작위 줄 자리를 돌려줌, 찾던 글은 버림
+    /// 검색창을 닫거나 다시 열 때, 곡 목록이 바뀔 때도 불림, 찾던 글이 검색어로 남지 않게
+    fn restore_roll_query(&mut self) -> Option<(Row, usize)> {
+        let r = self.roll_edit.take()?;
+        let row = self.restore_saved_query(r.saved);
+        self.view = r.from;
+        row
+    }
+
+    /// 원래 보기로 돌아가 무작위 줄을 고름, 결과는 그대로라 다시 찾지 않음
+    fn close_rolls(&mut self) {
+        if self.roll_edit.is_none() {
+            return;
+        }
+        // 찾던 글의 조합 중인 글자는 원래 검색어에 안 붙게 버림
+        self.preedit.clear();
+        self.notify_composition(CPS_CANCEL);
+        let Some((row, scroll)) = self.restore_roll_query() else { return };
+        // 시트가 열린 동안 플레이리스트 응답으로 히스토리가 바뀔 수 있음
+        if self.view == View::History {
+            self.fill_history();
+        }
+        self.retarget_panel();
+        self.restore_row(row, scroll);
+        self.hover = Hit::None;
     }
 
     /// 키워드 시트의 곡 (키워드는 `user_keys`)
@@ -1997,6 +2201,17 @@ impl Popup {
         self.ended = None;
         self.text_scroll = 0.0;
         self.input_changed();
+    }
+
+    /// 지금 입력을 보관하기 전에 하던 입력을 끝냄
+    /// 조합 중인 글자는 확정해 같이 보관하고, 끌기·누른 토글·기다리던 검색은 멈춤
+    fn finish_input(&mut self) {
+        self.complete_composition();
+        self.end_drag();
+        self.release_toggle();
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), TIMER_SEARCH);
+        }
     }
 
     /// 입력을 검사하고 저장, 되면 입력 칸만 비워 이어서 넣을 수 있게 함
@@ -2109,11 +2324,19 @@ impl Popup {
         self.hover = Hit::None;
     }
 
-    /// 키워드 시트를 여닫는 키와 시트 안의 키, 처리했으면 true
+    /// 키워드·뽑은 기록 시트를 여닫는 키와 시트 안의 키, 처리했으면 true
     /// 시트에서 입력 편집 키는 아래 공통 처리로 넘김
     fn keyword_key(&mut self, vk: VIRTUAL_KEY, ctrl: bool, alt: bool, shift: bool, repeat: bool) -> bool {
         // F2나 메뉴 키 (Apps, Shift+F10), 시트에선 F2만 닫음
         let open_key = !ctrl && !alt && ((!shift && matches!(vk, VK_F2 | VK_APPS)) || (shift && vk == VK_F10));
+        if self.view == View::Rolls {
+            if vk == VK_ESCAPE || (open_key && vk == VK_F2) {
+                self.close_rolls();
+                return true;
+            }
+            // 줄 이동·고르기도 공통 처리로 넘기고, 모드·난이도 단축키 (Alt)와 다른 여는 키만 막음
+            return alt || open_key;
+        }
         if self.view != View::Keywords {
             if open_key {
                 self.open_keywords(self.selected);
@@ -2152,9 +2375,12 @@ impl Popup {
     }
 
     /// 보여 줄 내용이 있으면 그 내용으로 바꾸고, 없으면 직전 내용 그대로 사라짐 (`retarget_panel`)
-    /// 히스토리는 열 때마다 고른 탭으로 다시 채움, 키워드 시트는 닫고 넘어감
+    /// 히스토리는 열 때마다 고른 탭으로 다시 채움, 키워드·뽑은 기록 시트는 닫고 넘어감
     /// 히스토리에선 입력 칸으로 그 탭을 찾고, 나가면 원래 입력·결과·고른 줄로 돌아감
     fn set_view(&mut self, v: View) {
+        if self.view == View::Rolls {
+            self.close_rolls();
+        }
         if self.view == View::Keywords {
             self.close_keywords();
         }
@@ -2215,12 +2441,7 @@ impl Popup {
     /// 히스토리 안에서 찾기 시작: 지금 입력·검색어·고른 결과 줄을 보관하고 입력 칸을 비움
     /// 조합 중인 글자는 원래 검색어에 넣어 둠
     fn begin_history_search(&mut self) {
-        self.complete_composition();
-        self.end_drag();
-        self.release_toggle();
-        unsafe {
-            let _ = KillTimer(Some(self.hwnd), TIMER_SEARCH);
-        }
+        self.finish_input();
         self.history_edit = Some(HistoryEdit {
             edit: std::mem::take(&mut self.edit),
             searched: std::mem::take(&mut self.searched),
@@ -2238,11 +2459,16 @@ impl Popup {
     /// 검색창을 닫거나 다시 열 때도 불림, 찾던 글이 검색어로 남지 않게
     fn restore_history_query(&mut self) -> Option<(Row, usize)> {
         let h = self.history_edit.take()?;
+        self.restore_saved_query(h)
+    }
+
+    /// 보관한 입력·검색어로 되돌리고 그때 고르던 줄을 돌려줌
+    fn restore_saved_query(&mut self, saved: HistoryEdit) -> Option<(Row, usize)> {
         self.clear_input();
-        self.edit = h.edit;
+        self.edit = saved.edit;
         self.seen = self.edit.text().to_owned();
-        self.searched = h.searched;
-        h.row
+        self.searched = saved.searched;
+        saved.row
     }
 
     /// 히스토리 탭을 바꾸면 목록과 선택을 처음부터 맞춤
@@ -2257,8 +2483,11 @@ impl Popup {
         self.retarget_panel();
     }
 
-    /// 버튼이 눌린 채 보이는 보기, 히스토리에서 연 키워드 시트는 히스토리 안의 한 단계라 히스토리
+    /// 버튼이 눌린 채 보이는 보기, 히스토리에서 연 키워드·뽑은 기록 시트는 히스토리 안의 한 단계라 히스토리
     fn bead_view(&self) -> View {
+        if let Some(r) = &self.roll_edit {
+            return r.from;
+        }
         match &self.keyword_edit {
             Some(k) if self.view == View::Keywords => k.from,
             _ => self.view,
@@ -2389,7 +2618,9 @@ impl Popup {
         }
         // 히스토리에선 결과는 그대로 두고 그 탭 안에서만 찾음
         // 검색어를 지우면 사라지는 동안 지난 결과를 시트에 남겨 둠
-        if self.view == View::History {
+        if self.view == View::Rolls {
+            self.fill_rolls();
+        } else if self.view == View::History {
             self.fill_history();
         } else if !q.trim().is_empty() {
             if let Some(id) = playlist::id(&q) {
@@ -2472,9 +2703,10 @@ impl Popup {
             }
             Err(_) => {}
         }
-        // 히스토리나 키워드 시트 뒤에 숨은 검색도 이 플레이리스트면 결과를 바꿔 둠, 돌아갈 때 고르던 줄을 다시 고름
+        // 히스토리나 키워드·뽑은 기록 시트 뒤에 숨은 검색도 이 플레이리스트면 결과를 바꿔 둠, 돌아갈 때 고르던 줄을 다시 고름
         let query = self.history_edit.as_ref().map(|h| &h.edit)
             .or_else(|| self.keyword_edit.as_ref().map(|k| &k.edit))
+            .or_else(|| self.roll_edit.as_ref().map(|r| &r.saved.edit))
             .map_or_else(|| self.query(), |edit| edit.text().to_owned());
         if playlist::id(&query) != Some(reply.id.as_str()) {
             return;
@@ -2498,7 +2730,7 @@ impl Popup {
                 p.waiting = false;
             }
         }
-        if self.view == View::Keywords {
+        if matches!(self.view, View::Keywords | View::Rolls) {
             return;
         }
         // 기다리는 동안 숨긴 패널은 아직 결과 시트가 아닐 수 있어 시트를 먼저 맞춘 뒤 줄을 고름
@@ -2544,17 +2776,23 @@ impl Popup {
     }
 
     /// 플레이리스트 결과의 무작위 줄 아랫줄: 뽑을 곡 수, 다음에 뽑을 수 있는 곡이 적으면 남은 수 (이름은 아래 설명 줄에 나옴)
-    fn playlist_random_note(&self) -> Option<String> {
+    fn playlist_random_note(&self, rows: &[Row]) -> Option<String> {
         self.playlist_data()?;
-        let n = picks(&self.results).count();
-        let m = self.rolls.choices(&self.results).0.count();
+        let n = picks(rows).count();
+        let m = self.rolls.choices(rows).0.count();
         let left = if m < n { format!(" ({m}곡 남음)") } else { String::new() };
         Some(format!("{n}곡 중 하나{left}"))
     }
 
     /// 그리는 시트가 플레이리스트 결과, 아래 칸처럼 검색어를 지워 사라지는 동안에도 그대로
+    /// 플레이리스트 결과에서 연 뽑은 기록도 같음, 바에 모드가 안 보이고 나온 패턴마다 달라서
     fn playlist_sheet(&self) -> bool {
-        self.sheet == Sheet::Results && self.playlist_data().is_some()
+        let results = match self.sheet {
+            Sheet::Results => true,
+            Sheet::Rolls => self.roll_edit.as_ref().is_some_and(|r| r.from == View::Results),
+            _ => false,
+        };
+        results && self.playlist_data().is_some()
     }
 
     /// 줄 오른쪽 레벨 칸 너비 (DIP), 플레이리스트 결과는 모드까지 들어가게 넓힘
@@ -2770,9 +3008,9 @@ impl Popup {
         self.retarget_selection(true);
     }
 
-    /// 결과 줄을 고를 수 있음: 검색 결과나 히스토리, 검색어를 지운 뒤 사라지는 중인 줄은 아님
+    /// 결과 줄을 고를 수 있음: 검색 결과·히스토리·뽑은 기록, 검색어를 지운 뒤 사라지는 중인 줄은 아님
     fn listing(&self) -> bool {
-        self.view != View::Keywords && (!self.searched.trim().is_empty() || self.view == View::History)
+        self.view != View::Keywords && (!self.searched.trim().is_empty() || matches!(self.view, View::History | View::Rolls))
     }
 
     /// 고르는 목록 (`sel_of`)의 `i`번째 줄 자리 위쪽, 패널 위에서
@@ -2864,7 +3102,9 @@ impl Popup {
             self.open_playlist_history(recent);
             return Action::None;
         }
-        if self.view == View::Results {
+        // 플레이리스트 결과에서 연 뽑은 기록의 줄도 플레이리스트 항목으로 고름
+        let from = self.roll_edit.as_ref().map_or(self.view, |r| r.from);
+        if from == View::Results {
             if let (Some(Row::Chart(s, mode, diff)), Some(p)) = (row, &self.playlist) {
                 return Action::PlaylistPick(p.id.clone(), Pattern { title: self.catalog.songs[s].id, mode, diff });
             }
@@ -2962,6 +3202,7 @@ impl Popup {
 
     fn input_hint(&self) -> &'static str {
         match self.view {
+            View::Rolls => "나온 곡에서 찾기",
             View::Keywords => "추가할 키워드를 입력해 주세요",
             View::History if self.history_tab == HistoryTab::Favorites => "즐겨찾기에서 찾기",
             View::History => "최근 기록에서 찾기",
@@ -2972,6 +3213,7 @@ impl Popup {
     /// 줄이 없을 때 목록 자리 문구
     fn empty_text(&self) -> Option<&'static str> {
         match self.sheet {
+            Sheet::Rolls => self.roll_empty_text(),
             Sheet::History if !self.history_query.trim().is_empty() => Some(match self.history_tab {
                 HistoryTab::Favorites => "즐겨찾기에 맞는 곡이 없어요",
                 HistoryTab::Recent => "최근 기록에 맞는 곡이 없어요",
@@ -3382,7 +3624,7 @@ impl Popup {
             WM_MOUSEWHEEL => {
                 // 한 칸에 한 줄, 정밀 휠과 터치패드는 모아서 칸으로 셈
                 let d = ((wp.0 >> 16) as i16) as i32;
-                if matches!(self.view, View::Results | View::History) {
+                if matches!(self.view, View::Results | View::History | View::Rolls) {
                     if d.signum() != self.wheel_acc.signum() {
                         self.wheel_acc = 0; // 방향 바뀜
                     }
@@ -3473,6 +3715,14 @@ impl Popup {
                     }
                     Hit::Done => {
                         self.close_keywords();
+                        Action::None
+                    }
+                    Hit::ClearRolls => {
+                        self.clear_rolls();
+                        Action::None
+                    }
+                    Hit::DoneRolls => {
+                        self.close_rolls();
                         Action::None
                     }
                     Hit::RemoveKeyword(i) => {
@@ -3718,7 +3968,7 @@ impl Popup {
         // 화면에 그릴 결과: 보이는 범위 + 스크롤 중 미끄러져 들어오는 줄
         let pitch = self.px(lay::ROW_H);
         let off = self.scroll_s.value;
-        let listed = matches!(self.sheet, Sheet::Results | Sheet::History);
+        let listed = matches!(self.sheet, Sheet::Results | Sheet::History | Sheet::Rolls);
         let n_rows = self.rows_of(self.sheet).len();
         let foot = self.foot_of(self.sheet);
         let n_page = n_rows.min(page_above(foot.as_ref()));
@@ -3816,7 +4066,7 @@ impl Popup {
             let (l0, r0) = (panel.left + self.px(lay::INSET), panel.right - self.px(lay::INSET));
             let l0t = l0 - BEARING; // 글자 x, 잉크가 16 정렬선에 맞음
 
-            // 줄 목록 (결과·히스토리): 빈 목록 문구나 선택 강조·줄·아래 칸
+            // 줄 목록 (결과·히스토리·뽑은 기록): 빈 목록 문구나 선택 강조·줄·아래 칸
             let draw_list = || -> Result<()> {
                 let row0 = self.list_top(self.sheet);
                 if n_rows == 0 {
@@ -3843,10 +4093,11 @@ impl Popup {
                 let lvl_w = self.px(self.level_w());
                 // 줄은 줄 영역 안에서 미끄러짐 (멈추면 딱 보이는 줄만이라 잘림 없음)
                 let top = ct + row0;
-                let bpm = if self.sheet == Sheet::History {
-                    self.catalog.parse_filter(&self.history_query).is_some_and(|f| f.bpm.is_some())
-                } else {
-                    self.bpm_rows
+                // 히스토리·뽑은 기록은 그 안에서 찾은 글 기준
+                let bpm = match self.sheet {
+                    Sheet::History => self.catalog.parse_filter(&self.history_query).is_some_and(|f| f.bpm.is_some()),
+                    Sheet::Rolls => self.catalog.parse_filter(&self.searched).is_some_and(|f| f.bpm.is_some()),
+                    _ => self.bpm_rows,
                 };
                 dc.PushAxisAlignedClip(&rect(panel.left, top, panel.right, top + pitch * n_page as f32), D2D1_ANTIALIAS_MODE_ALIASED);
                 for (k, &j) in shown.iter().enumerate() {
@@ -3876,7 +4127,7 @@ impl Popup {
                     let (title, sub, tail) = match row {
                         Row::Random => {
                             // 플레이리스트 문구는 결과 줄 기준이라 히스토리의 무작위 줄엔 안 씀
-                            let note = self.playlist_random_note().filter(|_| self.sheet == Sheet::Results);
+                            let note = self.playlist_random_note(rows).filter(|_| self.sheet == Sheet::Results);
                             let sub = note.unwrap_or_else(|| self.rolls.note(rows));
                             (Cow::Borrowed("무작위로 고르기"), Cow::Owned(sub), None)
                         }
@@ -4080,6 +4331,34 @@ impl Popup {
                     if let Some(note) = self.keyword_note() {
                         text_line(note, &f.sub, kl.note, self.px(16.0), &sub_b)?;
                     }
+                } else if self.sheet == Sheet::Rolls {
+                    let rl = self.roll_layout();
+                    // 무작위 줄: 결과의 무작위 줄과 같은 아이콘·제목·아랫줄 (선택 강조 없음), 레벨 칸 자리에 초기화와 완료
+                    let y = ct + self.px(lay::PAD);
+                    let jsz = self.px(32.0);
+                    let (jx, jy) = (panel.left + self.px(lay::PAD) + self.px(8.0), y + (self.px(lay::ROW_H) - jsz) / 2.0);
+                    dc.FillRoundedRectangle(&rrect(jx, jy, jx + jsz, jy + jsz, self.px(lay::PANEL_R - lay::PAD - 8.0)), &g.brush(white(FILL_HOVER))?);
+                    g.fill_icon(Icon::Random, jx + jsz / 2.0, jy + jsz / 2.0, icon_box, &text_b)?;
+                    let tx = jx + jsz + self.px(10.0);
+                    let tw = rl.clear.left - self.px(8.0) - tx;
+                    let tl = g.layout("무작위로 고르기", &f.title, tw, self.px(19.0))?;
+                    dc.DrawTextLayout(gfx::pt(tx, y + self.px(6.67)), &tl, &text_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+                    self.draw_sub(tx, y + self.px(26.67), tw, &self.roll_note(), None, &sub_b)?;
+                    if self.can_clear_rolls() {
+                        draw_button(g, &f.item, rl.clear, "초기화", self.hover == Hit::ClearRolls, s)?;
+                    } else {
+                        draw_button_off(g, &f.item, rl.clear, "초기화", s)?;
+                    }
+                    draw_button(g, &f.item, rl.done, "완료", self.hover == Hit::DoneRolls, s)?;
+                    // 라벨은 키워드 시트 라벨과 같은 줄, 곡 수는 같은 줄 오른쪽 16 정렬선에 한 단계 흐리게
+                    let ll = g.layout("이 목록에서 나온 곡", &f.sub, r0 - l0, self.px(16.0))?;
+                    ll.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+                    dc.DrawTextLayout(gfx::pt(l0t, rl.label), &ll, &sub_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                    let cl = g.layout(&self.roll_count_text(), &f.sub, r0 - l0, self.px(16.0))?;
+                    cl.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)?;
+                    cl.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+                    dc.DrawTextLayout(gfx::pt(l0, rl.label), &cl, &g.brush(FAINT)?, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                    draw_list()?;
                 } else if self.sheet == Sheet::History {
                     let at = self.seg[2].value();
                     draw_segments(g, f, self.tabs_rect(), &["최근", "즐겨찾기"], (at, at + 1.0), lay::PANEL_R - lay::PAD, s)?;
@@ -4318,6 +4597,16 @@ fn draw_button(g: &Gfx, font: &IDWriteTextFormat, r: D2D_RECT_F, label: &str, li
     unsafe {
         let l = g.layout_centered(label, font, r.right - r.left, r.bottom - r.top)?;
         g.dc.DrawTextLayout(gfx::pt(r.left, r.top), &l, &g.brush(TEXT)?, D2D1_DRAW_TEXT_OPTIONS_NONE);
+    }
+    Ok(())
+}
+
+/// 누를 수 없는 패널 버튼: 세그먼트 트랙만큼 옅은 채움에 고를 수 없는 줄 글자색, 호버 없음
+fn draw_button_off(g: &Gfx, font: &IDWriteTextFormat, r: D2D_RECT_F, label: &str, s: f32) -> Result<()> {
+    unsafe {
+        g.dc.FillRoundedRectangle(&rounded(r, (8.0 * s).round()), &g.brush(white(FILL_TRACK))?);
+        let l = g.layout_centered(label, font, r.right - r.left, r.bottom - r.top)?;
+        g.dc.DrawTextLayout(gfx::pt(r.left, r.top), &l, &g.brush(DISABLED)?, D2D1_DRAW_TEXT_OPTIONS_NONE);
     }
     Ok(())
 }
