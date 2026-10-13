@@ -4,6 +4,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod anim;
+mod beam;
 mod catalog;
 mod driver;
 mod edit;
@@ -16,6 +17,7 @@ mod keywords;
 mod pace;
 mod playlist;
 mod popup;
+mod scene;
 mod sys;
 mod toast;
 mod tray;
@@ -618,6 +620,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
         }
         if msg == WM_TIMER && wp.0 == TIMER_FOREGROUND {
             sync_hotkey(a);
+            a.popup.settle();
+            a.toast.settle();
             update_tick(a);
             a.toast.tick();
             return LRESULT(0);

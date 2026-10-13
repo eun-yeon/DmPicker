@@ -108,6 +108,8 @@ dependencies = [
  "serde_json",
  "unicode-segmentation",
  "windows",
+ "windows-collections",
+ "windows-core",
  "windows-numerics",
 ]
 

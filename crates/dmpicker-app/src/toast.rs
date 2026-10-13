@@ -10,8 +10,16 @@ use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use windows::core::HSTRING;
+use windows::Foundation::{IReference, PropertyValue, TimeSpan};
+use windows::UI::Color;
+use windows::UI::Composition::{CompositionEllipseGeometry, CompositionPropertySet, CompositionStrokeCap, Compositor, ContainerVisual, ShapeVisual};
+use windows_numerics::{Vector2, Vector3};
+
 use crate::anim::{Ease, Spring};
+use crate::beam::{Beam, Kind};
 use crate::gfx::{self, circle, color, rect, rrect, white, with_alpha, Gfx, BEARING, PLATE_ALPHA, SUB, TEXT, TINT};
+use crate::scene::Scene;
 use crate::sys;
 
 /// 글 앞의 배지: 없음, 진행률 (0..1)만큼 차는 링, 끝난 결과
@@ -35,6 +43,10 @@ pub struct Toast {
     gfx: Option<Gfx>,
     fonts: Option<[IDWriteTextFormat; 2]>, // 윗줄·아랫줄 글자, gfx와 같이 만들고 버림
     shadow: Option<gfx::Shadow>,           // 캡슐 그림자, gfx와 같이 만들고 버림
+    /// 합성기에 올렸으면 진행 링의 호와 빛 (gfx와 같이 만들고 버림)
+    lights: Option<Lights>,
+    /// 결과 빛을 띄운 끝 배지의 `end_at`, 같은 결과에 두 번 안 띄움
+    glowed: Option<Instant>,
     scale: f32,
     text: String,
     badge: Badge,
@@ -83,6 +95,8 @@ const RED: D2D1_COLOR_F = D2D1_COLOR_F { r: 0.941, g: 0.267, b: 0.322, a: 1.0 };
 /// 진행 링과 트랙, 글처럼 이 불투명도의 흰색
 const RING: f32 = 0.85;
 const TRACK: f32 = 0.14;
+/// 진행 링 굵기 (px), 합성기가 그리는 호와 트랙이 같이 씀
+const RING_STROKE: f32 = 2.5;
 /// 진행 링이 다 찬 것으로 보는 채움, 완료면 여기서 체크로 바뀜
 const FULL: f32 = 0.995;
 
@@ -99,6 +113,138 @@ fn morph(t: f32) -> (f32, f32, f32, f32, f32, f32) {
     let check = if t <= 230.0 { 0.0 } else { Ease::OUT.apply(((t - 230.0) / 600.0).min(1.0)) };
     let disc = SOFT.apply(at(350.0)).clamp(0.0, 1.0);
     (1.0 - EASE.apply(at(245.0)), 1.0 - EASE.apply(at(175.0)), disc, 1.0 + 0.09 * POP.apply(at(350.0)), hop, check)
+}
+
+/// 진행 링 스프링 (300, 34)과 같은 합성기 스프링: 감쇠비 34 / (2√300), 감쇠 없을 때 주기 2π / √300
+const ARC_DAMPING: f32 = 0.9815;
+const ARC_PERIOD: f32 = 0.3628;
+/// 결과 빛을 보여 주는 초, 그 뒤 0.5초 동안 사라짐
+const GLOW_SECS: f32 = 2.3;
+
+/// 합성기에 올린 알림의 빛: 차오르는 진행 링의 호, 인식 중 테두리를 도는 빛, 결과 빛 (완료·실패)
+/// 호는 진행률이 바뀔 때마다 링 스프링과 같은 스프링으로 합성기가 그림, 그동안 앱은 안 그림
+struct Lights {
+    compositor: Compositor,
+    over: ContainerVisual,
+    arc: ShapeVisual,
+    geo: CompositionEllipseGeometry,
+    props: CompositionPropertySet,
+    size: f32,
+    spin: Beam,
+    done: Beam,
+    failed: Beam,
+}
+
+impl Drop for Lights {
+    fn drop(&mut self) {
+        let _ = self.over.Children().and_then(|c| c.Remove(&self.arc));
+    }
+}
+
+impl Lights {
+    fn new(scene: &Scene, s: f32) -> Result<Self> {
+        let c = &scene.compositor;
+        let size = (BADGE + 4.0) * s;
+        let geo = c.CreateEllipseGeometry()?;
+        let r = (BADGE - RING_STROKE) / 2.0 * s;
+        geo.SetCenter(Vector2 { X: size / 2.0, Y: size / 2.0 })?;
+        geo.SetRadius(Vector2 { X: r, Y: r })?;
+        let shape = c.CreateSpriteShapeWithGeometry(&geo)?;
+        shape.SetStrokeBrush(&c.CreateColorBrushWithColor(Color { A: (RING * 255.0).round() as u8, R: 255, G: 255, B: 255 })?)?;
+        shape.SetStrokeThickness(RING_STROKE * s)?;
+        shape.SetStrokeStartCap(CompositionStrokeCap::Round)?;
+        shape.SetStrokeEndCap(CompositionStrokeCap::Round)?;
+        let arc = c.CreateShapeVisual()?;
+        arc.SetSize(Vector2 { X: size, Y: size })?;
+        arc.Shapes()?.Append(&shape)?;
+        // 타원 둘레가 12시에서 시계 방향으로 시작해서 안 돌림, 가운데는 배율 기준
+        arc.SetCenterPoint(Vector3 { X: size / 2.0, Y: size / 2.0, Z: 0.0 })?;
+        let props = c.CreatePropertySet()?;
+        props.InsertScalar(&HSTRING::from("alpha"), 1.0)?;
+        // 다 비었으면 둥근 끝이 점으로 찍히지 않게 숨김
+        let e = c.CreateExpressionAnimationWithExpression(&HSTRING::from("g.TrimEnd > 0.002 ? p.alpha : 0"))?;
+        e.SetReferenceParameter(&HSTRING::from("g"), &geo)?;
+        e.SetReferenceParameter(&HSTRING::from("p"), &props)?;
+        arc.StartAnimation(&HSTRING::from("Opacity"), &e)?;
+        arc.SetIsVisible(false)?;
+        scene.over.Children()?.InsertAtTop(&arc)?;
+        let (w, h) = (W * s, H * s);
+        Ok(Self {
+            compositor: c.clone(),
+            over: scene.over.clone(),
+            arc,
+            geo,
+            props,
+            size,
+            spin: Beam::new(scene, Kind::Spin, w, h, h / 2.0, s)?,
+            done: Beam::new(scene, Kind::Glow { failed: false }, w, h, h / 2.0, s)?,
+            failed: Beam::new(scene, Kind::Glow { failed: true }, w, h, h / 2.0, s)?,
+        })
+    }
+
+    /// 호를 `value` 길이 (0..1)로 바로 맞춤
+    fn snap(&self, value: f32) -> Result<()> {
+        self.geo.StopAnimation(&HSTRING::from("TrimEnd"))?;
+        self.geo.SetTrimEnd(value.clamp(0.0, 1.0))
+    }
+
+    /// 링 스프링의 지금 값·속도에서 목표까지를 합성기 스프링으로 이어 감
+    fn aim(&self, ring: &Spring) -> Result<()> {
+        let a = self.compositor.CreateSpringScalarAnimation()?;
+        a.SetDampingRatio(ARC_DAMPING)?;
+        a.SetPeriod(TimeSpan { Duration: (ARC_PERIOD * 10_000_000.0) as i64 })?;
+        a.SetInitialValue(&PropertyValue::CreateSingle(ring.value)?.cast::<IReference<f32>>()?)?;
+        a.SetInitialVelocity(ring.velocity)?;
+        a.SetFinalValue(&PropertyValue::CreateSingle(ring.target)?.cast::<IReference<f32>>()?)?;
+        self.geo.StartAnimation(&HSTRING::from("TrimEnd"), &a)
+    }
+
+    /// 새 메시지의 배지를 따라감: 진행 링, 인식 중 도는 빛, 끝 배지가 아니면 지난 결과 빛은 바로 끔
+    fn follow(&self, badge: Badge, snap: bool, ring: &Spring) -> Result<()> {
+        match badge {
+            Badge::Progress(_) if snap => self.snap(ring.value)?,
+            Badge::Progress(_) | Badge::Done => self.aim(ring)?,
+            _ => {}
+        }
+        if !badge.is_end() {
+            self.done.stop();
+            self.failed.stop();
+        }
+        self.spin.set(matches!(badge, Badge::Progress(_)))
+    }
+
+    /// 결과 배지 모션이 시작될 때, 도는 빛과 반대 결과 빛을 끄고 결과 빛을 한 번 보여 줌
+    fn ended(&self, failed: bool) -> Result<()> {
+        self.spin.set(false)?;
+        let (show, other) = if failed { (&self.failed, &self.done) } else { (&self.done, &self.failed) };
+        other.stop();
+        show.once(GLOW_SECS)
+    }
+
+    /// 캡슐 (`at`, 창 px)과 불투명도, 배지 가운데와 배율에 맞춰 놓음
+    fn place(&self, at: D2D_RECT_F, alpha: f32, badge: (f32, f32), scale: f32, arc_live: bool) -> Result<()> {
+        for b in [&self.spin, &self.done, &self.failed] {
+            b.place(at, alpha)?;
+        }
+        self.arc.SetIsVisible(arc_live)?;
+        self.arc.SetOffset(Vector3 { X: badge.0 - self.size / 2.0, Y: badge.1 - self.size / 2.0, Z: 0.0 })?;
+        self.arc.SetScale(Vector3 { X: scale, Y: scale, Z: 1.0 })?;
+        self.props.InsertScalar(&HSTRING::from("alpha"), alpha)
+    }
+
+    fn settle(&self) {
+        for b in [&self.spin, &self.done, &self.failed] {
+            b.settle();
+        }
+    }
+
+    /// 알림을 숨길 때 바로 다 숨김
+    fn stop(&self) {
+        for b in [&self.spin, &self.done, &self.failed] {
+            b.stop();
+        }
+        let _ = self.arc.SetIsVisible(false);
+    }
 }
 
 /// 불투명도를 1/64 단위로 (흐려지는 동안 브러시 캐시가 안 커지게)
@@ -118,6 +264,8 @@ impl Toast {
             gfx: None,
             fonts: None,
             shadow: None,
+            lights: None,
+            glowed: None,
             scale: 1.0,
             text: String::new(),
             badge: Badge::None,
@@ -136,8 +284,9 @@ impl Toast {
     pub fn show(&mut self, text: &str, badge: Badge, secs: Option<f32>) {
         let opening = !self.shown || self.open.target < 1.0;
         let bump = !opening && badge == Badge::None && text != self.text;
+        let snap = opening || !matches!(self.badge, Badge::Progress(_));
         match badge {
-            Badge::Progress(p) if opening || !matches!(self.badge, Badge::Progress(_)) => self.ring.snap(p),
+            Badge::Progress(p) if snap => self.ring.snap(p),
             Badge::Progress(p) => self.ring.target = p,
             // 진행 중에 끝나면 링이 다 찬 걸 보여 준 뒤 체크로 (`frame`)
             Badge::Done if self.badge != badge => {
@@ -150,6 +299,7 @@ impl Toast {
         }
         if !badge.is_end() {
             self.end_at = None;
+            self.glowed = None;
         }
         self.text = text.to_string();
         self.badge = badge;
@@ -160,7 +310,7 @@ impl Toast {
         // 조금 다르면 그대로 둠, 창과 swapchain이 늘 같은 배율로 만들어짐
         if (scale - self.scale).abs() > 0.01 {
             self.scale = scale;
-            self.gfx = None;
+            self.drop_gfx();
         }
         let scale = self.scale;
         let (w, h) = (((W + 2.0 * MARGIN) * scale) as i32, ((H + 2.0 * MARGIN) * scale) as i32);
@@ -179,8 +329,10 @@ impl Toast {
                 });
                 self.shadow = self.gfx.as_ref().and_then(|g| gfx::Shadow::new(g, scale).ok());
                 if self.fonts.is_none() || self.shadow.is_none() {
-                    self.gfx = None; // 글꼴·그림자를 못 만들면 다음 알림에서 처음부터 다시
+                    self.drop_gfx(); // 글꼴·그림자를 못 만들면 다음 알림에서 처음부터 다시
                 }
+                // 빛을 못 만들면 링은 앱이 그리고 빛은 없음
+                self.lights = self.gfx.as_ref().and_then(|g| g.scene()).and_then(|sc| Lights::new(sc, scale).inspect_err(|e| eprintln!("toast lights: {e:?}")).ok());
             }
             Some(g) if opening => g.retune(self.hwnd),
             Some(_) => {}
@@ -198,9 +350,39 @@ impl Toast {
         } else if bump {
             self.open.velocity = BUMP;
         }
+        if let Some(Err(e)) = self.lights.as_ref().map(|l| l.follow(badge, snap, &self.ring)) {
+            eprintln!("toast lights: {e:?}");
+        }
         self.shown = true;
         self.last = Instant::now();
         self.render();
+    }
+
+    fn drop_gfx(&mut self) {
+        self.lights = None;
+        self.gfx = None;
+        self.fonts = None;
+        self.shadow = None;
+    }
+
+    /// 다 사라진 빛의 움직임을 멈춤 (주기 타이머에서 부름)
+    pub fn settle(&self) {
+        if let Some(l) = &self.lights {
+            l.settle();
+        }
+    }
+
+    /// 링이 차오르는 걸 합성기가 그리는 중 (끝 배지 모션 전까지)
+    fn arc_live(&self) -> bool {
+        self.lights.is_some() && self.end_at.is_none() && matches!(self.badge, Badge::Progress(_) | Badge::Done)
+    }
+
+    /// 앱이 다시 그려야 하는 움직임: 열고 닫기, 페이드 인, 끝 배지 모션, 합성기 없이 차오르는 링
+    fn needs_draw(&self) -> bool {
+        let morphing = self.end_at.is_some_and(|t| t.elapsed().as_secs_f32() * 1000.0 < MORPH_MS);
+        let filling = self.badge == Badge::Done && self.end_at.is_none();
+        let fading = self.opened_at.elapsed().as_secs_f32() < FADE;
+        !self.open.settled() || fading || morphing || (!self.arc_live() && (!self.ring.settled() || filling))
     }
 
     /// 다시 줄어들며 닫히기 시작
@@ -213,11 +395,10 @@ impl Toast {
         }
     }
 
+    /// 프레임마다 볼 게 있음, 링 스프링은 합성기가 그려도 끝 배지로 넘어갈 때를 알려고 따라감
     pub fn animating(&self) -> bool {
-        let morphing = self.end_at.is_some_and(|t| t.elapsed().as_secs_f32() * 1000.0 < MORPH_MS);
         let filling = self.badge == Badge::Done && self.end_at.is_none(); // 0.99에서 멈춘 링도 끝까지
-        let fading = self.opened_at.elapsed().as_secs_f32() < FADE;
-        self.shown && (!self.open.settled() || !self.ring.settled() || filling || morphing || fading)
+        self.shown && (self.needs_draw() || !self.ring.settled() || filling)
     }
 
     /// 애니메이션 한 프레임 ([`Toast::animating`] 동안 UI 루프에서 부름)
@@ -232,12 +413,18 @@ impl Toast {
         self.last = now;
         if self.open.target == 0.0 && self.open.value < 0.02 {
             self.shown = false;
+            if let Some(l) = &self.lights {
+                l.stop();
+            }
             unsafe {
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
             }
             return;
         }
-        self.render();
+        // 링만 차오르는 동안엔 합성기가 그려서 앱은 안 그림
+        if self.needs_draw() {
+            self.render();
+        }
     }
 
     /// 주기 타이머에서 부름
@@ -255,14 +442,13 @@ impl Toast {
         if let Err(e) = r {
             eprintln!("toast render: {e:?}");
             if gfx::device_lost(&e) {
-                self.gfx = None;
-                self.fonts = None;
-                self.shadow = None;
+                self.drop_gfx();
             }
         }
     }
 
     fn draw_frame(&mut self) -> Result<()> {
+        let arc_live = self.arc_live();
         let (Some(g), Some([f1, f2]), Some(shadow)) = (&self.gfx, &self.fonts, &self.shadow) else { return Ok(()) };
         let s = self.scale;
         let o = self.open.value;
@@ -340,7 +526,7 @@ impl Toast {
                     }
                 }
                 if self.badge != Badge::None {
-                    self.draw_badge(g, (left + BADGE_X * s, top + ch / 2.0), &ride)?;
+                    self.draw_badge(g, (left + BADGE_X * s, top + ch / 2.0), &ride, arc_live)?;
                 }
                 dc.SetTransform(&windows_numerics::Matrix3x2::identity());
                 dc.PopLayer();
@@ -348,11 +534,28 @@ impl Toast {
             dc.PopLayer();
             d.end()?;
         }
+        // 빛이 안 돼도 알림은 띄움
+        if let Some(l) = &self.lights {
+            // 결과 배지 모션이 시작될 때 결과 빛을 한 번
+            if self.end_at.is_some() && self.glowed != self.end_at {
+                self.glowed = self.end_at;
+                if let Err(e) = l.ended(self.badge == Badge::Failed) {
+                    eprintln!("toast lights: {e:?}");
+                }
+            }
+            let at = rect(shape.rect.left - 0.5, shape.rect.top - 0.5, shape.rect.right + 0.5, shape.rect.bottom + 0.5);
+            // 배지 가운데를 캡슐과 같이 키움 (`ride`)
+            let (bx, by) = (left + BADGE_X * s, top + ch / 2.0);
+            if let Err(e) = l.place(at, alpha, (cx + (bx - cx) * sx, cy + (by - cy) * sx), sx, arc_live) {
+                eprintln!("toast lights: {e:?}");
+            }
+        }
         self.gfx.as_ref().unwrap().present()
     }
 
     /// `c`를 중심으로 배지를 그림 (카드 좌표, `ride`가 창 좌표로 바꿈)
-    unsafe fn draw_badge(&self, g: &Gfx, c: (f32, f32), ride: &windows_numerics::Matrix3x2) -> Result<()> {
+    /// `arc_live`면 차오르는 호는 합성기가 그려서 트랙만 그림
+    unsafe fn draw_badge(&self, g: &Gfx, c: (f32, f32), ride: &windows_numerics::Matrix3x2, arc_live: bool) -> Result<()> {
         let s = self.scale;
         let dc = &g.dc;
         let t = self.end_at.map_or(0.0, |t| t.elapsed().as_secs_f32() * 1000.0);
@@ -368,7 +571,7 @@ impl Toast {
             M32: c.1 * (1.0 - scale) + hop * s,
         };
         dc.SetTransform(&(local * ride));
-        let (stroke, r) = (2.5 * s, (BADGE - 2.5) / 2.0 * s);
+        let (stroke, r) = (RING_STROKE * s, (BADGE - RING_STROKE) / 2.0 * s);
         if track_a > 0.0 {
             dc.DrawEllipse(&circle(c.0, c.1, r), &g.brush(white(q(TRACK * track_a)))?, stroke, None);
         }
@@ -382,7 +585,7 @@ impl Toast {
             None,
         )?;
         let fill = self.ring.value.clamp(0.0, 1.0);
-        if ring_a > 0.0 && fill > 0.002 {
+        if ring_a > 0.0 && fill > 0.002 && !arc_live {
             let ring_b = g.brush(white(q(RING * ring_a)))?;
             if fill > 0.998 {
                 dc.DrawEllipse(&circle(c.0, c.1, r), &ring_b, stroke, None);

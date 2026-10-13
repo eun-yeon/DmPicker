@@ -17,6 +17,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use dmpicker_search::{Diff, Filter, Mode};
 
 use crate::anim::{Ease, Spring, Tween};
+use crate::beam::{Beam, Kind, SPIN_SECS};
 use crate::catalog::{Catalog, Song};
 use crate::edit::{clean_paste, Editor};
 use crate::gfx::{
@@ -650,6 +651,21 @@ pub struct Popup {
     old_list: Option<(ID2D1CommandList, Tween)>,
     fonts: Option<Fonts>,
     fx: Option<Effects>,
+    beams: Option<Beams>,
+}
+
+/// 합성기에 올렸으면 빛 셋: 열 때 바를 한 바퀴 도는 빛, 목록 인식 카드 아래를 오가는 흰 빛,
+/// 무작위로 고르기 줄 아래를 오가는 여러 색 빛
+struct Beams {
+    open: Beam,
+    card: Beam,
+    random: Beam,
+}
+
+impl Beams {
+    fn all(&self) -> [&Beam; 3] {
+        [&self.open, &self.card, &self.random]
+    }
 }
 
 /// 그릴 시트 (`sheet_geom`), 판정과 그리기가 같이 씀
@@ -829,6 +845,7 @@ impl Popup {
             old_list: None,
             fonts: None,
             fx: None,
+            beams: None,
         }
     }
 
@@ -1093,6 +1110,7 @@ impl Popup {
 
     /// 그리기 리소스를 다 버림, 다음 `prepare`에서 새로 만듦
     fn drop_gfx(&mut self) {
+        self.beams = None;
         self.gfx = None;
         self.fonts = None;
         self.fx = None;
@@ -1161,6 +1179,16 @@ impl Popup {
             let _ = SetFocus(Some(self.hwnd));
             SetTimer(Some(self.hwnd), TIMER_CARET, CARET_BLINK_MS, None);
         }
+        if let Some(Err(e)) = self.beams.as_ref().map(|b| b.open.once(SPIN_SECS)) {
+            eprintln!("beams: {e:?}");
+        }
+    }
+
+    /// 다 사라진 빛의 움직임을 멈춤 (주기 타이머에서 부름)
+    pub fn settle(&self) {
+        for b in self.beams.iter().flat_map(Beams::all) {
+            b.settle();
+        }
     }
 
     /// 애니메이션 없이 바로 숨김, 트레이 메뉴처럼 메시지 루프가 잠깐 멈출 때
@@ -1204,6 +1232,9 @@ impl Popup {
     fn finish_hide(&mut self) {
         self.closing = false;
         self.visible = false;
+        for b in self.beams.iter().flat_map(Beams::all) {
+            b.stop();
+        }
         self.restore_keyword_query();
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_HIDE);
@@ -1269,6 +1300,17 @@ impl Popup {
         gfx::set_input_effect(&rim_light, 1, &ring)?;
 
         self.fx = Some(Effects { goo_blur, sheets, shadow, plate, rim_light, _keep: vec![flood, thresh, erode, ring] });
+
+        // 빛을 못 만들면 빛 없이 그대로
+        let beams = g.scene().map(|sc| -> Result<Beams> {
+            let px = |v: f32| v * s;
+            Ok(Beams {
+                open: Beam::new(sc, Kind::Spin, px(lay::W), px(lay::BAR_H), px(lay::BAR_R), s)?,
+                card: Beam::new(sc, Kind::Line { colorful: false }, px(lay::W), px(lay::CARD_H), px(lay::PANEL_R), s)?,
+                random: Beam::new(sc, Kind::Line { colorful: true }, px(lay::W - 2.0 * lay::PAD), px(lay::ROW_H), px(lay::PANEL_R - lay::PAD), s)?,
+            })
+        });
+        self.beams = beams.and_then(|b| b.inspect_err(|e| eprintln!("beams: {e:?}")).ok());
         Ok(())
     }
 
@@ -3389,6 +3431,30 @@ impl Popup {
         r
     }
 
+    /// 빛을 그린 자리에 맞춤: 바 (열 때 도는 빛), 카드·무작위 줄은 보이면 켜고 아니면 끔
+    /// 닫힐 때 줄어드는 변환과 페이드도 같이
+    fn place_beams(
+        &self,
+        b: &Beams,
+        shrink: &windows_numerics::Matrix3x2,
+        bar: D2D_RECT_F,
+        open_t: f32,
+        card: Option<(D2D_RECT_F, f32)>,
+        random: Option<(D2D_RECT_F, f32)>,
+    ) -> Result<()> {
+        if let Some(sc) = self.gfx.as_ref().and_then(Gfx::scene) {
+            sc.set_transform(shrink)?;
+        }
+        b.open.place(bar, open_t)?;
+        for (beam, want) in [(&b.card, card), (&b.random, random)] {
+            if let Some((at, a)) = want {
+                beam.place(at, open_t * a)?;
+            }
+            beam.set(want.is_some())?;
+        }
+        Ok(())
+    }
+
     /// 줄의 아랫줄을 (`x`, `y`)부터 너비 `w`에 그림, 다 들어가면 꼬리까지 한 덩어리로
     /// 넘치면 꼬리는 다 보이게 두고 앞 글만 말줄임한 뒤 그 바로 뒤에 꼬리를 이음
     /// 서열표 기준선을 맞추게 맨 앞 레이아웃을 돌려줌
@@ -4006,6 +4072,23 @@ impl Popup {
                 d.end()?;
                 list.Close()?;
                 last_list = Some(list);
+            }
+        }
+        if let Some(b) = &self.beams {
+            // 목록 인식 카드 (첫 인식·다시 인식), 결과에서 선택된 무작위로 고르기 줄 (시트 내용과 같이 비켜남)
+            let scan_card = matches!(self.card(), Some(Card::Scan | Card::Stale));
+            let card = (self.sheet == Sheet::Card && scan_card && has_panel).then_some((panel, panel_a));
+            let list_top = self.panel_top() + sg.dy + self.list_top(self.sheet);
+            let list_bottom = (list_top + pitch * n_page as f32).min(panel.bottom);
+            let random = (self.sheet == Sheet::Results && has_panel && listed && self.rows_of(self.sheet).get(self.selected) == Some(&Row::Random))
+                .then(|| {
+                    let inset = self.px(lay::PAD);
+                    let y = list_top + pitch * self.selected as f32 - off;
+                    (rect(panel.left + inset, y, panel.right - inset, y + pitch), panel_a)
+                })
+                .filter(|(at, _)| at.top >= list_top - 0.5 && at.bottom <= list_bottom + 0.5);
+            if let Err(e) = self.place_beams(b, &shrink, bar, open_t, card, random) {
+                eprintln!("beams: {e:?}");
             }
         }
         self.last_list = last_list;

@@ -13,6 +13,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 
 use crate::icons::{Icon, VIEW};
+use crate::scene::Scene;
 
 // 색: 어두운 판 위에 불투명도만 다른 흰색
 // 글자·아이콘·채움이 판처럼 배경색을 띠고, 배경이 얼마나 밝든 진하기 순서가 유지됨
@@ -72,9 +73,8 @@ pub struct Gfx {
     /// 못 읽었으면 None, 설치된 글꼴로 대신 그림
     ui_fonts: Option<IDWriteFontCollection>,
     swapchain: IDXGISwapChain1,
-    _dcomp: IDCompositionDevice,
-    _target: IDCompositionTarget,
-    _visual: IDCompositionVisual,
+    /// 창에 올린 방식: 합성기 (빛을 겹칠 수 있음) 또는 그걸 못 쓸 때 DirectComposition
+    stage: Stage,
     /// 프레임당 vblank 수, 모니터 주사율을 나눠 `max_fps` 이하로 맞춤
     /// 모든 프레임이 같은 시간 보임 (240 Hz에서 타이머로 60 fps를 맞출 때 생기는 4-5-4 떨림 없음)
     sync: std::cell::Cell<u32>,
@@ -83,6 +83,12 @@ pub struct Gfx {
     brushes: std::cell::RefCell<std::collections::HashMap<[u32; 4], ID2D1SolidColorBrush>>,
     layouts: std::cell::RefCell<std::collections::HashMap<(usize, String, u32, u32), IDWriteTextLayout>>,
     icons: std::cell::RefCell<std::collections::HashMap<Icon, ID2D1PathGeometry1>>,
+}
+
+enum Stage {
+    Scene(Scene),
+    /// 쥐고만 있음, 놓으면 창에서 내려감
+    Plain { _dcomp: IDCompositionDevice, _target: IDCompositionTarget, _visual: IDCompositionVisual },
 }
 
 impl Gfx {
@@ -125,12 +131,19 @@ impl Gfx {
             };
             let swapchain = dxgi_factory.CreateSwapChainForComposition(&dxgi_device, &desc, None)?;
 
-            let dcomp: IDCompositionDevice = DCompositionCreateDevice(&dxgi_device)?;
-            let target = dcomp.CreateTargetForHwnd(hwnd, true)?;
-            let visual = dcomp.CreateVisual()?;
-            visual.SetContent(&swapchain)?;
-            target.SetRoot(&visual)?;
-            dcomp.Commit()?;
+            let scene = Scene::new(hwnd, &swapchain, &d2d_device, width as f32, height as f32).inspect_err(|e| eprintln!("scene: {e:?}"));
+            let stage = match scene {
+                Ok(s) => Stage::Scene(s),
+                Err(_) => {
+                    let dcomp: IDCompositionDevice = DCompositionCreateDevice(&dxgi_device)?;
+                    let target = dcomp.CreateTargetForHwnd(hwnd, true)?;
+                    let visual = dcomp.CreateVisual()?;
+                    visual.SetContent(&swapchain)?;
+                    target.SetRoot(&visual)?;
+                    dcomp.Commit()?;
+                    Stage::Plain { _dcomp: dcomp, _target: target, _visual: visual }
+                }
+            };
 
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
             let ui_fonts = UI_COLLECTION.with(|c| {
@@ -142,9 +155,7 @@ impl Gfx {
                 dc,
                 ui_fonts,
                 swapchain,
-                _dcomp: dcomp,
-                _target: target,
-                _visual: visual,
+                stage,
                 sync: std::cell::Cell::new(1),
                 max_fps,
                 brushes: Default::default(),
@@ -154,6 +165,14 @@ impl Gfx {
             g.bind_target()?;
             g.retune(hwnd);
             Ok(g)
+        }
+    }
+
+    /// 합성기에 올렸으면 그 장면 (빛을 겹칠 수 있음)
+    pub fn scene(&self) -> Option<&Scene> {
+        match &self.stage {
+            Stage::Scene(s) => Some(s),
+            Stage::Plain { .. } => None,
         }
     }
 
