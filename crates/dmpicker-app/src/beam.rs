@@ -34,6 +34,8 @@ const FADE_IN: f32 = 0.6;
 const FADE_OUT: f32 = 0.5;
 /// 도는 빛이 한 바퀴 도는 초
 pub const SPIN_SECS: f32 = 1.96;
+/// 도는 빛 겹 불투명도에 곱함, 무늬 그대로면 게임 위에서 거의 안 보임
+const SPIN_GAIN: f32 = 3.0;
 /// 지금 판 크기 (px), `Beam::place`가 넣음
 const PLATE: &str = "Vector2(p.cw, p.ch)";
 
@@ -737,9 +739,9 @@ impl Make<'_> {
             self.inset(dc, radius, 0.27)
         })?;
         self.clip(root, radius)?;
-        self.layer(root, &inner, &self.both(&mask_b, &self.edges()?)?, 0.21, false)?;
-        self.layer(root, &self.plate_surface(&stroke_v)?, &self.both(&mask_b, &ring)?, 0.13, false)?;
-        self.layer(root, &self.plate_surface(&bloom_v)?, &ring, 0.12, false)
+        self.layer(root, &inner, &self.both(&mask_b, &self.edges()?)?, 0.21 * SPIN_GAIN, false)?;
+        self.layer(root, &self.plate_surface(&stroke_v)?, &self.both(&mask_b, &ring)?, 0.13 * SPIN_GAIN, false)?;
+        self.layer(root, &self.plate_surface(&bloom_v)?, &ring, 0.12 * SPIN_GAIN, false)
     }
 
     // ---------------------------------------------------------------- 아래 테두리를 오가는 빛
