@@ -439,6 +439,10 @@ pub fn write_pointer(root: &Path, pointer: &Pointer) -> Result<CleanupPermit> {
 /// data 바로 아래 `gen-`·`staging` 항목 중 현재 pointer의 두 세대만 남김
 /// 링크는 대상에 들어가지 않고 링크만 삭제
 pub fn cleanup(permit: &CleanupPermit) -> Result<usize> {
+    // 직전 세대는 새 세대가 깨졌을 때만 쓰는 예비라 특징 캐시는 안 남김, 그때 다시 계산
+    if let Some(previous) = &permit.pointer.previous {
+        let _ = fs::remove_file(permit.root.join(previous).join(FEATURES_FILE));
+    }
     let mut removed = 0usize;
     for entry in fs::read_dir(&permit.root)? {
         let entry = entry?;

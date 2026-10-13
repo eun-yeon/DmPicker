@@ -1239,16 +1239,14 @@ fn notice_text(notice: &Notice, recognized: bool) -> Option<String> {
     if notice.new_patterns != 0 {
         parts.push(format!("새 패턴 {}개", notice.new_patterns));
     }
-    if notice.changed_jackets != 0 {
-        parts.push(format!("자켓 {}개", notice.changed_jackets));
-    }
-    let verb = if notice.changed_jackets != 0 {
-        "가 바뀌었어요"
+    // 추가가 있으면 재킷 변경은 뺌, 할 일이 없는 정보고 한 줄이 알림 폭을 넘지 않게
+    let mut text = if parts.is_empty() {
+        format!("자켓 {}개가 바뀌었어요", notice.changed_jackets)
     } else {
-        "가 추가됐어요"
+        format!("{}가 추가됐어요", parts.join(" · "))
     };
-    let mut text = format!("{}{verb}", parts.join(" · "));
-    if recognized {
+    // 다시 인식이 필요한 건 새 곡뿐, 새 패턴·재킷은 저장한 목록과 상관없음
+    if recognized && notice.new_songs != 0 {
         text.push_str("\nDLC를 샀다면 다시 인식해 주세요");
     }
     Some(text)
