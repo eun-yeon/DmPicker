@@ -319,6 +319,20 @@ pub fn resample(v: RgbView, out_w: usize, out_h: usize, sigma: f32) -> Vec<f32> 
     apply_rgb(v, &ox, &oy)
 }
 
+/// luma 썸네일, 평균 0·길이 1로 맞춰서 밝기·대비가 달라도 모양만 비교됨
+/// 견본과 내적하면 상관계수
+pub(crate) fn luma_feature(v: RgbView, out_w: usize, out_h: usize, sigma: f32) -> Vec<f32> {
+    let rgb = resample(v, out_w, out_h, sigma);
+    let mut f: Vec<f32> = rgb.chunks_exact(3).map(|p| (p[0] + p[1] + p[2]) / 3.0).collect();
+    let mean = f.iter().sum::<f32>() / f.len() as f32;
+    f.iter_mut().for_each(|v| *v -= mean);
+    let norm = f.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        f.iter_mut().for_each(|v| *v /= norm);
+    }
+    f
+}
+
 /// RGB view에 분리형 연산 적용 (`ox`는 x 방향, `oy`는 y 방향)
 pub fn apply_rgb(v: RgbView, ox: &Op1d, oy: &Op1d) -> Vec<f32> {
     debug_assert_eq!(ox.in_len, v.width);

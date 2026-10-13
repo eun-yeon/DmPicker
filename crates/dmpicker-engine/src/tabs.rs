@@ -7,7 +7,7 @@
 use std::sync::OnceLock;
 
 use crate::geom::ListGeom;
-use crate::img::{resample, Rect, Rgb, RgbView};
+use crate::img::{luma_feature, Rect, Rgb, RgbView};
 use crate::state::{nominal_lists, ScreenKind};
 
 /// 지금 탭에 보이는 ALL TRACK 글자, 1440p 화면에서 아래 상자 위치대로 잘라 둠
@@ -36,17 +36,9 @@ const FH: usize = 16;
 const CURRENT_MIN: f32 = 0.8;
 const STRIP_MIN: f32 = 0.7;
 
-/// 글자 상자의 luma 썸네일, 평균 0·길이 1로 맞추고 살짝 블러 (최고점이 덜 뾰족하게)
+/// 글자 상자의 luma 썸네일, 살짝 블러 (최고점이 덜 뾰족하게)
 fn feature(v: RgbView) -> Vec<f32> {
-    let rgb = resample(v, FW, FH, 0.75 * v.width as f32 / FW as f32);
-    let mut f: Vec<f32> = rgb.chunks_exact(3).map(|p| (p[0] + p[1] + p[2]) / 3.0).collect();
-    let mean = f.iter().sum::<f32>() / f.len() as f32;
-    f.iter_mut().for_each(|v| *v -= mean);
-    let norm = f.iter().map(|v| v * v).sum::<f32>().sqrt();
-    if norm > 0.0 {
-        f.iter_mut().for_each(|v| *v /= norm);
-    }
-    f
+    luma_feature(v, FW, FH, 0.75 * v.width as f32 / FW as f32)
 }
 
 fn template() -> &'static [f32] {
