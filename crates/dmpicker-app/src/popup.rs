@@ -102,7 +102,7 @@ mod lay {
     pub const ROW_H: f32 = 48.0;
     pub const ROWS: usize = 6;
     pub const LEVEL_W: f32 = 60.0; // 줄 오른쪽 끝의 레벨 칸
-    pub const PLAYLIST_LEVEL_W: f32 = 72.0; // 플레이리스트 결과는 모드까지, 가장 긴 "8B · MX 15"가 약 66
+    pub const PLAYLIST_LEVEL_W: f32 = 72.0; // 플레이리스트 결과·뽑은 기록은 모드까지, 가장 긴 "8B · MX 15"가 약 66
     pub const SETTINGS_H: f32 = 402.0; // 맨 아래 줄(버튼 높이 30) 아래 16 (= 오른쪽 여백)
     pub const TOGGLE_W: f32 = 42.0;
     pub const TOGGLE_H: f32 = 24.0;
@@ -2784,24 +2784,24 @@ impl Popup {
         Some(format!("{n}곡 중 하나{left}"))
     }
 
-    /// 그리는 시트가 플레이리스트 결과, 아래 칸처럼 검색어를 지워 사라지는 동안에도 그대로
-    /// 플레이리스트 결과에서 연 뽑은 기록도 같음, 바에 모드가 안 보이고 나온 패턴마다 달라서
-    fn playlist_sheet(&self) -> bool {
-        let results = match self.sheet {
-            Sheet::Results => true,
-            Sheet::Rolls => self.roll_edit.as_ref().is_some_and(|r| r.from == View::Results),
+    /// 그리는 시트의 레벨 칸에 모드까지 씀: 플레이리스트 결과와 뽑은 기록
+    /// 둘 다 바에 모드가 안 보이고 줄마다 모드가 다를 수 있음
+    /// 플레이리스트 결과는 아래 칸처럼 검색어를 지워 사라지는 동안에도 그대로
+    fn mode_levels(&self) -> bool {
+        match self.sheet {
+            Sheet::Results => self.playlist_data().is_some(),
+            Sheet::Rolls => true,
             _ => false,
-        };
-        results && self.playlist_data().is_some()
+        }
     }
 
-    /// 줄 오른쪽 레벨 칸 너비 (DIP), 플레이리스트 결과는 모드까지 들어가게 넓힘
+    /// 줄 오른쪽 레벨 칸 너비 (DIP), 모드까지 쓰는 시트는 넓힘
     fn level_w(&self) -> f32 {
-        if self.playlist_sheet() { lay::PLAYLIST_LEVEL_W } else { lay::LEVEL_W }
+        if self.mode_levels() { lay::PLAYLIST_LEVEL_W } else { lay::LEVEL_W }
     }
 
     /// 줄 레벨 칸의 글과 서열표, 무작위 줄·히스토리의 플레이리스트 줄은 None
-    /// 플레이리스트 결과는 바에 모드가 안 보이고 항목마다 달라서 "4B · SC 15"
+    /// 플레이리스트 결과·뽑은 기록은 모드까지 "4B · SC 15", 곡 줄은 설정 모드
     /// 고를 수 없는 줄도 항목의 패턴으로, 레벨을 모르면 "4B · SC"까지
     /// 그 밖엔 "SC 15", 그 모드·난이도 패턴이 없는 곡은 None
     fn level_text(&self, row: Row) -> Option<(String, Option<f32>)> {
@@ -2815,7 +2815,7 @@ impl Popup {
             Row::Random | Row::Playlist(_) => return None,
         };
         let level = song.and_then(|s| Some((s.level(m, d)?, s.floor(m, d))));
-        match (self.playlist_sheet(), level) {
+        match (self.mode_levels(), level) {
             (true, Some((l, fl))) => Some((format!("{} · {} {l}", m.label(), d.label()), fl)),
             (true, None) => Some((format!("{} · {}", m.label(), d.label()), None)),
             (false, level) => level.map(|(l, fl)| (format!("{} {l}", d.label()), fl)),
@@ -3938,6 +3938,23 @@ impl Popup {
         Ok(l)
     }
 
+    /// 위쪽이 `y`인 무작위로 고르기 줄: 재킷 자리에 셔플 아이콘, 제목과 아랫줄 `note`는 `right` 왼쪽 8까지
+    /// 결과·히스토리 목록의 무작위 줄과 뽑은 기록 맨 위 줄이 같이 씀
+    fn draw_random_row(&self, y: f32, right: f32, note: &str) -> Result<()> {
+        let (g, f) = (self.gfx.as_ref().unwrap(), self.fonts.as_ref().unwrap());
+        let text_b = g.brush(TEXT)?;
+        let jsz = self.px(32.0);
+        let (jx, jy) = (self.px(lay::MARGIN) + self.px(lay::PAD) + self.px(8.0), y + (self.px(lay::ROW_H) - jsz) / 2.0);
+        unsafe { g.dc.FillRoundedRectangle(&rrect(jx, jy, jx + jsz, jy + jsz, self.px(lay::PANEL_R - lay::PAD - 8.0)), &g.brush(white(FILL_HOVER))?) };
+        g.fill_icon(Icon::Random, jx + jsz / 2.0, jy + jsz / 2.0, self.px(lay::ICON), &text_b)?;
+        let tx = jx + jsz + self.px(10.0);
+        let tw = right - self.px(8.0) - tx;
+        let tl = g.layout("무작위로 고르기", &f.title, tw, self.px(19.0))?;
+        unsafe { g.dc.DrawTextLayout(gfx::pt(tx, y + self.px(6.67)), &tl, &text_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT) };
+        self.draw_sub(tx, y + self.px(26.67), tw, note, None, &g.brush(SUB)?)?;
+        Ok(())
+    }
+
     fn draw_frame(&mut self) -> Result<()> {
         if self.gfx.is_none() || self.fonts.is_none() || self.fx.is_none() {
             return Ok(());
@@ -4091,6 +4108,7 @@ impl Popup {
                 let jsz = self.px(32.0);
                 let jr = self.px(lay::PANEL_R - lay::PAD - 8.0);
                 let lvl_w = self.px(self.level_w());
+                let lvl_r = panel.right - inset - self.px(8.0);
                 // 줄은 줄 영역 안에서 미끄러짐 (멈추면 딱 보이는 줄만이라 잘림 없음)
                 let top = ct + row0;
                 // 히스토리·뽑은 기록은 그 안에서 찾은 글 기준
@@ -4103,33 +4121,13 @@ impl Popup {
                 for (k, &j) in shown.iter().enumerate() {
                     let row = rows[j];
                     let y = ct + (row0 + pitch * j as f32 - off);
-                    let jx = panel.left + inset + self.px(8.0);
-                    let jy = y + (self.px(lay::ROW_H) - jsz) / 2.0;
-                    // 고를 수 없는 줄은 제자리에 흐리게
-                    let dim = matches!(row, Row::Unavailable(_));
-                    match row {
-                        // 재킷 자리에 아이콘: 무작위 줄은 셔플, 히스토리의 플레이리스트는 목록
-                        Row::Random | Row::Playlist(_) => {
-                            dc.FillRoundedRectangle(&rrect(jx, jy, jx + jsz, jy + jsz, jr), &g.brush(white(FILL_HOVER))?);
-                            let icon = if row == Row::Random { Icon::Random } else { Icon::Playlist };
-                            g.fill_icon(icon, jx + jsz / 2.0, jy + jsz / 2.0, icon_box, &text_b)?;
-                        }
-                        _ => match &jackets[k] {
-                            Some(bmp) => draw_jacket(g, bmp, jx, jy, jsz, jr, if dim { DISABLED.a } else { 1.0 })?,
-                            // 곡 데이터에 없는 곡은 빈 재킷 자리
-                            None if dim && ids[k].is_none() => {
-                                dc.FillRoundedRectangle(&rrect(jx, jy, jx + jsz, jy + jsz, jr), &g.brush(white(FILL_TRACK))?);
-                            }
-                            None => {}
-                        },
-                    }
                     // 제목, 아랫줄과 그 꼬리
                     let (title, sub, tail) = match row {
                         Row::Random => {
                             // 플레이리스트 문구는 결과 줄 기준이라 히스토리의 무작위 줄엔 안 씀
                             let note = self.playlist_random_note(rows).filter(|_| self.sheet == Sheet::Results);
-                            let sub = note.unwrap_or_else(|| self.rolls.note(rows));
-                            (Cow::Borrowed("무작위로 고르기"), Cow::Owned(sub), None)
+                            self.draw_random_row(y, lvl_r - lvl_w, &note.unwrap_or_else(|| self.rolls.note(rows)))?;
+                            continue;
                         }
                         Row::Playlist(_) => {
                             let (title, sub) = self.history_playlist_text(j).unwrap_or_default();
@@ -4146,9 +4144,27 @@ impl Popup {
                             (Cow::Borrowed(song.name.as_str()), Cow::Borrowed(song.composer.as_str()), tail)
                         }
                     };
+                    let jx = panel.left + inset + self.px(8.0);
+                    let jy = y + (self.px(lay::ROW_H) - jsz) / 2.0;
+                    // 고를 수 없는 줄은 제자리에 흐리게
+                    let dim = matches!(row, Row::Unavailable(_));
+                    match row {
+                        // 재킷 자리에 아이콘: 히스토리의 플레이리스트는 목록
+                        Row::Playlist(_) => {
+                            dc.FillRoundedRectangle(&rrect(jx, jy, jx + jsz, jy + jsz, jr), &g.brush(white(FILL_HOVER))?);
+                            g.fill_icon(Icon::Playlist, jx + jsz / 2.0, jy + jsz / 2.0, icon_box, &text_b)?;
+                        }
+                        _ => match &jackets[k] {
+                            Some(bmp) => draw_jacket(g, bmp, jx, jy, jsz, jr, if dim { DISABLED.a } else { 1.0 })?,
+                            // 곡 데이터에 없는 곡은 빈 재킷 자리
+                            None if dim && ids[k].is_none() => {
+                                dc.FillRoundedRectangle(&rrect(jx, jy, jx + jsz, jy + jsz, jr), &g.brush(white(FILL_TRACK))?);
+                            }
+                            None => {}
+                        },
+                    }
                     let (title_b, line_b) = if dim { (&off_b, &off_b) } else { (&text_b, &sub_b) };
                     let tx = jx + jsz + self.px(10.0);
-                    let lvl_r = panel.right - inset - self.px(8.0);
                     let tw = lvl_r - lvl_w - self.px(8.0) - tx;
                     let (title_y, sub_y) = (y + self.px(6.67), y + self.px(26.67));
                     let tl = g.layout(&title, &f.title, tw, self.px(19.0))?;
@@ -4156,7 +4172,7 @@ impl Popup {
                     let sl_ = self.draw_sub(tx, sub_y, tw, &sub, tail.as_deref(), line_b)?;
 
                     // 레벨 칸: 레벨 "HD 11"은 곡 이름과, 서열표 "13.4"는 아랫줄과 같은 글자 기준선
-                    // 그 모드·난이도 패턴이 없는 곡은 비우고 (플레이리스트는 채보만), 서열표가 없는 패턴은 아래만 비움
+                    // 그 모드·난이도 패턴이 없는 곡은 비우고 (플레이리스트·뽑은 기록은 채보만), 서열표가 없는 패턴은 아래만 비움
                     // 고를 수 없는 줄은 서열표도 흐리게
                     let Some((label, floor)) = self.level_text(row) else { continue };
                     let lx = lvl_r - lvl_w;
@@ -4208,6 +4224,13 @@ impl Popup {
                 if let Some(button) = button {
                     draw_button(g, &f.item_bold, self.card_button(), button, matches!(self.hover, Hit::CardButton), s)?;
                 }
+                Ok(())
+            };
+            // 키워드·뽑은 기록 시트의 라벨·빈 칸 문구·안내 문구는 줄 높이 안 가운데, 잉크가 16 정렬선에 맞음
+            let text_line = |text: &str, font: &IDWriteTextFormat, top: f32, h: f32, b: &ID2D1SolidColorBrush| -> Result<()> {
+                let l = g.layout(text, font, r0 - l0, h)?;
+                l.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+                dc.DrawTextLayout(gfx::pt(l0t, top), &l, b, D2D1_DRAW_TEXT_OPTIONS_NONE);
                 Ok(())
             };
             // 시트 내용 (다 편 시트 자리), 히스토리는 제자리 탭 아래에 겹쳐 바꾸는 줄 목록 `list`
@@ -4304,14 +4327,7 @@ impl Popup {
                         }
                     }
 
-                    // 라벨·빈 칸 문구·안내 문구는 줄 높이 안 가운데, 잉크가 16 정렬선에 맞음
                     let faint_b = g.brush(FAINT)?;
-                    let text_line = |text: &str, font: &IDWriteTextFormat, top: f32, h: f32, b: &ID2D1SolidColorBrush| -> Result<()> {
-                        let l = g.layout(text, font, r0 - l0, h)?;
-                        l.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
-                        dc.DrawTextLayout(gfx::pt(l0t, top), &l, b, D2D1_DRAW_TEXT_OPTIONS_NONE);
-                        Ok(())
-                    };
                     text_line("내 키워드", &f.sub, kl.label, self.px(16.0), &sub_b)?;
                     if song.user_keys.is_empty() {
                         text_line("아직 없어요", &f.item_regular, kl.chips_top, self.px(28.0), &faint_b)?;
@@ -4333,17 +4349,8 @@ impl Popup {
                     }
                 } else if self.sheet == Sheet::Rolls {
                     let rl = self.roll_layout();
-                    // 무작위 줄: 결과의 무작위 줄과 같은 아이콘·제목·아랫줄 (선택 강조 없음), 레벨 칸 자리에 초기화와 완료
-                    let y = ct + self.px(lay::PAD);
-                    let jsz = self.px(32.0);
-                    let (jx, jy) = (panel.left + self.px(lay::PAD) + self.px(8.0), y + (self.px(lay::ROW_H) - jsz) / 2.0);
-                    dc.FillRoundedRectangle(&rrect(jx, jy, jx + jsz, jy + jsz, self.px(lay::PANEL_R - lay::PAD - 8.0)), &g.brush(white(FILL_HOVER))?);
-                    g.fill_icon(Icon::Random, jx + jsz / 2.0, jy + jsz / 2.0, icon_box, &text_b)?;
-                    let tx = jx + jsz + self.px(10.0);
-                    let tw = rl.clear.left - self.px(8.0) - tx;
-                    let tl = g.layout("무작위로 고르기", &f.title, tw, self.px(19.0))?;
-                    dc.DrawTextLayout(gfx::pt(tx, y + self.px(6.67)), &tl, &text_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
-                    self.draw_sub(tx, y + self.px(26.67), tw, &self.roll_note(), None, &sub_b)?;
+                    // 무작위 줄: 결과의 무작위 줄과 같은 모양 (선택 강조 없음), 레벨 칸 자리에 초기화와 완료
+                    self.draw_random_row(ct + self.px(lay::PAD), rl.clear.left, &self.roll_note())?;
                     if self.can_clear_rolls() {
                         draw_button(g, &f.item, rl.clear, "초기화", self.hover == Hit::ClearRolls, s)?;
                     } else {
@@ -4351,9 +4358,7 @@ impl Popup {
                     }
                     draw_button(g, &f.item, rl.done, "완료", self.hover == Hit::DoneRolls, s)?;
                     // 라벨은 키워드 시트 라벨과 같은 줄, 곡 수는 같은 줄 오른쪽 16 정렬선에 한 단계 흐리게
-                    let ll = g.layout("이 목록에서 나온 곡", &f.sub, r0 - l0, self.px(16.0))?;
-                    ll.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
-                    dc.DrawTextLayout(gfx::pt(l0t, rl.label), &ll, &sub_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                    text_line("이 목록에서 나온 곡", &f.sub, rl.label, self.px(16.0), &sub_b)?;
                     let cl = g.layout(&self.roll_count_text(), &f.sub, r0 - l0, self.px(16.0))?;
                     cl.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)?;
                     cl.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
