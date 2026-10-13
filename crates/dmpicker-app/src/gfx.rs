@@ -1,5 +1,6 @@
-//! DirectComposition 위 Direct2D 기반: 팝업 창의 픽셀별 알파 서피스, 효과 도우미, 텍스트 형식, 아이콘,
+//! Direct2D 기반: 팝업 창의 픽셀별 알파 서피스, 효과 도우미, 텍스트 형식, 아이콘,
 //! 검색창과 알림이 같이 쓰는 색과 그림자
+//! 서피스는 합성기 (Windows.UI.Composition)에 올리고, 못 쓰면 DirectComposition으로 올림
 
 use windows::core::{Error, Interface, Result, HSTRING};
 use windows::Win32::Foundation::{D2DERR_RECREATE_TARGET, HWND};
@@ -53,7 +54,7 @@ pub const MAX_FPS: u32 = 240;
 pub const TOAST_MAX_FPS: u32 = 120;
 
 /// UI 글꼴, exe에 넣어 둬서 설치 안 된 PC에서도 같은 글꼴로 보임
-/// 쓰는 굵기 (400 · 500 · 600)만, 배포본 woff2 그대로 (라이선스 licenses/Pretendard-OFL.txt)
+/// 쓰는 굵기 (400 · 500 · 600)만, 배포본 woff2 그대로
 const UI_FAMILY: &str = "Pretendard";
 static UI_FONTS: [&[u8]; 3] = [
     include_bytes!("../assets/fonts/Pretendard-Regular.woff2"),
@@ -232,19 +233,10 @@ impl Gfx {
         Ok(b)
     }
 
-    /// `from`에서 `to`로 가는 선형 그라데이션
-    pub fn gradient(&self, stops: &[D2D1_GRADIENT_STOP], from: windows_numerics::Vector2, to: windows_numerics::Vector2) -> Result<ID2D1LinearGradientBrush> {
-        unsafe {
-            let rt: &ID2D1RenderTarget = &self.dc;
-            let coll = rt.CreateGradientStopCollection(stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)?;
-            self.dc.CreateLinearGradientBrush(&D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES { startPoint: from, endPoint: to }, None, &coll)
-        }
-    }
-
     /// 판 테두리 선의 빛: 위는 밝게, 옆은 흐리게, 아래는 은은하게 (검색창과 알림이 같음)
     pub fn rim_gradient(&self, top: f32, bottom: f32, alpha: f32) -> Result<ID2D1LinearGradientBrush> {
         let stops = [(0.0, 0.22), (0.3, 0.10), (1.0, 0.06)].map(|(position, a)| D2D1_GRADIENT_STOP { position, color: white(a * alpha) });
-        self.gradient(&stops, pt(0.0, top), pt(0.0, bottom))
+        gradient(&self.dc, &stops, pt(0.0, top), pt(0.0, bottom))
     }
 
     /// 아이콘을 가운데 (`cx`, `cy`)에 한 변 `size`인 상자로 채움, 경로는 처음 한 번만 만듦
@@ -270,7 +262,7 @@ impl Gfx {
         Ok(())
     }
 
-    /// UI 글자 형식, 넣어 둔 프리텐다드로 그림
+    /// UI 글자 형식, exe에 넣어 둔 글꼴로 그림
     pub fn ui_format(&self, size: f32, weight: DWRITE_FONT_WEIGHT) -> Result<IDWriteTextFormat> {
         unsafe {
             let f = self.dwrite.CreateTextFormat(
@@ -327,6 +319,8 @@ impl Gfx {
 const SHADOW_ALPHA: f32 = 0.28;
 const SHADOW_BLUR: f32 = 12.0;
 const SHADOW_DROP: f32 = 6.0;
+/// 판 둘레 창 여백 (DIP): 그림자와 열 때 넘치는 자리 (검색창과 알림이 같음)
+pub const MARGIN: f32 = 32.0;
 
 /// 판 그림자 효과, 입력은 판 모양을 흰색으로 채운 마스크
 /// 출력은 입력과 같은 좌표라 변환 없이 판보다 먼저 그림
@@ -432,13 +426,36 @@ fn load_ui_fonts(dwrite: &IDWriteFactory) -> Result<IDWriteFontCollection> {
 }
 
 /// 96 dpi BGRA 비트맵 속성
-fn bitmap_props(alpha: D2D1_ALPHA_MODE, options: D2D1_BITMAP_OPTIONS) -> D2D1_BITMAP_PROPERTIES1 {
+pub fn bitmap_props(alpha: D2D1_ALPHA_MODE, options: D2D1_BITMAP_OPTIONS) -> D2D1_BITMAP_PROPERTIES1 {
     D2D1_BITMAP_PROPERTIES1 {
         pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: alpha },
         dpiX: 96.0,
         dpiY: 96.0,
         bitmapOptions: options,
         colorContext: std::mem::ManuallyDrop::new(None),
+    }
+}
+
+/// `from`에서 `to`로 가는 선형 그라데이션
+pub fn gradient(dc: &ID2D1DeviceContext, stops: &[D2D1_GRADIENT_STOP], from: windows_numerics::Vector2, to: windows_numerics::Vector2) -> Result<ID2D1LinearGradientBrush> {
+    unsafe {
+        let rt: &ID2D1RenderTarget = dc;
+        let coll = rt.CreateGradientStopCollection(stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)?;
+        dc.CreateLinearGradientBrush(&D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES { startPoint: from, endPoint: to }, None, &coll)
+    }
+}
+
+/// 안을 통째로 `opacity`만큼 흐리고, `mask`가 있으면 그 모양으로 자르는 레이어
+/// 마스크는 빌려 씀, 참조를 안 늘리고 구조체도 해제 안 해서 PopLayer까지 부르는 쪽이 쥐고 있어야 함
+pub fn layer(opacity: f32, mask: Option<&ID2D1Geometry>) -> D2D1_LAYER_PARAMETERS1 {
+    D2D1_LAYER_PARAMETERS1 {
+        contentBounds: rect(-1e6, -1e6, 1e6, 1e6),
+        geometricMask: std::mem::ManuallyDrop::new(mask.map(|m| unsafe { std::mem::transmute_copy(m) })),
+        maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+        maskTransform: windows_numerics::Matrix3x2::identity(),
+        opacity,
+        opacityBrush: std::mem::ManuallyDrop::new(None),
+        layerOptions: D2D1_LAYER_OPTIONS1_NONE,
     }
 }
 
@@ -453,6 +470,11 @@ pub fn white(a: f32) -> D2D1_COLOR_F {
 pub fn with_alpha(mut c: D2D1_COLOR_F, a: f32) -> D2D1_COLOR_F {
     c.a *= a;
     c
+}
+
+/// 불투명도를 1/64 단위로 (흐려지는 동안 브러시 캐시가 안 커지게)
+pub fn alpha_step(a: f32) -> f32 {
+    (a.clamp(0.0, 1.0) * 64.0).round() / 64.0
 }
 
 pub fn rect(l: f32, t: f32, r: f32, b: f32) -> D2D_RECT_F {

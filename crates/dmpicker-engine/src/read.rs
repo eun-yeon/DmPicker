@@ -4,7 +4,7 @@ use crate::features::{
     inset_view, jacket_feature, jacket_feature_gray, Candidate, Feature, RefSet, RANDOM_ID,
 };
 use crate::geom::ListGeom;
-use crate::img::{Rect, Rgb, RgbView};
+use crate::img::{Rgb, RgbView};
 use crate::NROWS;
 
 /// `sure` 조건, 1위 유사도 하한
@@ -22,8 +22,6 @@ pub const TOPK: usize = 3;
 pub struct RowRead {
     /// 보이는 줄 번호 (0..11, 선택 = [`crate::SEL_ROW`])
     pub row: usize,
-    /// 클라이언트 픽셀 기준 재킷 상자
-    pub rect: Rect,
     /// 서로 다른 후보 최대 3개, 높은 순
     pub cands: Vec<Candidate>,
     /// `top1 >= 0.7 && top1 - top2 >= 0.12`
@@ -34,7 +32,7 @@ pub struct RowRead {
     pub is_greyscale: bool,
     /// (가장자리 잘라낸) 크롭의 평균 채도
     pub chroma: f32,
-    /// 크롭의 원래 컬러 특징 ([`RefSet::add_features`]로 학습한 기준으로 저장)
+    /// 크롭의 원래 컬러 특징, 학습한 목록의 줄과 맞춰 볼 때 씀
     pub feature: Box<Feature>,
 }
 
@@ -73,7 +71,6 @@ pub fn read_crop(crop: RgbView, refs: &RefSet) -> RowRead {
     }
     let mut r = RowRead {
         row: 0,
-        rect: Rect::new(0, 0, crop.width as i32, crop.height as i32),
         cands,
         sure: false,
         is_random: false,
@@ -89,10 +86,8 @@ pub fn read_crop(crop: RgbView, refs: &RefSet) -> RowRead {
 
 /// 보이는 `k`번 줄 식별
 pub fn read_row(img: &Rgb, geom: &ListGeom, refs: &RefSet, k: usize) -> RowRead {
-    let rect = geom.jacket_box(k);
-    let mut r = read_crop(img.sub(rect), refs);
+    let mut r = read_crop(img.sub(geom.jacket_box(k)), refs);
     r.row = k;
-    r.rect = rect;
     r
 }
 

@@ -1,4 +1,4 @@
-//! 원격 바이트라 인덱싱 대신 `range`로만 읽음
+//! 받은 gzip·재킷 zip·webp 검사, 원격 바이트라 인덱싱 대신 `range`로만 읽음
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;

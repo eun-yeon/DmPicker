@@ -22,7 +22,7 @@ use crate::{catalog::Catalog, http};
 const BASELINE_FILE: &str = "notified-baseline.json";
 const CHECKED_TEXT: &str = "곡 데이터 확인됨";
 const SAVE_FAILED_TEXT: &str = "곡 데이터를 저장하지 못했어요";
-/// 예전 버전이 남긴 특징 캐시, 이제는 세대 폴더의 features.bin을 씀
+/// 1.0.0이 쓰던 특징 캐시, 받은 세대를 쓰기 시작하면 지움
 const OLD_REFS_CACHE: &str = "refs.cache";
 
 pub struct Active {
@@ -31,7 +31,7 @@ pub struct Active {
 }
 
 impl Active {
-    /// 검색할 곡이 있음(로컬 동봉 데이터 포함), 받은 세대 여부는 `generation`으로 구분
+    /// 검색할 곡이 있음
     pub fn has_data(&self) -> bool {
         !self.snapshot.songs.is_empty()
     }
@@ -60,20 +60,18 @@ pub struct Startup {
 }
 
 /// 특징 계산 전에 곡 목록을 읽어 화면부터 준비
-pub fn preview(root: &Path, bundled: &Path) -> Result<Startup, String> {
+pub fn preview(root: &Path, bundled: &Path) -> Startup {
     load_startup(root, bundled, false)
 }
 
-pub type InitialLoad = Result<Startup, String>;
-
 /// 시작 준비는 별도 스레드에서 마침
-pub fn start_initial(root: PathBuf, bundled: PathBuf) -> JoinHandle<InitialLoad> {
+pub fn start_initial(root: PathBuf, bundled: PathBuf) -> JoinHandle<Startup> {
     std::thread::spawn(move || load_startup(&root, &bundled, true))
 }
 
 /// `prepare`면 특징까지 준비한 뒤 pointer를 고치고 남은 세대 정리
 /// 아니면 화면을 먼저 띄우려고 곡 목록만 읽음
-fn load_startup(root: &Path, bundled: &Path, prepare: bool) -> Result<Startup, String> {
+fn load_startup(root: &Path, bundled: &Path, prepare: bool) -> Startup {
     let data = root.join("data");
     if prepare {
         if let Err(error) = std::fs::create_dir_all(&data) {
@@ -83,8 +81,7 @@ fn load_startup(root: &Path, bundled: &Path, prepare: bool) -> Result<Startup, S
     let state_path = root.join(feed::state::STATE_FILE);
     let mut state = UpdateState::load(&state_path).unwrap_or_default();
     let blocked = state.blocked_generation().map(str::to_owned);
-    #[allow(unused_mut)]
-    let mut loaded = store::choose_generation(&data, blocked.as_deref(), |candidate| {
+    let loaded = store::choose_generation(&data, blocked.as_deref(), |candidate| {
         let marked = state.begin_loading(&state_path, &candidate.name)?;
         let result = (|| {
             let generation = candidate.load()?;
@@ -127,13 +124,12 @@ fn load_startup(root: &Path, bundled: &Path, prepare: bool) -> Result<Startup, S
                     && blocked.as_ref() != Some(other)
                     && store::read_generation(&data.join(other)).is_ok()
             });
-        let pointer = Pointer::new(&name, previous.as_deref()).map_err(|e| e.to_string())?;
-        match store::write_pointer(&data, &pointer) {
+        match Pointer::new(&name, previous.as_deref()).and_then(|pointer| store::write_pointer(&data, &pointer)) {
             Ok(permit) => {
                 if state.applied_tag.as_deref() != Some(&generation.manifest.release_tag) {
-                    state
-                        .record_data_applied(&generation.manifest.release_tag)
-                        .map_err(|e| e.to_string())?;
+                    if let Err(error) = state.record_data_applied(&generation.manifest.release_tag) {
+                        eprintln!("data applied: {error}");
+                    }
                 } else if state.loading.as_deref() == Some(&name) {
                     state.finish_loading(&state_path);
                 }
@@ -153,7 +149,7 @@ fn load_startup(root: &Path, bundled: &Path, prepare: bool) -> Result<Startup, S
         }
         snapshot.clone()
     });
-    Ok(Startup {
+    Startup {
         catalog,
         refs,
         active: Arc::new(Active {
@@ -162,7 +158,7 @@ fn load_startup(root: &Path, bundled: &Path, prepare: bool) -> Result<Startup, S
         }),
         state,
         baseline,
-    })
+    }
 }
 
 fn prepare_refs(
@@ -211,7 +207,7 @@ fn prepare_refs(
 fn save_refs(generation: &Generation, refs: &RefSet) {
     let result = refs
         .to_cache_bytes(&generation.core.feature_signature(FEATURE_VERSION))
-        .and_then(|bytes| std::fs::write(generation.path.join(store::FEATURES_FILE), bytes));
+        .and_then(|bytes| crate::sys::save_file(&generation.path.join(store::FEATURES_FILE), &bytes));
     if let Err(error) = result {
         eprintln!("data features: {error}");
     }
@@ -398,7 +394,7 @@ fn exe_status(state: &UpdateState) -> Option<String> {
     exe_release(state).map(|release| version_text(release.version()))
 }
 
-/// 검증한 태그와 고정 경로로 만든 주소, 새 버전을 모르면 최신 릴리즈 주소
+/// 검증한 태그와 고정 경로로 만든 주소, 새 버전을 모르면 최신 릴리스 주소
 fn release_page(state: &UpdateState) -> String {
     exe_release(state).map_or_else(|| feed::EXE_LATEST_URL.to_owned(), |r| r.page_url())
 }
@@ -764,11 +760,6 @@ impl Updater {
         None
     }
 
-    pub fn initial_failed(&mut self) {
-        self.initializing = false;
-        self.status_text = "곡 데이터를 준비하지 못했어요".into();
-    }
-
     pub fn keep_ready(&mut self, ready: Ready) {
         self.ready = Some(ready);
     }
@@ -885,6 +876,9 @@ fn worker(
                     let pointer = Pointer::new(&name, previous.as_deref())?;
                     let permit = store::write_pointer(&root.join("data"), &pointer)?;
                     state.record_data_applied(&generation.manifest.release_tag)?;
+                    // 실행 중에 새 데이터를 적용했으면 지난 중단 표식은 쓸모없음 (막혔던 세대는 아래 정리로 지워짐)
+                    // 안 지우면 표식이 영영 남아 다음 시작의 중단을 못 막음
+                    state.loading = None;
                     if let Err(error) = state.save(&state_path) {
                         eprintln!("data state: {error}");
                     }
@@ -986,7 +980,7 @@ fn check_exe_version(url: &str, state_path: &Path, state: &mut UpdateState, canc
                 let _ = state.record_exe_available(release.tag(), current);
             }
         }
-        // 최신 릴리즈가 없어지면 알던 새 버전 안내도 내림
+        // 최신 릴리스가 없어지면 알던 새 버전 안내도 내림
         Err(error) if error.status == Some(404) => state.latest_version = None,
         Err(_) => {}
     }
@@ -1200,13 +1194,9 @@ fn make_ready(
     previous: &Active,
 ) -> Ready {
     let snapshot = Snapshot::from_data(&generation.core, &generation.dynamic);
-    let summary = previous.generation.as_ref().map_or_else(
-        || Summary {
-            notice: previous.snapshot.changes_to(&snapshot),
-            ..Summary::default()
-        },
-        |old| Summary::between(&previous.snapshot, &old.dynamic, &snapshot, &generation.dynamic),
-    );
+    let summary = previous.generation.as_ref().map_or_else(Summary::default, |old| {
+        Summary::between(&previous.snapshot, &old.dynamic, &snapshot, &generation.dynamic)
+    });
     let titles = catalog.titles();
     Ready {
         catalog,

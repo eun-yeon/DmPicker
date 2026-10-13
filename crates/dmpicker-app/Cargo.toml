@@ -23,7 +23,6 @@ unicode-segmentation = "1"
 version = "0.62"
 features = [
     "Foundation",
-    "Foundation_Numerics",
     "Graphics_DirectX",
     "Graphics_Effects",
     "System",

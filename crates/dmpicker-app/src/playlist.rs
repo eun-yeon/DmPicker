@@ -1,4 +1,4 @@
-//! djmax.gg 플레이리스트: 주소·응답 읽기, 히스토리와 사본 저장, 작업 스레드에서 받아 오기
+//! djmax.gg 플레이리스트: 주소·응답 읽기, 히스토리(최근 기록·즐겨찾기)와 사본 저장, 작업 스레드에서 받아 오기
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -200,15 +200,22 @@ pub struct Library {
     pub copies: HashMap<String, Playlist>,
     /// 기록·즐겨찾기·플레이리스트 사본을 두는 곳, 없으면 파일에 안 씀
     root: Option<PathBuf>,
+    /// 즐겨찾기 파일을 못 읽었음, 덮어쓰면 목록을 잃으니 이번 실행 동안 저장 안 함
+    favorites_unreadable: bool,
 }
 
 impl Library {
     /// 못 읽거나 겹치는 줄은 버림, 최근 기록만 `RECENT_MAX`까지, 사본이 없어도 히스토리 줄은 남김
     pub fn load(root: PathBuf) -> Self {
         let text = std::fs::read_to_string(root.join("recent.txt")).unwrap_or_default();
-        let favorites = std::fs::read_to_string(root.join("favorites.txt")).unwrap_or_default();
-        let mut lib = Self { root: Some(root), ..Self::default() };
-        for id in favorites.lines().filter_map(|line| line.trim().parse().ok()) {
+        let favorites = match std::fs::read_to_string(root.join("favorites.txt")) {
+            Ok(text) => Some(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(String::new()),
+            Err(_) => None,
+        };
+        let favorites_unreadable = favorites.is_none();
+        let mut lib = Self { root: Some(root), favorites_unreadable, ..Self::default() };
+        for id in favorites.unwrap_or_default().lines().filter_map(|line| line.trim().parse().ok()) {
             if !lib.is_favorite(id) {
                 lib.favorites.push(id);
             }
@@ -274,7 +281,7 @@ impl Library {
         }
         self.copies.insert(data.id.clone(), data.clone());
         if let Some(path) = self.path(&data.id) {
-            if let Err(e) = crate::keywords::write(&path, &data.bytes()) {
+            if let Err(e) = crate::sys::save_file(&path, &data.bytes()) {
                 eprintln!("save playlist: {e}");
             }
         }
@@ -297,16 +304,15 @@ impl Library {
     fn save_recent(&self) {
         let Some(root) = &self.root else { return };
         let text: String = self.recent.iter().map(Recent::line).collect();
-        let result = std::fs::create_dir_all(root).and_then(|_| std::fs::write(root.join("recent.txt"), text));
-        if let Err(e) = result {
+        if let Err(e) = crate::sys::save_file(&root.join("recent.txt"), text.as_bytes()) {
             eprintln!("save recent: {e}");
         }
     }
 
     fn save_favorites(&self) {
-        let Some(root) = &self.root else { return };
+        let Some(root) = self.root.as_ref().filter(|_| !self.favorites_unreadable) else { return };
         let text: String = self.favorites.iter().map(|id| format!("{id}\n")).collect();
-        if let Err(e) = crate::keywords::write(&root.join("favorites.txt"), text.as_bytes()) {
+        if let Err(e) = crate::sys::save_file(&root.join("favorites.txt"), text.as_bytes()) {
             eprintln!("save favorites: {e}");
         }
     }

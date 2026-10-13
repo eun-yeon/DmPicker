@@ -29,7 +29,7 @@ pub struct Hit {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Kind {
     Name,
-    /// `searchDoc.segments`의 제목 별칭·발음
+    /// core.json `segments` 중 제목 별칭·발음
     Alias,
     /// 내 키워드, compact 완전 일치만 이름보다 위
     User,
@@ -646,12 +646,8 @@ impl Searcher {
     }
 
     /// 색인한 곡 수
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.rank.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.rank.is_empty()
     }
 
     /// `query`로 검색, 점수 높은 순으로 최대 `limit`개

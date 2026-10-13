@@ -444,8 +444,15 @@ pub fn cleanup(permit: &CleanupPermit) -> Result<usize> {
         let _ = fs::remove_file(permit.root.join(previous).join(FEATURES_FILE));
     }
     let mut removed = 0usize;
+    let mut failed = None;
     for entry in fs::read_dir(&permit.root)? {
-        let entry = entry?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                failed = Some(error.into());
+                continue;
+            }
+        };
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
@@ -455,12 +462,14 @@ pub fn cleanup(permit: &CleanupPermit) -> Result<usize> {
         if name == permit.pointer.active || permit.pointer.previous.as_ref() == Some(&name) {
             continue;
         }
+        // 백신·탐색기가 잡고 있는 폴더 하나 때문에 나머지를 남기지 않음, 못 지운 건 다음 정리 때 다시
         let path = entry.path();
-        let metadata = fs::symlink_metadata(&path)?;
-        remove_entry(&path, &metadata)?;
-        removed += 1;
+        match fs::symlink_metadata(&path).map_err(Error::from).and_then(|metadata| remove_entry(&path, &metadata)) {
+            Ok(()) => removed += 1,
+            Err(error) => failed = Some(error),
+        }
     }
-    Ok(removed)
+    failed.map_or(Ok(removed), Err)
 }
 
 fn remove_entry(path: &Path, metadata: &Metadata) -> Result<()> {

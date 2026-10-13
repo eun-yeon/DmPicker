@@ -319,18 +319,10 @@ pub struct PatternInfo {
     pub tags: BTreeMap<String, u8>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PatternAxes {
-    pub radar: Vec<String>,
-    pub extra: Vec<String>,
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct Dynamic {
     pub patterns: BTreeMap<u32, BTreeMap<Mode, BTreeMap<Difficulty, Pattern>>>,
     pub pattern_info: BTreeMap<u32, Vec<PatternInfo>>,
-    pub pattern_axes: BTreeMap<Mode, PatternAxes>,
-    pub sources: BTreeMap<String, String>,
 }
 
 impl Dynamic {
@@ -405,31 +397,9 @@ impl Dynamic {
                 pattern_info.insert(id, infos);
             }
         }
-        let mut pattern_axes = BTreeMap::new();
-        if let Some(value) = root.get("patternAxes") {
-            for (mode, value) in object(value)? {
-                let axes = object(value)?;
-                pattern_axes.insert(
-                    Mode::parse(mode)?,
-                    PatternAxes {
-                        radar: strings(field(axes, "radar")?)?,
-                        extra: strings(field(axes, "extra")?)?,
-                    },
-                );
-            }
-        }
-        let source = object(field(root, "sources")?)?;
-        let mut sources = BTreeMap::new();
-        for name in ["tiers", "patternInfo"] {
-            if let Some(value) = source.get(name) {
-                sources.insert(name.to_owned(), string(value)?.to_owned());
-            }
-        }
         Ok(Self {
             patterns,
             pattern_info,
-            pattern_axes,
-            sources,
         })
     }
 

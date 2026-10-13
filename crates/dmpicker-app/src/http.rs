@@ -203,7 +203,8 @@ impl Url {
             return Err(invalid());
         }
         let secure = parts.nScheme == WINHTTP_INTERNET_SCHEME_HTTPS;
-        if !allowed_scheme(secure, parts.nScheme, &host) {
+        let allowed = secure;
+        if !allowed {
             return Err(invalid());
         }
         let mut path = component(&wide, parts.lpszUrlPath, parts.dwUrlPathLength)?;
@@ -251,13 +252,6 @@ impl Url {
         }
         Ok(next)
     }
-}
-
-fn allowed_scheme(secure: bool, _scheme: WINHTTP_INTERNET_SCHEME, _host: &str) -> bool {
-    if secure {
-        return true;
-    }
-    false
 }
 
 fn component(input: &[u16], ptr: PWSTR, count: u32) -> Result<String, Failure> {

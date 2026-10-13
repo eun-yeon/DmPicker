@@ -2,7 +2,6 @@
 //! 작업 스레드에서 돌고 게임 프로세스는 건드리지 않음
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -22,9 +21,6 @@ use crate::pace::{Pace, SAFE_MS};
 const ALIGN_SIM: f32 = 0.85;
 /// 저장된 게임 내 특징이 계산 방식과 안 맞게 되면 `dmpicker_engine::features::FEATURE_VERSION`과 같이 올림
 const LEARN_MAGIC: &[u8; 8] = b"PICKLST3";
-/// 이전 방식으로 저장된 목록, 곡은 그대로 쓸 수 있음 (줄 인식으로 맞춤)
-/// 특징은 0으로 둬서 아무것과도 안 맞음, 다음 인식 때 새로 저장됨
-const LEARN_MAGIC_OLD: &[u8; 8] = b"PICKLST2";
 
 // ------------------------------------------------------------------ 저장 목록
 
@@ -74,7 +70,6 @@ impl Learned {
     }
 
     pub fn save(&self, dir: &Path) -> std::io::Result<()> {
-        std::fs::create_dir_all(dir)?;
         let mut b = Vec::with_capacity(16 + self.entries.len() * (FEAT_LEN + 8));
         b.extend_from_slice(LEARN_MAGIC);
         b.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
@@ -83,16 +78,12 @@ impl Learned {
             b.push(e.random as u8 | (e.locked as u8) << 1);
             b.extend(e.feat.iter().map(|v| *v as u8));
         }
-        let tmp = Self::path(dir, self.kind).with_extension("tmp");
-        std::fs::File::create(&tmp)?.write_all(&b)?;
-        std::fs::rename(tmp, Self::path(dir, self.kind))
+        crate::sys::save_file(&Self::path(dir, self.kind), &b)
     }
 
     pub fn load(dir: &Path, k: ScreenKind) -> Option<Self> {
-        let mut b = Vec::new();
-        std::fs::File::open(Self::path(dir, k)).ok()?.read_to_end(&mut b).ok()?;
-        let old = b.len() >= 8 && &b[..8] == LEARN_MAGIC_OLD;
-        if b.len() < 12 || !(old || &b[..8] == LEARN_MAGIC) {
+        let b = std::fs::read(Self::path(dir, k)).ok()?;
+        if b.len() < 12 || &b[..8] != LEARN_MAGIC {
             return None;
         }
         let n = u32::from_le_bytes(b[8..12].try_into().ok()?) as usize;
@@ -105,7 +96,7 @@ impl Learned {
             let r = &b[12 + i * rec..12 + (i + 1) * rec];
             let id = i64::from_le_bytes(r[..8].try_into().ok()?);
             let fl = r[8];
-            let feat: Vec<i8> = if old { vec![0; FEAT_LEN] } else { r[9..].iter().map(|v| *v as i8).collect() };
+            let feat: Vec<i8> = r[9..].iter().map(|v| *v as i8).collect();
             entries.push(LEntry { id: (id >= 0).then_some(id as u32), random: fl & 1 != 0, locked: fl & 2 != 0, feat });
         }
         Some(Learned { kind: k, entries })
@@ -1766,7 +1757,7 @@ pub fn run_pick(ctx: &Ctx, song: u32, mode: ButtonMode, diff: usize, cancel: &At
         Ok(s) => s,
         Err(r) => return r,
     };
-    // 방장이 아니면 키를 하나도 안 누름, 못 읽은 프레임은 아래에서 다시 봄
+    // 방장이 아니면 키를 하나도 안 누름, 화면을 못 읽으면 막지 않음
     if screen.grab().is_ok_and(|img| room::guest_seat(&img)) {
         return JobResult::Failed(NOT_HOST.into());
     }

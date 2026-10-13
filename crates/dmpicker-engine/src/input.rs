@@ -121,51 +121,6 @@ impl Key {
         Key::Z,
     ];
 
-    /// 전체 키 목록
-    pub const ALL: [Key; 41] = [
-        Key::A,
-        Key::B,
-        Key::C,
-        Key::D,
-        Key::E,
-        Key::F,
-        Key::G,
-        Key::H,
-        Key::I,
-        Key::J,
-        Key::K,
-        Key::L,
-        Key::M,
-        Key::N,
-        Key::O,
-        Key::P,
-        Key::Q,
-        Key::R,
-        Key::S,
-        Key::T,
-        Key::U,
-        Key::V,
-        Key::W,
-        Key::X,
-        Key::Y,
-        Key::Z,
-        Key::Up,
-        Key::Down,
-        Key::Left,
-        Key::Right,
-        Key::PageUp,
-        Key::PageDown,
-        Key::LShift,
-        Key::RShift,
-        Key::LCtrl,
-        Key::Numpad4,
-        Key::Numpad5,
-        Key::Numpad6,
-        Key::Numpad8,
-        Key::Tab,
-        Key::F4,
-    ];
-
     /// `c`에 해당하는 글자 키 (ASCII A-Z, 대소문자 무시)
     pub fn letter(c: char) -> Option<Key> {
         let u = c.to_ascii_uppercase();

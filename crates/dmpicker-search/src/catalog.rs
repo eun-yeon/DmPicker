@@ -1,6 +1,5 @@
 //! 받은 곡 데이터(core·dynamic)로 만든 검색용 곡 목록
 
-
 /// 버튼 모드
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Mode {
@@ -96,14 +95,14 @@ pub struct Song {
     /// `bpm`의 최저·최고 BPM, 고정이면 둘이 같고 숫자가 아니면 None
     pub bpm_range: Option<(f32, f32)>,
     pub genres: Vec<String>,
-    /// djmax.gg 검색 별칭 (`searchDoc.segments`), 이미 compact 형태
+    /// djmax.gg 검색 별칭 (core.json `segments`), 이미 compact 형태
     pub segments: Vec<String>,
-    /// djmax.gg 작곡가 별칭 (`searchDoc.composerKeys`)
+    /// djmax.gg 작곡가 별칭 (core.json `composerKeys`)
     pub composer_keys: Vec<String>,
-    /// segment 중 djmax.gg 태그 (`searchDoc.tags`: 팩 이름, 장르)
+    /// segment 중 djmax.gg 태그 (core.json `tags`: 팩 이름, 장르)
     /// 곡이 속한 그룹이지 곡 자체의 별칭은 아님, 같이 쓰는 곡이 적어도 마찬가지
     pub tags: Vec<String>,
-    /// djmax.gg의 곡 자체 이름 (`searchDoc.names`: 읽는 법, 별명)
+    /// djmax.gg의 곡 자체 이름 (core.json `names`: 읽는 법, 별명)
     /// 같이 쓰는 곡이 많아도 항상 곡 자체의 별칭 (DIE IN과 아티스트 DIEIN 둘 다 "다인")
     pub names: Vec<String>,
     /// 내 키워드, djmax.gg 데이터엔 없고 앱이 따로 읽어 채움
@@ -111,7 +110,7 @@ pub struct Song {
     /// 패턴이 있으면 `[mode][diff]` 레벨
     /// `Some(0)`은 패턴은 있는데 레벨이 미정
     pub levels: [[Option<u8>; 4]; 4],
-    /// 서열표 난이도 `[mode][diff]` (djmax.gg `floor`, 소수 한 자리), 모든 SC와 일부 NM·HD·MX에 있음
+    /// 서열표 난이도 `[mode][diff]` (dynamic.json `floor`, 소수 한 자리), 모든 SC와 일부 NM·HD·MX에 있음
     pub floors: [[Option<f32>; 4]; 4],
     /// 패턴 특성 `[mode][diff]` (특성 이름, 0..=3), 평가가 없는 패턴은 None
     pub pattern_tags: [[Option<PatternTags>; 4]; 4],
@@ -243,13 +242,5 @@ impl Catalog {
 
     pub fn by_id(&self, id: u32) -> Option<&Song> {
         self.index_of(id).map(|i| &self.songs[i])
-    }
-
-    pub fn len(&self) -> usize {
-        self.songs.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.songs.is_empty()
     }
 }

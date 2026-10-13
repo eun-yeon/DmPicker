@@ -109,10 +109,6 @@ impl TimingTuner {
     pub fn gap_ms(&self) -> u32 {
         self.t.ceil() as u32
     }
-    /// 누락이 확인된 가장 높은 타이밍 (점점 줄어듦), 없으면 None
-    pub fn known_bad_ms(&self) -> Option<f32> {
-        self.bad
-    }
     /// 묶음이 전부 먹힘
     pub fn on_success(&mut self) {
         self.hitch_streak = 0;
@@ -250,7 +246,7 @@ impl std::error::Error for NavError {}
 
 /// `start`에서 `keys`를 눌러 `observed`에 닿으려면 최소 몇 번 누락돼야 하는지
 /// 어떤 부분열로도 설명 안 되면 `None`
-pub fn explain_drops(planner: &Planner, start: usize, keys: &[Key], observed: usize) -> Option<usize> {
+fn explain_drops(planner: &Planner, start: usize, keys: &[Key], observed: usize) -> Option<usize> {
     // 키마다 위치별 최소 누락 수를 구하는 DP
     let mut cur: BTreeMap<usize, usize> = BTreeMap::from([(start, 0)]);
     for key in keys {

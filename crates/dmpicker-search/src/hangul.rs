@@ -170,29 +170,6 @@ fn push_split(j: char, out: &mut impl FnMut(char)) {
     }
 }
 
-/// 문자열 전체를 타자 자모로 분해 (다른 정규화는 안 함)
-///
-/// `keystrokes("꽃") == "ㄲㅗㅊ"`, `keystrokes("괜") == "ㄱㅗㅐㄴ"`,
-/// `keystrokes("닭") == "ㄷㅏㄹㄱ"`
-pub fn keystrokes(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() * 3);
-    for c in s.chars() {
-        push_keystrokes(c, &mut |k| out.push(k));
-    }
-    out
-}
-
-/// 초성 문자열, 음절은 초성으로, 따로 있는 자모는 타자 순서로 나누고 나머지 글자는 그대로
-///
-/// `chosung("고백, 꽃") == "ㄱㅂ, ㄲ"`
-pub fn chosung(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        push_chosung(c, &mut |k| out.push(k));
-    }
-    out
-}
-
 #[inline]
 pub(crate) fn push_chosung(c: char, out: &mut impl FnMut(char)) {
     if let Some(l) = chosung_of(c) {

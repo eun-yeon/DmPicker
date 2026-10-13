@@ -135,7 +135,6 @@ impl Notice {
 /// 직전 적용 세대와 비교하는 설정 상태 줄용 개수
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Summary {
-    pub notice: Notice,
     pub levels: usize,
     pub tiers: usize,
     pub pattern_info: usize,
@@ -154,10 +153,7 @@ fn pattern_tags(dynamic: &Dynamic, key: PatternKey) -> Option<&BTreeMap<String, 
 impl Summary {
     /// `before`·`after`는 각 데이터의 `Snapshot::from_data`, 호출부가 이미 들고 있음
     pub fn between(before: &Snapshot, old: &Dynamic, after: &Snapshot, new: &Dynamic) -> Self {
-        let mut summary = Self {
-            notice: before.changes_to(after),
-            ..Self::default()
-        };
+        let mut summary = Self::default();
         for &key in before.patterns.intersection(&after.patterns) {
             if let (Some(a), Some(b)) = (old.pattern(key), new.pattern(key)) {
                 summary.levels += usize::from(a.level != b.level);

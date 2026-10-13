@@ -11,8 +11,7 @@ pub mod store;
 pub mod time;
 
 pub use model::{
-    Core, CoreSong, Difficulty, Dynamic, Manifest, Mode, Needs, Pattern, PatternAxes, PatternInfo,
-    PatternKey,
+    Core, CoreSong, Difficulty, Dynamic, Manifest, Mode, Needs, Pattern, PatternInfo, PatternKey,
 };
 
 pub const DATA_LATEST_URL: &str =

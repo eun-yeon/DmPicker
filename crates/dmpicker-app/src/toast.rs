@@ -11,14 +11,13 @@ use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use windows::core::HSTRING;
-use windows::Foundation::{IReference, PropertyValue, TimeSpan};
-use windows::UI::Color;
+use windows::Foundation::{IReference, PropertyValue};
 use windows::UI::Composition::{CompositionEllipseGeometry, CompositionPropertySet, CompositionStrokeCap, Compositor, ContainerVisual, ShapeVisual};
 use windows_numerics::{Vector2, Vector3};
 
-use crate::anim::{Ease, Spring};
-use crate::beam::{Beam, Kind};
-use crate::gfx::{self, circle, color, rect, rrect, white, with_alpha, Gfx, BEARING, PLATE_ALPHA, SUB, TEXT, TINT};
+use crate::anim::{open_scale, Ease, Spring, OPEN, OPEN_FADE, OPEN_KICK};
+use crate::beam::{self, Beam, Kind};
+use crate::gfx::{self, alpha_step, circle, color, rect, rrect, white, with_alpha, Gfx, BEARING, MARGIN, PLATE_ALPHA, SUB, TEXT, TINT};
 use crate::scene::Scene;
 use crate::sys;
 
@@ -65,21 +64,15 @@ const W: f32 = 384.0;
 const H: f32 = 64.0;
 /// 글과 바를 둥근 끝에서 띄움
 const INSET: f32 = 24.0;
-/// 캡슐 둘레 여백: 그림자와 넘칠 때의 자리 (검색창의 그림자 자리와 같음)
-const MARGIN: f32 = 32.0;
-/// 검색창과 같은 스프링, 열 땐 살짝 튀고 닫을 땐 안 튐
-const OPEN: (f32, f32) = (340.0, 22.0);
+/// 닫는 스프링, 열 땐 검색창처럼 살짝 튀고 (`OPEN`) 닫을 땐 안 튐
 const CLOSE: (f32, f32) = (520.0, 46.0);
 /// 새 메시지가 지금 것을 바꿀 때 스프링에 주는 반동
 const BUMP: f32 = -0.8;
-/// 열기: 첫 프레임부터 움직이고 이 시간 동안 페이드 인 (검색창과 같음)
-const KICK: f32 = 4.0;
-const FADE: f32 = 0.10;
 /// 배지: 지름 24 px 원, 중심이 캡슐 안쪽으로 이만큼, 글은 그 뒤에
 const BADGE: f32 = 24.0;
 const BADGE_X: f32 = 32.0;
 const BADGE_TEXT_X: f32 = 56.0;
-/// 스피너가 체크로 바뀌는 모션의 곡선과 시간
+/// 진행 링이 체크로 바뀌는 모션의 곡선과 시간
 const MORPH_MS: f32 = 900.0;
 const EASE: Ease = Ease(0.25, 0.1, 0.25, 1.0);
 const SOFT: Ease = Ease(0.34, 1.35, 0.64, 1.0);
@@ -150,7 +143,7 @@ impl Lights {
         geo.SetCenter(Vector2 { X: size / 2.0, Y: size / 2.0 })?;
         geo.SetRadius(Vector2 { X: r, Y: r })?;
         let shape = c.CreateSpriteShapeWithGeometry(&geo)?;
-        shape.SetStrokeBrush(&c.CreateColorBrushWithColor(Color { A: (RING * 255.0).round() as u8, R: 255, G: 255, B: 255 })?)?;
+        shape.SetStrokeBrush(&c.CreateColorBrushWithColor(beam::rgb([255.0; 3], RING))?)?;
         shape.SetStrokeThickness(RING_STROKE * s)?;
         shape.SetStrokeStartCap(CompositionStrokeCap::Round)?;
         shape.SetStrokeEndCap(CompositionStrokeCap::Round)?;
@@ -192,7 +185,7 @@ impl Lights {
     fn aim(&self, ring: &Spring) -> Result<()> {
         let a = self.compositor.CreateSpringScalarAnimation()?;
         a.SetDampingRatio(ARC_DAMPING)?;
-        a.SetPeriod(TimeSpan { Duration: (ARC_PERIOD * 10_000_000.0) as i64 })?;
+        a.SetPeriod(beam::ts(ARC_PERIOD))?;
         a.SetInitialValue(&PropertyValue::CreateSingle(ring.value)?.cast::<IReference<f32>>()?)?;
         a.SetInitialVelocity(ring.velocity)?;
         a.SetFinalValue(&PropertyValue::CreateSingle(ring.target)?.cast::<IReference<f32>>()?)?;
@@ -247,11 +240,6 @@ impl Lights {
     }
 }
 
-/// 불투명도를 1/64 단위로 (흐려지는 동안 브러시 캐시가 안 커지게)
-fn q(a: f32) -> f32 {
-    (a.clamp(0.0, 1.0) * 64.0).round() / 64.0
-}
-
 impl Toast {
     pub fn new(wndproc: WNDPROC) -> Result<Self> {
         let ex = WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_NOREDIRECTIONBITMAP;
@@ -304,7 +292,7 @@ impl Toast {
         self.text = text.to_string();
         self.badge = badge;
         self.until = secs.map(|s| Instant::now() + Duration::from_secs_f32(s));
-        let game = sys::find_game().and_then(sys::client_rect_screen);
+        let game = sys::game_rect();
         let anchor = game.unwrap_or(RECT { left: 0, top: 0, right: 1920, bottom: 1080 });
         let scale = sys::ui_scale(&anchor, game.is_some());
         // 조금 다르면 그대로 둠, 창과 swapchain이 늘 같은 배율로 만들어짐
@@ -343,7 +331,7 @@ impl Toast {
             self.opened_at = Instant::now();
             if !self.shown {
                 self.open.snap(0.0);
-                self.open.velocity = KICK;
+                self.open.velocity = OPEN_KICK;
             }
             self.open.tune(OPEN);
             self.open.target = 1.0;
@@ -381,7 +369,7 @@ impl Toast {
     fn needs_draw(&self) -> bool {
         let morphing = self.end_at.is_some_and(|t| t.elapsed().as_secs_f32() * 1000.0 < MORPH_MS);
         let filling = self.badge == Badge::Done && self.end_at.is_none();
-        let fading = self.opened_at.elapsed().as_secs_f32() < FADE;
+        let fading = self.opened_at.elapsed().as_secs_f32() < OPEN_FADE;
         !self.open.settled() || fading || morphing || (!self.arc_live() && (!self.ring.settled() || filling))
     }
 
@@ -452,13 +440,13 @@ impl Toast {
         let (Some(g), Some([f1, f2]), Some(shadow)) = (&self.gfx, &self.fonts, &self.shadow) else { return Ok(()) };
         let s = self.scale;
         let o = self.open.value;
-        // 검색창처럼 가운데 기준 90 % x 70 %에서 원래 크기로 커지며 빠르게 페이드 인
-        let (sx, sy) = (0.90 + 0.10 * o, 0.70 + 0.30 * o);
+        // 검색창처럼 가운데 기준으로 커지며 (`open_scale`) 빠르게 페이드 인
+        let (sx, sy) = open_scale(o);
         let (cx, cy) = ((W / 2.0 + MARGIN) * s, (H / 2.0 + MARGIN) * s);
         let (w, h) = (W * s * sx, H * s * sy);
         let shape = rrect(cx - w / 2.0 + 0.5, cy - h / 2.0 + 0.5, cx + w / 2.0 - 0.5, cy + h / 2.0 - 0.5, (h - 1.0) / 2.0);
         let alpha = if self.open.target > 0.0 {
-            let t = Ease::OUT.apply((self.opened_at.elapsed().as_secs_f32() / FADE).min(1.0));
+            let t = Ease::OUT.apply((self.opened_at.elapsed().as_secs_f32() / OPEN_FADE).min(1.0));
             self.fade_from + (1.0 - self.fade_from) * t
         } else {
             o.clamp(0.0, 1.0)
@@ -486,18 +474,8 @@ impl Toast {
             dc.SetTarget(&target);
             let d = gfx::Drawing::begin(dc, &windows_numerics::Matrix3x2::identity());
             dc.Clear(Some(&color(0.0, 0.0, 0.0, 0.0)));
-            // 마스크는 빌려 씀, 구조체가 해제하지 않는 참조 미증가 복사본이고 소유는 호출하는 쪽
-            let layer = |opacity: f32, mask: Option<&ID2D1Geometry>| D2D1_LAYER_PARAMETERS1 {
-                contentBounds: rect(-1e6, -1e6, 1e6, 1e6),
-                geometricMask: std::mem::ManuallyDrop::new(mask.map(|m| std::mem::transmute_copy(m))),
-                maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-                maskTransform: windows_numerics::Matrix3x2::identity(),
-                opacity,
-                opacityBrush: std::mem::ManuallyDrop::new(None),
-                layerOptions: D2D1_LAYER_OPTIONS1_NONE,
-            };
             // 그림자도 판과 같은 레이어 안이라 같이 페이드
-            dc.PushLayer(&layer(alpha, None), None);
+            dc.PushLayer(&gfx::layer(alpha, None), None);
             dc.DrawImage(&shadow.output()?, None, None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
             dc.FillRoundedRectangle(&shape, &g.brush(with_alpha(TINT, PLATE_ALPHA))?);
             // 테두리 선, 위쪽이 더 밝음
@@ -505,7 +483,7 @@ impl Toast {
 
             {
                 let clip: ID2D1Geometry = g.factory.CreateRoundedRectangleGeometry(&shape)?.cast()?;
-                dc.PushLayer(&layer(1.0, Some(&clip)), None);
+                dc.PushLayer(&gfx::layer(1.0, Some(&clip)), None);
                 dc.SetTransform(&ride);
                 let lead = if self.badge == Badge::None { INSET } else { BADGE_TEXT_X };
                 let (x0, tw) = (left + lead * s - BEARING, cw - (lead + INSET) * s);
@@ -573,7 +551,7 @@ impl Toast {
         dc.SetTransform(&(local * ride));
         let (stroke, r) = (RING_STROKE * s, (BADGE - RING_STROKE) / 2.0 * s);
         if track_a > 0.0 {
-            dc.DrawEllipse(&circle(c.0, c.1, r), &g.brush(white(q(TRACK * track_a)))?, stroke, None);
+            dc.DrawEllipse(&circle(c.0, c.1, r), &g.brush(white(alpha_step(TRACK * track_a)))?, stroke, None);
         }
         let round = g.factory.CreateStrokeStyle(
             &D2D1_STROKE_STYLE_PROPERTIES1 {
@@ -586,7 +564,7 @@ impl Toast {
         )?;
         let fill = self.ring.value.clamp(0.0, 1.0);
         if ring_a > 0.0 && fill > 0.002 && !arc_live {
-            let ring_b = g.brush(white(q(RING * ring_a)))?;
+            let ring_b = g.brush(white(alpha_step(RING * ring_a)))?;
             if fill > 0.998 {
                 dc.DrawEllipse(&circle(c.0, c.1, r), &ring_b, stroke, None);
             } else {
@@ -609,7 +587,7 @@ impl Toast {
         }
         if disc_a > 0.0 {
             let disc = if self.badge == Badge::Failed { RED } else { GREEN };
-            dc.FillEllipse(&circle(c.0, c.1, (BADGE / 2.0 + 1.0) * s), &g.brush(with_alpha(disc, q(disc_a)))?);
+            dc.FillEllipse(&circle(c.0, c.1, (BADGE / 2.0 + 1.0) * s), &g.brush(with_alpha(disc, alpha_step(disc_a)))?);
         }
         if check > 0.0 {
             // 글리프 길이의 앞 `check`만큼, 획 순서대로

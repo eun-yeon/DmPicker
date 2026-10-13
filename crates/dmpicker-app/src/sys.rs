@@ -1,5 +1,7 @@
-//! 창 도우미 (게임 창 찾기, 우리 팝업 창), DPI 도우미
+//! 창 도우미 (게임 창 찾기, 우리 팝업 창), DPI 도우미, 앱 파일 저장
 //! 창 수준 API만 씀, 안티치트 때문에 게임 프로세스엔 접근 안 함
+
+use std::path::Path;
 
 use windows::core::{Result, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HWND, POINT, RECT};
@@ -87,8 +89,9 @@ pub fn set_clipboard_text(owner: HWND, text: &str) -> bool {
     }
 }
 
-/// 창의 클라이언트 영역, 화면 (물리 픽셀) 좌표
-pub fn client_rect_screen(h: HWND) -> Option<RECT> {
+/// 게임 창의 클라이언트 영역, 화면 (물리 픽셀) 좌표, 게임이 없으면 None
+pub fn game_rect() -> Option<RECT> {
+    let h = find_game()?;
     unsafe {
         let mut rc = RECT::default();
         GetClientRect(h, &mut rc).ok()?;
@@ -196,4 +199,12 @@ pub fn is_capture_tool(hwnd: HWND) -> bool {
         let exe = path.rsplit('\\').next().unwrap_or("");
         CAPTURE_TOOLS.contains(&exe)
     }
+}
+
+/// 임시 파일에 다 쓰고 디스크에 내린 뒤 바꿔 끼움, 쓰다 꺼져도 원래 파일이 남음
+pub fn save_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    dmpicker_update::store::atomic_write(path, bytes).map_err(std::io::Error::other)
 }

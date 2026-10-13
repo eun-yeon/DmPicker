@@ -12,8 +12,6 @@ pub enum ButtonMode {
 }
 
 impl ButtonMode {
-    pub const ALL: [ButtonMode; 4] = [ButtonMode::B4, ButtonMode::B5, ButtonMode::B6, ButtonMode::B8];
-
     pub fn buttons(self) -> u8 {
         match self {
             ButtonMode::B4 => 4,
@@ -21,13 +19,6 @@ impl ButtonMode {
             ButtonMode::B6 => 6,
             ButtonMode::B8 => 8,
         }
-    }
-    pub fn from_buttons(b: u8) -> Option<ButtonMode> {
-        ButtonMode::ALL.into_iter().find(|m| m.buttons() == b)
-    }
-    /// Ctrl+Numpad 단축키의 숫자 (버튼 수와 같음)
-    pub fn numpad_digit(self) -> u8 {
-        self.buttons()
     }
 }
 

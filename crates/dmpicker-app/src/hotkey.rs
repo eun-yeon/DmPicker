@@ -1,4 +1,4 @@
-//! 검색창 단축키: 받을 수 있는 조합인지, 보이는 이름 ("Ctrl + Space"), 설정 파일에 쓰는 글
+//! 검색창 단축키: 받을 수 있는 조합인지, 보이는 이름 ("Alt + Space"), 설정 파일에 쓰는 글
 
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 
@@ -20,8 +20,8 @@ const SYSTEM: [Hotkey; 1] = [hk(MOD_ALT, VK_F4)];
 const CTRL_SHIFT: HOT_KEY_MODIFIERS = HOT_KEY_MODIFIERS(MOD_CONTROL.0 | MOD_SHIFT.0);
 
 /// 검색창 안에서 쓰는 조합 (popup.rs의 키 처리), 단축키가 되면 검색창을 닫아 버림
-/// 모드·난이도 바꾸기, 입력 칸 편집 (전체 선택, 복사·잘라내기·붙여넣기, 단어 이동과 선택)
-const IN_POPUP: [Hotkey; 12] = [
+/// 모드·난이도 바꾸기, 입력 칸 편집 (전체 선택, 복사·잘라내기·붙여넣기, 단어 이동과 선택), 즐겨찾기
+const IN_POPUP: [Hotkey; 13] = [
     hk(MOD_ALT, VIRTUAL_KEY(b'M' as u16)),
     hk(HOT_KEY_MODIFIERS(MOD_ALT.0 | MOD_SHIFT.0), VIRTUAL_KEY(b'M' as u16)),
     hk(MOD_ALT, VK_LEFT),
@@ -34,6 +34,7 @@ const IN_POPUP: [Hotkey; 12] = [
     hk(MOD_CONTROL, VK_RIGHT),
     hk(CTRL_SHIFT, VK_LEFT),
     hk(CTRL_SHIFT, VK_RIGHT),
+    hk(MOD_CONTROL, VIRTUAL_KEY(b'D' as u16)),
 ];
 
 /// 표시 순서대로 수식 키와 그 이름

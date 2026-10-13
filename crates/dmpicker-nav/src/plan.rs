@@ -45,6 +45,7 @@ impl CostWeights {
 #[derive(Clone, Debug)]
 pub struct Planner {
     n: usize,
+    /// 쓸 수 있는 키, 동점이면 앞 키 우선
     keys: Vec<Key>,
     wts: Vec<u32>,
     /// `next[p * keys.len() + j]` = `p`에서 `keys[j]`를 누른 뒤 위치
@@ -118,10 +119,6 @@ impl Planner {
     pub fn is_empty(&self) -> bool {
         self.n == 0
     }
-    /// 플래너가 쓸 수 있는 키, 동점일 때 우선순위 순
-    pub fn keys(&self) -> &[Key] {
-        &self.keys
-    }
     /// 플래너 그래프 (고쳐졌을 수 있음) 기준으로 `pos`에서 `key`를 누른 뒤 위치
     /// 플래너가 모르는 키는 위치를 안 바꿈
     pub fn apply(&self, pos: usize, key: Key) -> usize {
@@ -175,11 +172,6 @@ impl Planner {
     pub fn plan(&self, from: usize, to: usize) -> Vec<Key> {
         self.distances_to(to).plan(self, from)
     }
-
-    /// [`Planner::plan`]의 비용 (못 가면 `u32::MAX`)
-    pub fn plan_cost(&self, from: usize, to: usize) -> u32 {
-        self.distances_to(to).cost(from)
-    }
 }
 
 /// 목표 하나까지 남은 비용, 어느 시작 위치에서든 다시 씀
@@ -191,10 +183,7 @@ pub struct DistField {
 }
 
 impl DistField {
-    pub fn cost(&self, from: usize) -> u32 {
-        self.dist[from]
-    }
-    /// `from`에서의 최적 계획을 뽑음 (동점이면 [`Planner::keys`] 순서상 앞 키)
+    /// `from`에서의 최적 계획을 뽑음 (동점이면 플래너 키 순서상 앞 키)
     pub fn plan(&self, pl: &Planner, from: usize) -> Vec<Key> {
         let k = pl.keys.len();
         let mut out = Vec::new();
@@ -226,9 +215,4 @@ impl DistField {
 /// 여러 번 물을 거면 `Planner`를 재사용해야 함
 pub fn plan(model: &ListModel, from: usize, to: usize) -> Vec<Key> {
     Planner::new(model, CostWeights::default()).plan(from, to)
-}
-
-/// [`plan`]의 가중 비용 (기본 가중치: 방향키 한 번에 100)
-pub fn plan_cost(model: &ListModel, from: usize, to: usize) -> u32 {
-    Planner::new(model, CostWeights::default()).plan_cost(from, to)
 }

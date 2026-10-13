@@ -24,7 +24,7 @@ use crate::img::{Rect, Rgb, RgbView};
 use crate::state::{layout_kind, ScreenKind, FREESTYLE_BAR_X, MIN_ROWS, ONLINE_BAR_X};
 use crate::REF_H;
 
-/// 칸 하나만 볼 때 선택으로 치는 `fill` 점수 ([`slot_state`])
+/// 압도적인 칸이 없을 때 선택으로 치는 `fill` 절대 기준 ([`states_from_metrics`])
 pub const FILL_SELECTED: f32 = 110.0;
 /// 프레임에서 `fill`이 가장 높은 칸을 선택으로 치려면 넘어야 하는 점수 ([`slot_states`])
 pub const FILL_MIN: f32 = 80.0;
@@ -88,11 +88,6 @@ fn layout_slots(h: u32, (x0, y0, bh, _): (f32, f32, f32, f32), dx: f32) -> [Rect
             (bh * s).round() as i32,
         )
     })
-}
-
-/// 높이 `h`인 16:9 클라이언트의 온라인 칸 기본 위치
-pub fn online_slots(h: u32) -> [Rect; 4] {
-    layout_slots(h, ONLINE_LAYOUT, 0.0)
 }
 
 /// 막대가 `design_bar_x`에 있는 배치에 비해 목록이 가로로 밀린 정도 (16:9면 0)
@@ -277,19 +272,6 @@ pub fn slot_metrics(img: &Rgb, r: Rect) -> SlotMetrics {
     SlotMetrics {
         fill,
         border: 0.5 * (top + bot),
-    }
-}
-
-/// 칸 하나만 보고 판단한 상태 (절대 기준)
-/// 프레임의 네 칸을 비교하는 [`slot_states`]를 쓰는 게 나음
-pub fn slot_state(img: &Rgb, r: Rect) -> SlotState {
-    let m = slot_metrics(img, r);
-    if m.fill >= FILL_SELECTED {
-        SlotState::Selected
-    } else if m.border >= BORDER_MIN {
-        SlotState::Available
-    } else {
-        SlotState::Missing
     }
 }
 

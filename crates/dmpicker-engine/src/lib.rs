@@ -40,7 +40,7 @@ pub use features::{
 };
 pub use geom::{at_rest, find_list, ListGeom};
 pub use img::{Rect, Rgb, RgbView};
-pub use panel::{find_diff_slots, slot_states, Difficulty, SlotState};
+pub use panel::{slot_states, SlotState};
 pub use read::{read_window, RowRead};
 pub use state::{analyze, classify, ScreenInfo, ScreenKind};
 

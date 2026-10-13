@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 /// 목록 항목의 제목 그룹, 게임의 순환 그룹 순서를 따름
-/// `A..Z -> RANDOM -> Kanji -> Hangul -> Symbol -> Digit -> A ...`
+/// `A..Z`, RANDOM, Kanji, Hangul, Symbol, Digit 순으로 돌고 다시 A
 ///
 /// derive한 `Ord`도 정확히 이 순서 (Letter('A') < ... < Letter('Z') < Random < ...)
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -50,11 +50,6 @@ impl Group {
             30 => Group::Digit,
             _ => return None,
         })
-    }
-
-    /// `c`가 글자면 그 글자 그룹 (ASCII, 대소문자 무시)
-    pub fn letter(c: char) -> Option<Group> {
-        c.is_ascii_alphabetic().then(|| Group::Letter(c.to_ascii_uppercase()))
     }
 
     /// 표시 제목의 첫 글자로 정한 그룹
@@ -345,9 +340,6 @@ impl ListModel {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
-    pub fn entries(&self) -> &[Entry] {
-        &self.entries
-    }
     pub fn entry(&self, pos: usize) -> &Entry {
         &self.entries[pos]
     }
@@ -362,9 +354,6 @@ impl ListModel {
     /// `pos`가 든 구간의 [`ListModel::runs`] 인덱스
     pub fn run_index(&self, pos: usize) -> usize {
         self.run_of[pos] as usize
-    }
-    pub fn run_of(&self, pos: usize) -> &GroupRun {
-        &self.runs[self.run_of[pos] as usize]
     }
     /// 그룹의 구간, 없으면 None
     pub fn run_for(&self, group: Group) -> Option<&GroupRun> {

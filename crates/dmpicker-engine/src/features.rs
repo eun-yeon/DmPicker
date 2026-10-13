@@ -209,8 +209,7 @@ impl RefSet {
         self.by_id.contains_key(&id)
     }
 
-    /// 미리 계산한 특징으로 기준 추가 (게임에서 학습한 크롭 등, [`crate::read::RowRead::feature`])
-    /// 학습한 크롭이 djmax.gg 그림보다 잘 맞음
+    /// 미리 계산한 특징으로 기준 추가
     pub fn add_features(&mut self, id: SongId, color: &Feature, gray: &GrayFeature) {
         self.by_id
             .entry(id)
@@ -221,7 +220,7 @@ impl RefSet {
         self.gray.extend_from_slice(gray);
     }
 
-    /// 이미지로 기준 추가 (재킷 그림이나 게임 크롭)
+    /// 재킷이나 RANDOM 칸 그림으로 기준 추가
     pub fn add_image(&mut self, id: SongId, v: RgbView) {
         self.add_features(id, &jacket_feature(v), &jacket_feature_gray(v));
         if is_grey(v) {
@@ -263,20 +262,9 @@ impl RefSet {
                     std::thread::Builder::new().spawn_scoped(scope, move || {
                         let mut rows = Vec::with_capacity(part.len());
                         for &(id, _) in part {
-                            let image = match decode(id) {
-                                Ok(image) => image,
-                                Err(error) if error.kind() == io::ErrorKind::Interrupted => return Err(error),
-                                Err(error) => {
-                                    eprintln!("jacket {id}: {error}");
-                                    continue;
-                                }
+                            let Some(image) = checked_jacket(id, decode(id))? else {
+                                continue;
                             };
-                            if image.width != 128
-                                || image.height != 128
-                                || image.data.len() != 128 * 128 * 3
-                            {
-                                return Err(invalid_cache("invalid jacket dimensions"));
-                            }
                             rows.push((
                                 id,
                                 Box::new(jacket_feature(image.view())),
@@ -335,17 +323,9 @@ impl RefSet {
             }
             let decoded = decode(id);
             check_cancel(cancel)?;
-            let image = match decoded {
-                Ok(image) => image,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => return Err(error),
-                Err(error) => {
-                    eprintln!("jacket {id}: {error}");
-                    continue;
-                }
+            let Some(image) = checked_jacket(id, decoded)? else {
+                continue;
             };
-            if image.width != 128 || image.height != 128 || image.data.len() != 128 * 128 * 3 {
-                return Err(invalid_cache("invalid jacket dimensions"));
-            }
             set.add_image(id, image.view());
         }
         check_cancel(cancel)?;
@@ -511,19 +491,6 @@ impl RefSet {
     pub fn topk_gray(&self, g: &GrayFeature, k: usize) -> Vec<Candidate> {
         self.top_from(k, self.gray.chunks_exact(GRAY_LEN).map(|r| dot(r, g)))
     }
-
-    /// 컬러 특징과 특정 곡 하나의 최고 유사도 (모르는 id면 `None`)
-    pub fn score_id(&self, f: &Feature, id: SongId) -> Option<f32> {
-        let idx = self.by_id.get(&id)?;
-        idx.iter()
-            .map(|&i| {
-                dot(
-                    &self.color[i as usize * FEAT_LEN..(i as usize + 1) * FEAT_LEN],
-                    f,
-                )
-            })
-            .reduce(f32::max)
-    }
 }
 
 type RefRow = (SongId, Box<Feature>, Box<GrayFeature>, bool);
@@ -576,6 +543,23 @@ fn check_cancel(cancel: &AtomicBool) -> io::Result<()> {
     } else {
         Ok(())
     }
+}
+
+/// 디코딩한 128×128 재킷, 못 읽은 곡은 로그만 남기고 None
+/// 취소 오류와 크기가 틀린 이미지는 오류
+fn checked_jacket(id: SongId, decoded: io::Result<Rgb>) -> io::Result<Option<Rgb>> {
+    let image = match decoded {
+        Ok(image) => image,
+        Err(error) if error.kind() == io::ErrorKind::Interrupted => return Err(error),
+        Err(error) => {
+            eprintln!("jacket {id}: {error}");
+            return Ok(None);
+        }
+    };
+    if image.width != 128 || image.height != 128 || image.data.len() != 128 * 128 * 3 {
+        return Err(invalid_cache("invalid jacket dimensions"));
+    }
+    Ok(Some(image))
 }
 
 fn cache_len(count: usize) -> io::Result<usize> {

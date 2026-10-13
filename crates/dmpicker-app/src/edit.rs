@@ -88,7 +88,7 @@ impl Editor {
         self.set(at, extend);
     }
 
-    /// ← (`word`면 Ctrl+←), 선택이 있는데 그냥 ←면 선택의 앞으로
+    /// 왼쪽 방향키 (`word`면 `Ctrl+Left`), 선택이 있는데 그냥 누르면 선택의 앞으로
     pub fn left(&mut self, word: bool, extend: bool) {
         let to = match self.selection() {
             Some((a, _)) if !extend && !word => a,
@@ -98,7 +98,7 @@ impl Editor {
         self.set(to, extend);
     }
 
-    /// → (`word`면 Ctrl+→), 선택이 있는데 그냥 →면 선택의 뒤로
+    /// 오른쪽 방향키 (`word`면 `Ctrl+Right`), 선택이 있는데 그냥 누르면 선택의 뒤로
     pub fn right(&mut self, word: bool, extend: bool) {
         let to = match self.selection() {
             Some((_, b)) if !extend && !word => b,

@@ -1,7 +1,7 @@
 //! 내 키워드 파일, 곡 데이터 갱신과 따로 두고 지금 없는 곡 id도 남김
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use dmpicker_search::Song;
 use serde_json::{json, Value};
@@ -65,21 +65,11 @@ impl Keywords {
         entries.retain(|_, e| !e.words.is_empty());
         let rows: Vec<Value> = entries.iter().map(|(id, e)| json!({ "id": id, "name": e.name, "keywords": e.words })).collect();
         let raw = serde_json::to_vec_pretty(&rows).map_err(|_| SAVE_FAILED)?;
-        if let Err(e) = write(&self.path, &raw) {
+        if let Err(e) = crate::sys::save_file(&self.path, &raw) {
             eprintln!("save keywords: {e}");
             return Err(SAVE_FAILED);
         }
         self.entries = entries;
         Ok(())
     }
-}
-
-/// 임시 파일에 다 쓴 뒤 바꿔 끼움, 쓰다 끊겨도 원래 파일이 남게 (플레이리스트 사본도 씀)
-pub fn write(path: &Path, raw: &[u8]) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, raw)?;
-    std::fs::rename(tmp, path)
 }

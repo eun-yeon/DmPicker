@@ -43,7 +43,7 @@ use toast::{Badge, Toast};
 /// 사용자에게 보이는 이름: 창 제목, 오류 창, 트레이 툴팁, 시작 시 실행 값 이름
 const APP_NAME: &str = "DM PICKER";
 const HOTKEY_ID: i32 = 1;
-const TIMER_FOREGROUND: usize = 1; // 검색창 창의 타이머, popup.rs의 TIMER_CARET (2)·TIMER_FOCUS (3)도 같은 창
+const TIMER_FOREGROUND: usize = 1; // 검색창 창의 타이머, popup.rs의 TIMER_CARET (2)·TIMER_FOCUS (3)·TIMER_SEARCH (4)도 같은 창
 const WM_APP_STATUS: u32 = WM_APP + 1;
 /// 단축키 뒤 화면 확인이 끝남 (`request_open`)
 const WM_APP_OPEN: u32 = WM_APP + 2;
@@ -67,7 +67,7 @@ struct App {
     job: Option<(Arc<AtomicBool>, std::thread::JoinHandle<()>)>, // 실행 중인 작업과 취소 플래그
     retired_jobs: Vec<std::thread::JoinHandle<()>>,
     peek_job: Option<std::thread::JoinHandle<()>>,
-    initial_refs: Option<std::thread::JoinHandle<update::InitialLoad>>,
+    initial_refs: Option<std::thread::JoinHandle<update::Startup>>,
     updates: update::Updater,
     /// 곡 이동 중 화면이 저장된 목록과 달랐음
     /// 새 목록이 저장되거나 다음 이동이 도착할 때까지 검색창에서 다시 인식을 권함
@@ -95,8 +95,7 @@ fn store_dir() -> PathBuf {
 
 fn data_dir() -> std::io::Result<PathBuf> {
     let exe = std::env::current_exe()?;
-    let adjacent = exe.parent().ok_or_else(|| std::io::Error::other("missing executable directory"))?.join("data");
-    Ok(adjacent)
+    Ok(exe.parent().ok_or_else(|| std::io::Error::other("missing executable directory"))?.join("data"))
 }
 
 fn sync_hotkey(a: &mut App) {
@@ -228,11 +227,11 @@ fn load_settings(p: &mut Popup) {
     apply_settings(p, &v);
 }
 
-/// 설정 파일 내용을 검색창에 넣음, 없거나 못 읽는 값은 그대로 (예전 파일엔 단축키가 없음)
+/// 설정 파일 내용을 검색창에 넣음, 없거나 못 읽는 값은 그대로 (1.0.0 파일엔 keep_query·show_dlc가 없음)
 fn apply_settings(p: &mut Popup, v: &serde_json::Value) {
     if let Some(m) = v["mode"].as_str() {
         if let Some(m) = dmpicker_search::Mode::from_label(m) {
-            p.mode_choice = m; // 예전 설정엔 "유지"가 있을 수 있음, 그땐 기본값 그대로
+            p.mode_choice = m;
         }
     }
     if let Some(d) = v["diff"].as_str().and_then(dmpicker_search::Diff::from_label) {
@@ -255,8 +254,7 @@ fn settings_json(p: &Popup) -> serde_json::Value {
 
 /// 저장하지 못하면 알림 (다시 켜면 예전 값으로 돌아감)
 fn save_settings(a: &mut App) -> bool {
-    let _ = std::fs::create_dir_all(store_dir());
-    let ok = std::fs::write(settings_path(), settings_json(&a.popup).to_string()).is_ok();
+    let ok = sys::save_file(&settings_path(), settings_json(&a.popup).to_string().as_bytes()).is_ok();
     if !ok {
         a.toast.show("설정을 저장하지 못했어요", Badge::None, Some(3.0));
     }
@@ -281,7 +279,7 @@ fn hand_over(a: &mut App) -> Option<driver::Ctx> {
         input::request_foreground(game);
     }
     let Some(refs) = a.refs.lock().unwrap().clone() else {
-        a.toast.show("준비 중이에요\n잠시 후 다시 시도해 주세요", Badge::None, Some(2.0));
+        a.toast.show("준비 중이에요\n잠시 뒤 다시 시도해 주세요", Badge::None, Some(2.0));
         return None;
     };
     Some(driver::Ctx { refs, store: a.store.clone(), titles: a.titles.clone(), hotkey: a.popup.hotkey })
@@ -428,17 +426,9 @@ fn reap_jobs(a: &mut App) {
     }
     if a.initial_refs.as_ref().is_some_and(|h| h.is_finished()) {
         if let Some(handle) = a.initial_refs.take() {
-            if let Ok(result) = handle.join() {
-                match result {
-                    Ok(startup) => {
-                        if let Some(refs) = a.updates.initial_loaded(startup) {
-                            if let Ok(mut slot) = a.refs.lock() { *slot = Some(refs); }
-                        }
-                    }
-                    Err(error) => {
-                        a.updates.initial_failed();
-                        eprintln!("jacket refs failed: {error}");
-                    }
+            if let Ok(startup) = handle.join() {
+                if let Some(refs) = a.updates.initial_loaded(startup) {
+                    if let Ok(mut slot) = a.refs.lock() { *slot = Some(refs); }
                 }
             }
         }
@@ -692,17 +682,9 @@ fn main() -> Result<()> {
                 return Ok(());
             }
         };
-        let mut startup = match update::preview(&store_dir(), &dir) {
-            Ok(data) => data,
-            Err(e) => {
-                eprintln!("failed to load catalog from {}: {e}", dir.display());
-                let text = HSTRING::from(format!("곡 데이터를 읽지 못했어요\n{}\n\n실행 파일 옆에 data 폴더가 있는지 확인해 주세요", dir.display()));
-                MessageBoxW(None, &text, &HSTRING::from(APP_NAME), MB_OK | MB_ICONERROR);
-                return Ok(());
-            }
-        };
+        let mut startup = update::preview(&store_dir(), &dir);
         startup.catalog.load_keywords(store_dir().join("keywords.json"));
-        println!("catalog: {} songs from {}", startup.catalog.songs.len(), dir.display());
+        println!("catalog: {} songs", startup.catalog.songs.len());
 
         let ex = WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOREDIRECTIONBITMAP;
         let hwnd = sys::create_popup(w!("DmPickerPopup"), APP_NAME, ex, Some(wndproc))?;

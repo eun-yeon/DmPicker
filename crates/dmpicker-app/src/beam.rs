@@ -19,7 +19,6 @@ use windows::UI::Composition::*;
 use windows::Win32::Foundation::{E_INVALIDARG, POINT};
 use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::System::WinRT::Composition::ICompositionDrawingSurfaceInterop;
 use windows::Win32::System::WinRT::Graphics::Direct2D::{
     IGraphicsEffectD2D1Interop, IGraphicsEffectD2D1Interop_Impl, GRAPHICS_EFFECT_PROPERTY_MAPPING, GRAPHICS_EFFECT_PROPERTY_MAPPING_DIRECT,
@@ -244,7 +243,8 @@ enum Curve {
     Sine,
 }
 
-fn ts(secs: f32) -> TimeSpan {
+/// 초를 합성기 시간 (100 ns 단위)으로
+pub fn ts(secs: f32) -> TimeSpan {
     TimeSpan { Duration: (secs * 10_000_000.0) as i64 }
 }
 
@@ -257,7 +257,8 @@ fn plus(v: f32) -> String {
     }
 }
 
-fn rgb(c: [f32; 3], a: f32) -> Color {
+/// 색 (0..255)과 불투명도 (0..1)를 합성기 색으로
+pub fn rgb(c: [f32; 3], a: f32) -> Color {
     let b = |v: f32| (v.clamp(0.0, 255.0)).round() as u8;
     Color { A: (a.clamp(0.0, 1.0) * 255.0).round() as u8, R: b(c[0]), G: b(c[1]), B: b(c[2]) }
 }
@@ -598,9 +599,9 @@ impl Make<'_> {
                 [(0.0, 1.0), (a, 0.0), (b, 0.0), (1.0, 1.0)].map(|(position, al)| D2D1_GRADIENT_STOP { position, color: gfx::white(al) })
             };
             let full = rect(0.0, 0.0, w, h);
-            dc.FillRectangle(&full, &linear(dc, &band(h), (0.0, 0.0), (0.0, h))?);
+            dc.FillRectangle(&full, &gfx::gradient(dc, &band(h), gfx::pt(0.0, 0.0), gfx::pt(0.0, h))?);
             dc.SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_ADD);
-            dc.FillRectangle(&full, &linear(dc, &band(w), (0.0, 0.0), (w, 0.0))?);
+            dc.FillRectangle(&full, &gfx::gradient(dc, &band(w), gfx::pt(0.0, 0.0), gfx::pt(w, 0.0))?);
             dc.SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
             Ok(())
         })
@@ -630,7 +631,7 @@ impl Make<'_> {
         gfx::set_f32(&blur, D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION.0 as u32, 4.5 * s)?;
         gfx::set_input_image(&blur, 0, &cl.cast()?);
         let body: ID2D1Geometry = f.CreateRoundedRectangleGeometry(&rounded(rect(0.0, 0.0, w, h), radius))?.cast()?;
-        dc.PushLayer(&clip_layer(&body), None);
+        dc.PushLayer(&gfx::layer(1.0, Some(&body)), None);
         dc.DrawImage(&blur.GetOutput()?, None, None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
         dc.PopLayer();
         Ok(())
@@ -691,13 +692,7 @@ impl Make<'_> {
         let turning = |pixels: Vec<u8>, blur: f32| -> Result<ContainerVisual> {
             let l = side as f32;
             let img = self.drawn(l, l, |dc| unsafe {
-                let props = D2D1_BITMAP_PROPERTIES1 {
-                    pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
-                    dpiX: 96.0,
-                    dpiY: 96.0,
-                    bitmapOptions: D2D1_BITMAP_OPTIONS_NONE,
-                    colorContext: std::mem::ManuallyDrop::new(None),
-                };
+                let props = gfx::bitmap_props(D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_BITMAP_OPTIONS_NONE);
                 let bmp = dc.CreateBitmap(D2D_SIZE_U { width: side, height: side }, Some(pixels.as_ptr() as _), side * 4, &props)?;
                 if blur > 0.0 {
                     let fx = dc.CreateEffect(&CLSID_D2D1GaussianBlur)?;
@@ -874,27 +869,6 @@ impl Make<'_> {
 /// 지금 판에 맞는 모서리 반지름 식, 판 높이·너비의 반을 안 넘음
 fn corner(radius: f32) -> String {
     format!("Min({radius}, Min(p.cw, p.ch) / 2)")
-}
-
-/// 모양 마스크만 있는 레이어 (빌려 씀, 해제는 호출하는 쪽)
-fn clip_layer(geo: &ID2D1Geometry) -> D2D1_LAYER_PARAMETERS1 {
-    unsafe {
-        D2D1_LAYER_PARAMETERS1 {
-            contentBounds: rect(-1e6, -1e6, 1e6, 1e6),
-            geometricMask: std::mem::ManuallyDrop::new(Some(std::mem::transmute_copy(geo))),
-            maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-            maskTransform: Matrix3x2::identity(),
-            opacity: 1.0,
-            opacityBrush: std::mem::ManuallyDrop::new(None),
-            layerOptions: D2D1_LAYER_OPTIONS1_NONE,
-        }
-    }
-}
-
-unsafe fn linear(dc: &ID2D1DeviceContext, stops: &[D2D1_GRADIENT_STOP], from: (f32, f32), to: (f32, f32)) -> Result<ID2D1LinearGradientBrush> {
-    let rt: ID2D1RenderTarget = dc.cast()?;
-    let coll = rt.CreateGradientStopCollection(stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)?;
-    dc.CreateLinearGradientBrush(&D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES { startPoint: gfx::pt(from.0, from.1), endPoint: gfx::pt(to.0, to.1) }, None, &coll)
 }
 
 /// 원뿔 그라데이션 셋 (가림, 흰 심, 번짐), 12시부터 시계 방향 비율에 따른 흰색 알파, premultiplied BGRA

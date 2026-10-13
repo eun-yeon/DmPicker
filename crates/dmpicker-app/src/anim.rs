@@ -1,4 +1,4 @@
-//! 애니메이션 기본 도구: 스프링(선택 강조)과 cubic-bezier 트윈(나머지 전부)
+//! 애니메이션 기본 도구: 스프링 (열기, 버튼, 패널 높이, 선택 강조, 스크롤, 알림)과 cubic-bezier 트윈 (나머지)
 
 use std::time::Instant;
 
@@ -30,6 +30,7 @@ impl Spring {
 
     /// 작은 고정 간격으로 나눠 적분함, 프레임 간격이 커도 안정적
     pub fn step(&mut self, dt: f32) {
+        let before = self.value;
         let mut left = dt.min(0.1);
         while left > 0.0 {
             let h = left.min(1.0 / 240.0);
@@ -38,11 +39,29 @@ impl Spring {
             self.value += self.velocity * h;
             left -= h;
         }
+        // 4096 px 넘는 스크롤에선 남은 걸음이 f32 반올림에 묻혀 값은 멈추고 속도만 남음
+        // 그대로 두면 `settled`가 끝내 참이 안 돼서 계속 그림, 멈추는 거리는 좌표 크기에 비례함
+        if self.value == before && (self.target - self.value).abs() < 0.01f32.max(self.target.abs() * 1e-5) {
+            self.snap(self.target);
+        }
     }
 
     pub fn settled(&self) -> bool {
         (self.target - self.value).abs() < 0.01 && self.velocity.abs() < 0.01
     }
+}
+
+/// 검색창·알림 열기: 띄울 때 0에서 1로 가는 스프링 (stiffness, damping), 살짝 튐
+pub const OPEN: (f32, f32) = (340.0, 22.0);
+/// 열 때 처음 속도, 첫 프레임부터 움직임
+pub const OPEN_KICK: f32 = 4.0;
+/// 열 때 스프링과 따로 이 시간 동안 처음엔 빠르게 페이드 인
+/// 스프링은 느리게 출발해서 그대로 쓰면 첫 프레임들이 거의 안 보임
+pub const OPEN_FADE: f32 = 0.10;
+
+/// 열기 스프링 값 `o`일 때 판 배율 (가로, 세로), 가운데 기준 90 % x 70 %에서 원래 크기로 커짐
+pub fn open_scale(o: f32) -> (f32, f32) {
+    (0.90 + 0.10 * o, 0.70 + 0.30 * o)
 }
 
 /// CSS식 cubic-bezier 이징 곡선

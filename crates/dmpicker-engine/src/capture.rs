@@ -32,9 +32,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::img::{Rect, Rgb};
 
-/// 게임 클라이언트 창 제목
-pub const GAME_TITLE: &str = "DJMAX RESPECT V";
-
 /// `Send + Sync + Copy`인 창 핸들 (그냥 정수), `windows::HWND`로 바꿀 수 있음
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Hwnd(pub isize);

@@ -35,15 +35,6 @@ impl Rect {
         let y1 = self.bottom().min(o.bottom());
         (x1 > x0 && y1 > y0).then(|| Rect::new(x0, y0, x1 - x0, y1 - y0))
     }
-    /// 사방으로 `m` 픽셀씩 줄임
-    pub fn inset(&self, m: i32) -> Rect {
-        Rect::new(
-            self.x + m,
-            self.y + m,
-            (self.w - 2 * m).max(0),
-            (self.h - 2 * m).max(0),
-        )
-    }
 }
 
 /// packed RGB8 이미지 (행 우선, stride = `width * 3`)
@@ -151,17 +142,6 @@ impl Rgb {
     /// 안티앨리어싱 bilinear 크기 변경 (커널은 [`Op1d::blur_resize`]와 같음)
     pub fn resize(&self, w: usize, h: usize) -> Rgb {
         self.view().resize(w, h)
-    }
-
-    /// 표준편차 `sigma`인 분리형 가우시안 블러 (가장자리는 끝 픽셀로 채움)
-    pub fn blur(&self, sigma: f32) -> Rgb {
-        let v = self.view();
-        let f = resample(v, self.width, self.height, sigma);
-        Rgb {
-            width: self.width,
-            height: self.height,
-            data: f.iter().map(|&x| to_u8(x)).collect(),
-        }
     }
 }
 
