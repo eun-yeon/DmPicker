@@ -121,9 +121,10 @@ pub fn restore_on_panic() {
 pub fn recover() {
     let path = crate::store_dir().join(RECORD);
     let Ok(raw) = std::fs::read(&path) else { return };
-    let _ = std::fs::remove_file(&path);
     let Some(s) = parse_record(&raw) else { return };
-    put_back(&s);
+    if put_back(&s) {
+        remove_record();
+    }
 }
 
 /// 창 핸들은 닫힌 뒤 다른 창에 다시 쓰일 수 있어서 pid·입력기 창까지 같아야 같은 게임
