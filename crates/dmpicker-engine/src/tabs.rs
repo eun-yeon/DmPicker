@@ -7,7 +7,7 @@
 use std::sync::OnceLock;
 
 use crate::geom::ListGeom;
-use crate::img::{luma_feature, Rect, Rgb, RgbView};
+use crate::img::{luma_feature, Rect, Rgb};
 use crate::state::{nominal_lists, ScreenKind};
 
 /// 지금 탭에 보이는 ALL TRACK 글자, 1440p 화면에서 아래 상자 위치대로 잘라 둠
@@ -36,16 +36,11 @@ const FH: usize = 16;
 const CURRENT_MIN: f32 = 0.8;
 const STRIP_MIN: f32 = 0.7;
 
-/// 글자 상자의 luma 썸네일, 살짝 블러 (최고점이 덜 뾰족하게)
-fn feature(v: RgbView) -> Vec<f32> {
-    luma_feature(v, FW, FH, 0.75 * v.width as f32 / FW as f32)
-}
-
 fn template() -> &'static [f32] {
     static T: OnceLock<Vec<f32>> = OnceLock::new();
     T.get_or_init(|| {
         let im = Rgb::decode(LABEL_PNG).expect("built-in ALL TRACK label");
-        feature(im.view())
+        luma_feature(im.view(), FW, FH)
     })
 }
 
@@ -61,7 +56,7 @@ fn label(img: &Rgb, geom: &ListGeom, dx: f32, dy: f32) -> Option<Vec<f32>> {
         (BOX_H * s).round() as i32,
     );
     let r = r.intersect(&img.rect()).filter(|c| *c == r)?;
-    Some(feature(img.sub(r)))
+    Some(luma_feature(img.sub(r), FW, FH))
 }
 
 /// (`dx`, 0) 주변 양쪽으로 `slack_x`까지 옮겨 가며 잰 템플릿 상관계수

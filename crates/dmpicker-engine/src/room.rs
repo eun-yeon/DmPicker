@@ -6,7 +6,7 @@
 use std::sync::OnceLock;
 
 use crate::geom::find_list;
-use crate::img::{luma_feature, Rect, Rgb, RgbView};
+use crate::img::{luma_feature, Rect, Rgb};
 use crate::state::{layout_kind, ScreenKind, MIN_ROWS, ONLINE_BAR_X};
 
 /// F4 키 표시 안쪽, 1440p 방장 화면에서 아래 상자 위치대로 잘라 둠
@@ -31,16 +31,11 @@ fn light(p: [u8; 3]) -> bool {
     lo >= 170 && hi - lo <= 30
 }
 
-/// 탭 글자와 같은 세기로 살짝 블러, 줄여 그린 작은 칸에서도 점수가 덜 떨어짐
-fn feature(v: RgbView) -> Vec<f32> {
-    luma_feature(v, THUMB, THUMB, 0.75 * v.width as f32 / THUMB as f32)
-}
-
 fn template() -> &'static [f32] {
     static T: OnceLock<Vec<f32>> = OnceLock::new();
     T.get_or_init(|| {
         let im = Rgb::decode(F4_PNG).expect("built-in F4 key");
-        feature(im.view())
+        luma_feature(im.view(), THUMB, THUMB)
     })
 }
 
@@ -63,7 +58,7 @@ fn f4_scores(img: &Rgb) -> Option<(f32, f32)> {
     let v = img.sub(r);
     let lit = (0..v.height).flat_map(|y| v.row(y).chunks_exact(3)).filter(|p| light([p[0], p[1], p[2]])).count();
     let lit = lit as f32 / (v.width * v.height) as f32;
-    let m = feature(v).iter().zip(template()).map(|(a, b)| a * b).sum();
+    let m = luma_feature(v, THUMB, THUMB).iter().zip(template()).map(|(a, b)| a * b).sum();
     Some((lit, m))
 }
 

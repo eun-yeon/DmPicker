@@ -321,7 +321,9 @@ pub fn resample(v: RgbView, out_w: usize, out_h: usize, sigma: f32) -> Vec<f32> 
 
 /// luma 썸네일, 평균 0·길이 1로 맞춰서 밝기·대비가 달라도 모양만 비교됨
 /// 견본과 내적하면 상관계수
-pub(crate) fn luma_feature(v: RgbView, out_w: usize, out_h: usize, sigma: f32) -> Vec<f32> {
+/// 줄여 그린 글자의 경계가 섞여도 점수가 덜 떨어지게 블러
+pub(crate) fn luma_feature(v: RgbView, out_w: usize, out_h: usize) -> Vec<f32> {
+    let sigma = 0.75 * v.width as f32 / out_w as f32;
     let rgb = resample(v, out_w, out_h, sigma);
     let mut f: Vec<f32> = rgb.chunks_exact(3).map(|p| (p[0] + p[1] + p[2]) / 3.0).collect();
     let mean = f.iter().sum::<f32>() / f.len() as f32;
