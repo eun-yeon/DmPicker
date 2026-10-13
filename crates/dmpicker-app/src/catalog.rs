@@ -85,6 +85,11 @@ impl Catalog {
         Filter::parse(query, &self.tag_names)
     }
 
+    /// 특성 조건을 쓴 검색어, 조건이 틀려도 일반 검색 대신 빈 결과로
+    pub fn has_tag_syntax(&self, query: &str) -> bool {
+        self.tag_names.has_tag_syntax(query)
+    }
+
     /// 조건 검색: `f`에 맞는 (`songs` 인덱스, 패턴 난이도) 전부 (개수 제한 없음), 패턴은 모드 `mode`로 봄
     pub fn filter(&self, f: &Filter, mode: Mode, owned: Option<&HashSet<u32>>) -> Vec<(usize, Option<Diff>)> {
         f.find(&self.songs, mode, |i| self.allowed(i, owned))

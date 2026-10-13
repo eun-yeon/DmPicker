@@ -119,9 +119,20 @@ impl TagNames {
         TagNames::new(songs.iter().flat_map(|s| s.pattern_tags.iter().flatten().flatten().flatten()).map(|(n, _)| n.as_str()))
     }
 
+    /// 특성 이름 뒤에 ':'가 있는 검색어, 값이 비었거나 틀려도 일반 검색으로 안 넘기려고 값은 안 봄
+    pub fn has_tag_syntax(&self, raw: &str) -> bool {
+        let text = squeeze(raw);
+        text.match_indices(':').any(|(at, _)| self.suffix(&text[..at]).is_some())
+    }
+
     /// `s` 끝에 붙은 이름 중 가장 긴 것의 (키 길이, 특성들), 겹계단이 계단으로 안 읽히게
+    /// 이름 앞이 맨 앞이나 숫자·'~'·'-'일 때만, 풀사이드의 사이드는 안 잡음
     fn suffix(&self, s: &str) -> Option<(usize, &[String])> {
-        self.0.iter().filter(|(k, _)| s.ends_with(k.as_str())).max_by_key(|(k, _)| k.len()).map(|(k, n)| (k.len(), n.as_slice()))
+        self.0.iter().filter(|(k, _)| {
+            s.strip_suffix(k.as_str()).is_some_and(|before| {
+                before.chars().next_back().is_none_or(|c| c.is_ascii_digit() || matches!(c, '~' | '-'))
+            })
+        }).max_by_key(|(k, _)| k.len()).map(|(k, n)| (k.len(), n.as_slice()))
     }
 }
 
@@ -174,7 +185,7 @@ pub struct Filter {
 }
 
 impl Filter {
-    /// 검색어 전체가 조건으로만 이뤄졌으면 Some, 아니면 텍스트 검색
+    /// 검색어 전체가 조건으로만 이뤄졌으면 Some
     /// 패턴 특성 이름은 `names`에 있는 것만 받음
     pub fn parse(raw: &str, names: &TagNames) -> Option<Filter> {
         // 특성 이름은 친 글자 그대로 비교, 자판 키로 바꾸면 "게단"이 계단으로 읽힘

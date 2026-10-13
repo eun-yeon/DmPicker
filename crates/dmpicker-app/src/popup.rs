@@ -1971,7 +1971,7 @@ impl Popup {
         let norm = dmpicker_search::normalize(word);
         let why = if norm.is_empty() {
             Some("글자나 숫자를 넣어 주세요")
-        } else if self.catalog.parse_filter(word).is_some() {
+        } else if self.catalog.parse_filter(word).is_some() || self.catalog.has_tag_syntax(word) {
             Some("sc15나 bpm150 같은 조건 검색어는 키워드로 쓸 수 없어요")
         } else if song.user_keys.iter().any(|k| dmpicker_search::normalize(k) == norm) {
             Some("이미 있는 키워드예요")
@@ -2542,6 +2542,10 @@ impl Popup {
     /// 레벨이나 패턴 특성 조건이 있으면 맞는 패턴마다, BPM 조건만이면 곡 (설정의 모드·난이도로 이동)
     fn find(&self, q: &str) -> Vec<Row> {
         let Some(f) = self.catalog.parse_filter(q) else {
+            // 특성 조건을 치다 만 글은 엉뚱한 곡 이름 결과 대신 빈 목록
+            if self.catalog.has_tag_syntax(q) {
+                return Vec::new();
+            }
             return self.catalog.search(q, LIMIT, self.owned.as_ref()).into_iter().map(Row::Song).collect();
         };
         let mode = f.level.and_then(|l| l.mode).unwrap_or(self.mode_choice);
@@ -3960,6 +3964,7 @@ impl Popup {
                     Some(Filter { level: Some(q), .. }) => format!("{} · {}", q.mode.unwrap_or(self.mode_choice).label(), q.diff.label()),
                     // 레벨 조건 없이 특성 조건이 있으면 난이도는 줄마다 달라서 모드만
                     Some(c) if !c.tags.is_empty() => self.mode_choice.label().to_owned(),
+                    None if self.view == View::Results && self.catalog.has_tag_syntax(&self.searched) => self.mode_choice.label().to_owned(),
                     _ => format!("{} · {}", self.mode_choice.label(), self.diff_choice.label()),
                 };
                 let cl_ = g.layout_centered(&cond, &f.small, cr.right - cr.left, cr.bottom - cr.top)?;
