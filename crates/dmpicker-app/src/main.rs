@@ -26,7 +26,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use dmpicker_engine::{capture, input};
+use dmpicker_engine::{capture, input, ScreenKind};
 use windows::core::{w, Result, HSTRING};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
@@ -74,11 +74,13 @@ struct App {
     /// 단축키를 눌러 검색창을 열지 화면을 확인하는 중, 그동안 누른 단축키는 무시함
     peeking: bool,
     peeked: Arc<Mutex<Peeked>>,
+    /// 지금 검색창을 연 선곡 화면, 첫 데이터를 넣을 때 고를 수 있는 곡을 다시 계산
+    open_kind: Option<ScreenKind>,
     playlists: playlist::Loader,
 }
 
-/// 단축키 뒤 화면 확인 결과: 선곡 목록이 보였으면 Some(그 목록에서 고를 수 있는 곡, 첫 인식 전엔 None)
-type Peeked = Option<Option<HashSet<u32>>>;
+/// 단축키 뒤 화면 확인 결과: 선곡 목록이 보였으면 Some(그 화면, 그 목록에서 고를 수 있는 곡, 첫 인식 전엔 None)
+type Peeked = Option<(ScreenKind, Option<HashSet<u32>>)>;
 
 static mut APP: *mut App = std::ptr::null_mut();
 
@@ -182,7 +184,7 @@ fn request_open(a: &mut App) {
         let t0 = std::time::Instant::now();
         let kind = driver::peek();
         eprintln!("peek: {kind:?} ({} ms)", t0.elapsed().as_millis());
-        *slot.lock().unwrap() = kind.map(|k| driver::searchable(&store, k, &titles));
+        *slot.lock().unwrap() = kind.map(|k| (k, driver::searchable(&store, k, &titles)));
     }));
 }
 
@@ -359,6 +361,18 @@ fn on_action(a: &mut App, act: Action) {
         Action::Pick(id, chart) => on_pick(a, id, chart, None),
         Action::PlaylistPick(id, pattern) => on_pick(a, pattern.title, Some((pattern.mode, pattern.diff)), Some(id)),
         Action::Scan => on_scan(a),
+        Action::Retry => {
+            let busy = a.peeking || jobs_busy(a);
+            let refs = a.refs.lock().ok().and_then(|slot| slot.clone());
+            a.updates.retry(busy, refs);
+            sync_notices(a);
+        }
+        // 브라우저가 포커스를 가져가면 검색창은 평소처럼 닫힘
+        Action::Release => {
+            if let Err(e) = a.updates.open_page() {
+                eprintln!("release page: {e}");
+            }
+        }
         Action::Hide => a.popup.hide(),
         Action::Choice => {
             save_settings(a);
@@ -432,24 +446,50 @@ fn reap_jobs(a: &mut App) {
     }
 }
 
+/// 지금 교체하면 Some(열린 검색창에 바로 넣음)
+/// 받아 둔 데이터가 없던 첫 받기는 열린 검색창에도 바로 넣음, 그 밖엔 검색창이 닫힌 뒤 교체
+fn apply_mode(had_data: bool, visible: bool, open: bool, busy: bool) -> Option<bool> {
+    let fill = !had_data && open;
+    (!busy && (!visible || fill)).then_some(fill)
+}
+
 /// 교체 관문과 메모리 교체를 한 번에 처리
 fn apply_ready(a: &mut App) {
-    if a.popup.visible || a.peeking || jobs_busy(a) { return; }
-    let Some(ready) = a.updates.take_ready() else { return; };
     let had_data = a.updates.active.has_data();
+    let busy = a.peeking || jobs_busy(a);
+    let Some(fill) = apply_mode(had_data, a.popup.visible, a.popup.is_open(), busy) else { return; };
+    let Some(ready) = a.updates.take_ready() else { return; };
     let changed = ready.changed_jackets(&a.updates.active);
     let update::Ready { catalog, active, refs, titles, summary } = ready;
-    if let Err(catalog) = a.popup.replace_catalog(catalog, &changed, None) {
+    let fill_with = if fill {
+        Some(catalog)
+    } else if let Err(catalog) = a.popup.replace_catalog(catalog, &changed, None) {
         a.updates.keep_ready(update::Ready { catalog: *catalog, active, refs, titles, summary });
         return;
-    }
+    } else {
+        None
+    };
     if let Ok(mut slot) = a.refs.lock() { *slot = active.has_data().then_some(refs); }
     a.titles = titles;
     if !had_data && active.has_data() {
         driver::ensure_both(&a.store, &|id| a.titles.get(&id).cloned().unwrap_or_default());
     }
+    if let Some(catalog) = fill_with {
+        let owned = refill_owned(&a.store, a.open_kind, &a.titles);
+        a.popup.fill_catalog(catalog, owned);
+    }
     a.generation = a.generation.wrapping_add(1);
     a.updates.applied(active, &summary);
+    // 치던 검색어가 플레이리스트 주소면 새 목록으로 다시 받음
+    if fill {
+        request_playlist(a);
+    }
+}
+
+/// 열린 검색창에 첫 데이터를 넣을 때 고를 수 있는 곡
+/// 열 때는 제목이 없어 모르는 칸에 있을 수 있는 곡이 빠졌음, 새 제목과 이번 열기의 화면으로 다시 계산
+fn refill_owned(store: &std::path::Path, kind: Option<ScreenKind>, titles: &HashMap<u32, String>) -> Option<HashSet<u32>> {
+    kind.and_then(|k| driver::searchable(store, k, titles))
 }
 
 fn update_tick(a: &mut App) {
@@ -459,6 +499,21 @@ fn update_tick(a: &mut App) {
     a.updates.poll();
     apply_ready(a);
     start_update(a);
+    sync_notices(a);
+}
+
+/// 업데이트 상태를 검색창 안내 카드와 설정 머리 줄에 넘김, 새 버전 안내는 그린 뒤에만 기록
+fn sync_notices(a: &mut App) {
+    if a.popup.take_version_seen() {
+        a.updates.exe_notice_shown();
+    }
+    // 새 버전 안내는 열 때 정하고 그 열기 동안 유지, 형식 문제가 풀리면 빠짐
+    let version = a.updates.exe_notice.as_ref().map(|n| n.text.clone());
+    if a.popup.set_updates(a.updates.data_notice, version, a.updates.status_line()) && a.popup.visible {
+        if let Err(e) = a.popup.render() {
+            eprintln!("render error: {e:?}");
+        }
+    }
 }
 
 fn start_update(a: &mut App) {
@@ -472,9 +527,14 @@ fn update_opened(a: &mut App) {
     reap_jobs(a);
     a.updates.poll();
     start_update(a);
+    // 지난 열기에 보인 안내를 먼저 기록해야 이번 안내에서 빠짐
+    if a.popup.take_version_seen() {
+        a.updates.exe_notice_shown();
+    }
     let busy = a.peeking || jobs_busy(a);
     let refs = a.refs.lock().ok().and_then(|slot| slot.clone());
     a.updates.opened(busy, refs);
+    sync_notices(a);
 }
 
 fn show_update_notice(a: &mut App) {
@@ -568,7 +628,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             let found = a.peeked.lock().unwrap().take();
             // 확인하는 동안 다른 창으로 넘어갔으면 (Alt+Tab, 트레이 메뉴) 버림
             let game_front = capture::find_game_window().is_some_and(input::is_foreground);
-            if let (Some(owned), true) = (found, game_front) {
+            if let (Some((kind, owned)), true) = (found, game_front) {
+                a.open_kind = Some(kind);
                 a.popup.show(owned, a.stale.load(Ordering::Relaxed));
                 // Windows가 포커스를 안 주면 바로 숨김, 보이는데 글자는 게임으로 가는 일이 없게
                 if unsafe { GetForegroundWindow() } != a.popup.hwnd {
@@ -675,6 +736,7 @@ fn main() -> Result<()> {
             stale: Arc::new(AtomicBool::new(false)),
             peeking: false,
             peeked: Arc::new(Mutex::new(None)),
+            open_kind: None,
             playlists: playlist::Loader::default(),
         });
         load_settings(&mut app_box.popup);

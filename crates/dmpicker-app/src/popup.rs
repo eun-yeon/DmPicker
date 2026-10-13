@@ -27,6 +27,7 @@ use crate::hotkey::Hotkey;
 use crate::icons::Icon;
 use crate::playlist::{self, Entry, Failure, Library, Pattern, Playlist, Recent, Reply};
 use crate::sys;
+use crate::update::{DataNotice, OUTDATED_TEXT};
 
 const LIMIT: usize = 50;
 const IDENTITY: windows_numerics::Matrix3x2 = windows_numerics::Matrix3x2::identity();
@@ -154,6 +155,10 @@ pub enum Action {
     PlaylistPick(String, Pattern),
     Hide,
     Scan,
+    /// 곡 데이터를 바로 다시 받음
+    Retry,
+    /// 새 버전 릴리즈 페이지를 엶
+    Release,
     /// 모드·난이도·토글 바뀜 (저장해야 함)
     Choice,
     /// 새 단축키를 받음, 등록해 보고 [`Popup::hotkey_result`]로 알려야 함
@@ -188,6 +193,23 @@ enum Sheet {
     History,
     /// 곡 줄과 키워드 칩
     Keywords,
+}
+
+/// 결과 자리에 뜨는 안내 카드, 모두 같은 높이 (`CARD_H`)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Card {
+    /// 첫 실행에 곡 데이터를 받는 중, 버튼 없음
+    Loading,
+    /// 곡 데이터를 받지 못함
+    Failed,
+    /// 받은 곡 데이터 형식을 이 버전이 못 읽음
+    Outdated,
+    /// 첫 인식 전
+    Scan,
+    /// 곡 이동 중 화면이 저장된 목록과 달랐음
+    Stale,
+    /// 새 버전이 나옴, 버전마다 한 번만
+    Update,
 }
 
 /// 키워드 시트 상태와 닫으면 돌아갈 보기·입력·줄·스크롤
@@ -527,6 +549,16 @@ pub struct Popup {
     owned: Option<HashSet<u32>>,
     /// 곡 이동 중 화면이 저장된 목록과 달랐음 (다른 계정, 새 곡)
     stale: bool,
+    /// 받아 둔 곡 데이터가 없을 때의 상태 (앱이 넘겨줌)
+    data_notice: Option<DataNotice>,
+    /// 이번 열기의 새 버전 안내 설명, 열 때마다 앱이 정함
+    version_notice: Option<String>,
+    /// 새 버전 안내 카드를 그림, 앱이 꺼내서 기록 (`take_version_seen`)
+    version_seen: bool,
+    /// 설정 시트 머리 줄 문구, true면 새 버전 안내라 조금 밝게
+    status_line: Option<(String, bool)>,
+    /// 카드 시트에 그리는 카드, 시트처럼 보이거나 나타나는 중에만 바뀜
+    card_now: Option<Card>,
     /// 검색창 단축키 (앱이 등록하고 저장함)
     pub hotkey: Hotkey,
     /// 새 단축키를 기다리는 중이면 Some(대기 동안 떼어 둔 IME 입력 컨텍스트)
@@ -595,7 +627,7 @@ pub struct Popup {
     sel_y: Spring,          // 선택 강조 위쪽, 패널 px (높이는 한 줄)
     scroll_s: Spring,       // 목록 오프셋 px, scroll x 줄 간격을 따라감
     seg: [Tween; 3],        // 세그먼트 손잡이 [모드, 난이도, 히스토리 탭]: 왼쪽 끝, 칸 단위
-    list_shown: Tween,      // 히스토리 줄 목록 보임 0 .. 1, 탭을 바꾸면 옛 목록이 사라진 뒤 나타남
+    list_shown: Tween,      // 히스토리 줄 목록·카드 내용 보임 0 .. 1, 탭이나 카드가 바뀌면 옛 내용이 사라진 뒤 나타남
     star: Option<StarMotion>, // 키워드 시트 별 버튼 모션, 시트를 닫으면 버림
     toggles: [ToggleMotion; 2], // 검색어 유지, DLC 표시
     hover_since: Option<Instant>,
@@ -612,9 +644,9 @@ pub struct Popup {
     last_mouse: Option<(i32, i32)>, // 마지막 마우스 이동의 클라이언트 좌표
     // 리소스
     jackets: HashMap<u32, Option<ID2D1Bitmap1>>,
-    /// 히스토리 시트에 지난 프레임에 그린 줄 목록, 탭을 바꾸면 이걸 흐려 보냄
+    /// 히스토리·카드 시트에 지난 프레임에 그린 내용, 탭이나 카드가 바뀌면 이걸 흐려 보냄
     last_list: Option<ID2D1CommandList>,
-    /// 탭을 바꿔 흐려지며 올라가는 옛 목록과 그 불투명도
+    /// 탭이나 카드가 바뀌어 흐려지며 올라가는 옛 내용과 그 불투명도
     old_list: Option<(ID2D1CommandList, Tween)>,
     fonts: Option<Fonts>,
     fx: Option<Effects>,
@@ -727,6 +759,11 @@ impl Popup {
             catalog,
             owned: None,
             stale: false,
+            data_notice: None,
+            version_notice: None,
+            version_seen: false,
+            status_line: None,
+            card_now: None,
             hotkey: Hotkey::DEFAULT,
             hotkey_wait: None,
             hotkey_note: None,
@@ -820,11 +857,7 @@ impl Popup {
         next.inherit_keywords(&mut self.catalog);
         self.catalog = next;
         self.owned = owned;
-        let ids: HashSet<_> = self.catalog.songs.iter().map(|song| song.id).collect();
-        self.library.recent.retain(|entry| match entry {
-            Recent::Song(id) => ids.contains(id),
-            Recent::Playlist { .. } => true,
-        });
+        self.retain_recent();
         self.kept_row = kept_row;
         if let Some(p) = &mut self.playlist {
             p.restore = restore;
@@ -856,6 +889,51 @@ impl Popup {
         self.hover = Hit::None;
         self.jackets.retain(|id, _| !changed_jackets.contains(id));
         Ok(())
+    }
+
+    /// 받아 둔 곡 데이터가 없던 첫 받기, 열려 있어도 바로 새 목록으로 바꾸고 치던 검색어로 다시 찾음
+    /// 빈 목록이라 옮길 선택·재킷이 없음, `owned`는 새 제목으로 다시 계산한 이번 열기의 고를 수 있는 곡
+    pub fn fill_catalog(&mut self, mut next: Catalog, owned: Option<HashSet<u32>>) {
+        next.inherit_keywords(&mut self.catalog);
+        self.catalog = next;
+        self.owned = owned;
+        self.retain_recent();
+        self.kept_row = None;
+        self.rolls = Rolls::default();
+        self.jackets.clear();
+        self.fill_history();
+        self.searched.clear();
+        self.search_now();
+        self.retarget_panel();
+    }
+
+    /// 새 목록에 없는 곡은 최근 기록에서 뺌, 플레이리스트는 그대로
+    fn retain_recent(&mut self) {
+        let ids: HashSet<_> = self.catalog.songs.iter().map(|song| song.id).collect();
+        self.library.recent.retain(|entry| match entry {
+            Recent::Song(id) => ids.contains(id),
+            Recent::Playlist { .. } => true,
+        });
+    }
+
+    /// 업데이트 상태, 다시 그려야 하면 true
+    /// 받아 둔 곡 데이터가 없을 때의 안내, 이번 열기의 새 버전 안내 설명, 설정 머리 줄
+    pub fn set_updates(&mut self, data: Option<DataNotice>, version: Option<String>, status: Option<(String, bool)>) -> bool {
+        if (data, &version, &status) == (self.data_notice, &self.version_notice, &self.status_line) {
+            return false;
+        }
+        self.data_notice = data;
+        self.version_notice = version;
+        self.status_line = status;
+        if self.visible {
+            self.retarget_panel();
+        }
+        true
+    }
+
+    /// 지난번 꺼낸 뒤 새 버전 안내 카드를 그렸는지
+    pub fn take_version_seen(&mut self) -> bool {
+        std::mem::take(&mut self.version_seen)
     }
 
     #[allow(dead_code)]
@@ -910,23 +988,62 @@ impl Popup {
                 || self.leave_since.is_some())
     }
 
-    /// 검색어가 비었을 때 결과 대신 보여주는 안내 카드
-    fn card(&self) -> Option<(&'static str, &'static str, &'static str)> {
-        if !self.searched.trim().is_empty() || self.view != View::Results {
+    /// 결과 대신 보여 주는 안내 카드
+    /// 곡 데이터가 없으면 결과도 없어서 검색어가 있어도 보임, 나머지는 검색어가 비었을 때만
+    /// 첫 인식 전, 목록이 다름, 새 버전 순
+    fn card(&self) -> Option<Card> {
+        if self.view != View::Results {
             return None;
         }
-        self.notice()
+        match self.data_notice {
+            Some(DataNotice::Loading) => return Some(Card::Loading),
+            Some(DataNotice::Failed) => return Some(Card::Failed),
+            Some(DataNotice::Outdated) => return Some(Card::Outdated),
+            None => {}
+        }
+        if !self.searched.trim().is_empty() {
+            None
+        } else if self.owned.is_none() {
+            Some(Card::Scan)
+        } else if self.stale {
+            Some(Card::Stale)
+        } else {
+            self.version_notice.as_ref().map(|_| Card::Update)
+        }
     }
 
-    /// 이번 열기의 목록에 맞는 안내 (제목, 설명, 인식 버튼): 첫 인식 전, 목록이 다름
-    fn notice(&self) -> Option<(&'static str, &'static str, &'static str)> {
-        if self.owned.is_none() {
-            return Some(("곡 목록을 한 번 읽어올게요", "읽는 동안 잠시 손을 쉬어 주세요", "목록 인식 시작"));
+    /// 카드의 (제목, 설명, 버튼), 버튼이 없으면 글만
+    fn card_text(&self, card: Card) -> (&'static str, &str, Option<&'static str>) {
+        match card {
+            Card::Loading => ("곡 데이터를 받고 있어요", "잠시만 기다려 주세요", None),
+            Card::Failed => ("곡 데이터를 받지 못했어요", "인터넷 연결을 확인해 주세요", Some("다시 시도")),
+            Card::Outdated => ("앱을 업데이트해 주세요", OUTDATED_TEXT, Some("릴리즈 페이지")),
+            Card::Scan => ("곡 목록을 한 번 읽어올게요", "읽는 동안 잠시 손을 쉬어 주세요", Some("목록 인식 시작")),
+            Card::Stale => ("저장된 곡 목록과 화면이 달라요", "계정이나 DLC가 바뀌었다면 다시 읽어 주세요", Some("다시 인식")),
+            Card::Update => ("앱을 업데이트해 주세요", self.version_notice.as_deref().unwrap_or_default(), Some("릴리즈 페이지")),
         }
-        if self.stale {
-            return Some(("저장된 곡 목록과 화면이 달라요", "계정이나 DLC가 바뀌었다면 다시 읽어 주세요", "다시 인식"));
+    }
+
+    /// 카드 버튼을 누르거나 Enter, 카드가 바뀐 뒤 새 카드가 반 넘게 보여야 함 (`list_ready`)
+    fn card_action(&self) -> Action {
+        if !self.list_ready() {
+            return Action::None;
         }
-        None
+        match self.card() {
+            Some(Card::Scan | Card::Stale) => Action::Scan,
+            Some(Card::Failed) => Action::Retry,
+            Some(Card::Outdated | Card::Update) => Action::Release,
+            Some(Card::Loading) | None => Action::None,
+        }
+    }
+
+    /// 새 버전 안내 카드가 지금 보임, 그린 프레임마다 기록할 걸로 남김 (`take_version_seen`)
+    fn version_card_visible(&self) -> bool {
+        self.sheet == Sheet::Card
+            && self.card_now == Some(Card::Update)
+            && self.sheet_geom().alpha > 0.0
+            && self.panel_h.value > 0.0
+            && self.list_fade(self.list_shown.value()).0 > 0.0
     }
 
     // ---------------------------------------------------------------- 열기 / 닫기
@@ -1001,6 +1118,7 @@ impl Popup {
         }
         self.owned = owned;
         self.stale = stale;
+        self.version_notice = None; // 이번 열기의 안내는 앱이 연 뒤 정함 (`set_updates`)
 
         self.dragging = false;
         self.kb_focus = None;
@@ -1230,6 +1348,7 @@ impl Popup {
     /// 보여 줄 게 있으면 그 높이로 나타나고 (다 사라져 있었으면 그 높이에서 바로) 시트 내용도 한 프레임에 바꿈
     /// 없으면 높이와 내용을 그대로 둔 채 사라짐, 다 사라지면 높이 0 (`render`)
     /// 나타나다 사라지거나 그 반대로 바뀌어도 지금 불투명도·자리에서 이어짐
+    /// 보이던 카드가 다른 카드로 바뀌면 히스토리 탭처럼 앞 내용이 흐려지며 올라간 뒤 새 내용이 내려앉음
     fn retarget_panel(&mut self) {
         let to = self.panel_target();
         if to <= 0.0 {
@@ -1245,6 +1364,22 @@ impl Popup {
         if matches!(sheet, Sheet::Results | Sheet::History) && sheet != self.sel_of {
             self.sel_of = sheet;
             self.reset_rows();
+        }
+        // 다른 시트로 바뀌면 흐려 보내던 내용은 버림, 히스토리 목록이 카드 위에 남지 않게
+        // 카드와 히스토리는 서로의 전환을 이어받지 않음
+        if sheet != self.sheet {
+            self.old_list = None;
+            if sheet == Sheet::Card || self.sheet == Sheet::Card {
+                self.list_shown.snap(1.0);
+            }
+        }
+        // 반 넘게 보이던 카드만, 나타나는 중이면 다른 시트처럼 한 프레임에 바뀜
+        if sheet == Sheet::Card {
+            let card = self.card();
+            if self.sheet == Sheet::Card && card != self.card_now && self.sheet_geom().alpha >= 0.5 {
+                self.swap_list();
+            }
+            self.card_now = card;
         }
         self.sheet = sheet;
     }
@@ -1605,8 +1740,10 @@ impl Popup {
             }
             return Hit::Inside;
         }
-        if self.card().is_some() {
-            if inside(&self.card_button(), x, y) {
+        // 카드 버튼은 그려진 자리로, 카드가 바뀐 뒤 반도 안 보이면 안 눌림 (`list_ready`)
+        if let Some(card) = self.card() {
+            let y = y - self.list_fade(self.list_shown.value()).1;
+            if self.card_text(card).2.is_some() && self.list_ready() && inside(&self.card_button(), x, y) {
                 return Hit::CardButton;
             }
             return Hit::Inside;
@@ -1925,8 +2062,8 @@ impl Popup {
         self.retarget_panel();
     }
 
-    /// 탭을 바꿈: 보이던 줄 목록은 흐려지며 올라가고 (`old_list`), 새 목록은 그 뒤에 내려앉음
-    /// 옛 목록이 사라지는 중에 또 바꾸면 그 목록이 마저 사라짐
+    /// 탭이나 카드를 바꿈: 보이던 줄 목록·카드 내용은 흐려지며 올라가고 (`old_list`), 새 내용은 그 뒤에 내려앉음
+    /// 옛 내용이 사라지는 중에 또 바꾸면 그 내용이 마저 사라짐
     fn swap_list(&mut self) {
         let shown = self.list_shown.value();
         if let Some(list) = self.last_list.take().filter(|_| shown > 0.0) {
@@ -1943,16 +2080,17 @@ impl Popup {
         self.list_shown.target() > 0.0 && self.list_fade(self.list_shown.value()).0 <= 0.0
     }
 
-    /// 히스토리 줄 목록을 보임 `a`일 때 그리는 (불투명도, 다 나온 자리에서 비켜난 거리 px, 위가 음수)
-    /// 시트처럼 1/64 단위, 나타날 땐 위에서 내려앉고 사라질 땐 올라감, 그리기와 줄 판정이 같이 씀
+    /// 히스토리 줄 목록·카드 내용을 보임 `a`일 때 그리는 (불투명도, 다 나온 자리에서 비켜난 거리 px, 위가 음수)
+    /// 시트처럼 1/64 단위, 나타날 땐 위에서 내려앉고 사라질 땐 올라감, 그리기와 판정이 같이 씀
     fn list_fade(&self, a: f32) -> (f32, f32) {
         let a = alpha_step(a);
         (a, -SHEET_RISE * self.scale * (1.0 - a))
     }
 
-    /// 줄을 누르거나 고르거나 키워드 시트를 열 수 있음, 시트처럼 탭을 바꾼 뒤 새 목록이 반 넘게 보여야 함
+    /// 줄이나 카드 버튼을 누르거나 고르거나 키워드 시트를 열 수 있음
+    /// 시트처럼 탭이나 카드를 바꾼 뒤 새 내용이 반 넘게 보여야 함
     fn list_ready(&self) -> bool {
-        self.view != View::History || self.list_fade(self.list_shown.value()).0 >= 0.5
+        !matches!(self.sheet_now(), Sheet::History | Sheet::Card) || self.list_fade(self.list_shown.value()).0 >= 0.5
     }
 
     /// 새 단축키를 기다림 (설정 보기에서만, 거기선 조합 중인 글자가 없음)
@@ -2863,7 +3001,7 @@ impl Popup {
                             Action::None
                         }
                         VK_ESCAPE => Action::Hide,
-                        VK_RETURN if self.card().is_some() => Action::Scan,
+                        VK_RETURN if self.card().is_some() => self.card_action(),
                         VK_RETURN if !self.list_ready() => Action::None,
                         VK_RETURN => self.choose(self.selected),
                         VK_UP => {
@@ -3055,7 +3193,8 @@ impl Popup {
                         self.kb_focus = None;
                         Action::Choice
                     }
-                    Hit::Rescan | Hit::CardButton => Action::Scan,
+                    Hit::Rescan => Action::Scan,
+                    Hit::CardButton => self.card_action(),
                     Hit::Hotkey => {
                         self.kb_focus = None;
                         self.start_hotkey_wait();
@@ -3658,6 +3797,29 @@ impl Popup {
                 Ok(())
             };
 
+            // 안내 카드: 제목과 설명을 한 덩어리로 가운데, 버튼은 오른쪽 16 정렬선 (없으면 글이 그 선까지)
+            let draw_card = || -> Result<()> {
+                let Some(card) = self.card_now else { return Ok(()) };
+                let (title, sub, button) = self.card_text(card);
+                let tw = r0 - l0 - if button.is_some() { self.px(lay::CARD_BTN_W + 12.0) } else { 0.0 };
+                // 두 줄을 재서 카드 안에 한 덩어리로 가운데 정렬
+                let tl = g.layout(title, &f.title, tw, self.px(40.0))?;
+                let sl_ = g.layout(sub, &f.sub, tw, self.px(40.0))?;
+                let (mut tm, mut sm) = (DWRITE_TEXT_METRICS::default(), DWRITE_TEXT_METRICS::default());
+                tl.GetMetrics(&mut tm)?;
+                sl_.GetMetrics(&mut sm)?;
+                let gap = self.px(4.0);
+                let y0 = ct + ((self.px(lay::CARD_H) - (tm.height + gap + sm.height)) / 2.0).round();
+                dc.DrawTextLayout(gfx::pt(l0t, y0), &tl, &text_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+                dc.DrawTextLayout(gfx::pt(l0t, y0 + tm.height + gap), &sl_, &sub_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+                if let Some(button) = button {
+                    draw_button(g, &f.item_bold, self.card_button(), button, matches!(self.hover, Hit::CardButton), s)?;
+                }
+                Ok(())
+            };
+            // 탭이나 카드가 바뀔 때 흐려 보내는 내용: 히스토리 줄 목록이나 카드
+            let draw_swapped = || if self.sheet == Sheet::Card { draw_card() } else { draw_list() };
+
             // 6) 패널 내용 (움직이는 패널 모양으로 자름, 보기를 바꾸면 한 프레임에 바뀜)
             if has_panel {
                 let geo = g.factory.CreateRoundedRectangleGeometry(&rounded(panel, pr))?;
@@ -3681,6 +3843,15 @@ impl Popup {
                     let sl = self.settings_layout();
                     let t = g.layout("검색 설정", &f.head, self.px(200.0), self.px(22.0))?;
                     dc.DrawTextLayout(gfx::pt(l0t, sl.title), &t, &text_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                    // 머리 줄 오른쪽: 곡 데이터 상태, 새 버전이 있으면 그 안내를 조금 밝게
+                    // 오른쪽 정렬선에 붙이고 제목 오른쪽 12 앞에서 말줄임, 글자 기준선은 제목과 같음
+                    if let Some((line, bright)) = &self.status_line {
+                        let left = l0t + self.measure("검색 설정", |f| &f.head) + self.px(12.0);
+                        let st = g.layout(line, &f.sub, (r0 - left).max(0.0), self.px(18.0))?;
+                        st.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)?;
+                        let sb = g.brush(if *bright { SUB } else { FAINT })?;
+                        dc.DrawTextLayout(gfx::pt(left, sl.title + baseline(&t) - baseline(&st)), &st, &sb, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                    }
                     // 화살표로 바꾸는 컨트롤은 (한 번 쓴 뒤로) 테두리 없이 라벨 밝기로만 표시
                     for (k, (label, y)) in [("버튼 모드", sl.labels[0]), ("난이도", sl.labels[1])].into_iter().enumerate() {
                         let ll = g.layout(label, &f.sub, self.px(200.0), self.px(18.0))?;
@@ -3724,20 +3895,6 @@ impl Popup {
                         let m = &self.toggles[toggle as usize];
                         draw_toggle(g, r, (m.knob.value(), m.tint.value(), m.press.value()), self.hover == Hit::Toggle(toggle) || self.kb_focus == Some(focus), s)?;
                     }
-                } else if let (Sheet::Card, Some((title, sub, button))) = (self.sheet, self.notice()) {
-                    let top = ct;
-                    let tw = r0 - l0 - self.px(lay::CARD_BTN_W + 12.0);
-                    // 두 줄을 재서 카드 안에 한 덩어리로 가운데 정렬
-                    let tl = g.layout(title, &f.title, tw, self.px(40.0))?;
-                    let sl_ = g.layout(sub, &f.sub, tw, self.px(40.0))?;
-                    let (mut tm, mut sm) = (DWRITE_TEXT_METRICS::default(), DWRITE_TEXT_METRICS::default());
-                    tl.GetMetrics(&mut tm)?;
-                    sl_.GetMetrics(&mut sm)?;
-                    let gap = self.px(4.0);
-                    let y0 = top + ((self.px(lay::CARD_H) - (tm.height + gap + sm.height)) / 2.0).round();
-                    dc.DrawTextLayout(gfx::pt(l0t, y0), &tl, &text_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
-                    dc.DrawTextLayout(gfx::pt(l0t, y0 + tm.height + gap), &sl_, &sub_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
-                    draw_button(g, &f.item_bold, self.card_button(), button, matches!(self.hover, Hit::CardButton), s)?;
                 } else if let (Sheet::Keywords, Some(song)) = (self.sheet, self.keyword_song()) {
                     let kl = self.keyword_layout();
                     // 곡 줄: 결과 줄과 같은 재킷·제목·아랫줄 (선택 강조 없음), 레벨 칸 자리에 별과 완료 버튼
@@ -3801,10 +3958,13 @@ impl Popup {
                     if let Some(note) = self.keyword_note() {
                         text_line(note, &f.sub, kl.note, self.px(16.0), &sub_b)?;
                     }
-                } else if self.sheet == Sheet::History {
+                } else if matches!(self.sheet, Sheet::History | Sheet::Card) {
                     // 탭은 제자리, 탭을 바꾸면 줄 목록만 옛 것이 흐려지며 올라간 뒤 새 것이 내려앉음 (`swap_list`)
-                    let at = self.seg[2].value();
-                    draw_segments(g, f, self.tabs_rect(), &["최근", "즐겨찾기"], (at, at + 1.0), lay::PANEL_R - lay::PAD, s)?;
+                    // 카드끼리 바뀔 때도 같음
+                    if self.sheet == Sheet::History {
+                        let at = self.seg[2].value();
+                        draw_segments(g, f, self.tabs_rect(), &["최근", "즐겨찾기"], (at, at + 1.0), lay::PANEL_R - lay::PAD, s)?;
+                    }
                     let old = self.old_list.as_ref().map(|(list, fade)| (Some(list), fade.value()));
                     for (list, a) in old.into_iter().chain([(None, self.list_shown.value())]) {
                         // 다 나타난 목록은 레이어 없이 그림
@@ -3818,7 +3978,7 @@ impl Popup {
                         }
                         match list {
                             Some(list) => dc.DrawImage(list, None, None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER),
-                            None => draw_list()?,
+                            None => draw_swapped()?,
                         }
                         if a < 1.0 {
                             dc.PopLayer();
@@ -3837,24 +3997,34 @@ impl Popup {
             dc.PopLayer();
             d.end()?;
 
-            // 탭을 바꿀 때 흐려 보낼 히스토리 줄 목록, 이번 프레임 그대로 기록해 둠 (`swap_list`)
-            if self.sheet == Sheet::History && has_panel {
+            // 탭이나 카드가 바뀔 때 흐려 보낼 히스토리 줄 목록·카드, 이번 프레임 그대로 기록해 둠 (`swap_list`)
+            if matches!(self.sheet, Sheet::History | Sheet::Card) && has_panel {
                 let list = dc.CreateCommandList()?;
                 dc.SetTarget(&list);
                 let d = Drawing::begin(dc, &IDENTITY);
-                draw_list()?;
+                draw_swapped()?;
                 d.end()?;
                 list.Close()?;
                 last_list = Some(list);
             }
         }
         self.last_list = last_list;
-        // 다 사라졌거나 히스토리를 떠나면 버림, 돌아와도 다시 안 보임
-        if self.sheet != Sheet::History || self.old_list.as_ref().is_some_and(|(_, fade)| fade.done()) {
+        // 다 사라졌거나 히스토리·카드를 떠나면 버림, 돌아와도 다시 안 보임
+        if !matches!(self.sheet, Sheet::History | Sheet::Card) || self.old_list.as_ref().is_some_and(|(_, fade)| fade.done()) {
             self.old_list = None;
         }
+        let seen = self.version_card_visible();
         self.moving = self.animating();
-        self.gfx.as_ref().unwrap().present()
+        let presented = self.gfx.as_ref().unwrap().present();
+        self.presented(seen, presented)
+    }
+
+    /// 화면에 내보낸 프레임에서만 새 버전 안내를 본 걸로 침 (`take_version_seen`)
+    fn presented(&mut self, seen: bool, result: Result<()>) -> Result<()> {
+        if seen && result.is_ok() {
+            self.version_seen = true;
+        }
+        result
     }
 }
 

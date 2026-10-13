@@ -336,6 +336,7 @@ enum Command {
     },
     Baseline(Snapshot),
     ExeNoticeShown(Version),
+    SchemaNoticeShown(u64),
     Stop,
 }
 
@@ -354,42 +355,23 @@ enum Event {
     },
 }
 
-/// 다음 검색창에서 표시할 버전 알림
-#[allow(dead_code)]
-pub struct ExeNotice {
-    release: ExeRelease,
-    pub text: String,
-    pub action_text: &'static str,
+/// 받아 둔 곡 데이터가 없을 때의 상태
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DataNotice {
+    Loading,
+    Failed,
+    /// 받은 데이터 형식을 이 버전이 못 읽음
+    Outdated,
 }
 
-#[allow(dead_code)]
-impl ExeNotice {
-    pub fn version(&self) -> Version {
-        self.release.version()
-    }
+/// 새 데이터 형식을 못 읽을 때의 새 버전 안내
+pub const OUTDATED_TEXT: &str = "새 곡 데이터를 읽으려면 새 버전이 필요해요";
 
-    /// 검증한 태그와 고정 경로로 만든 주소만 엶
-    pub fn open_page(&self) -> std::io::Result<()> {
-        use windows::Win32::UI::Shell::ShellExecuteW;
-        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-        use windows::core::{HSTRING, PCWSTR, w};
-
-        let url = HSTRING::from(self.release.page_url());
-        let result = unsafe {
-            ShellExecuteW(
-                None,
-                w!("open"),
-                &url,
-                PCWSTR::null(),
-                PCWSTR::null(),
-                SW_SHOWNORMAL,
-            )
-        };
-        if result.0 as isize <= 32 {
-            return Err(std::io::Error::other("could not open release page"));
-        }
-        Ok(())
-    }
+/// 이번 검색창에서 표시할 새 버전 안내, 형식 안내가 있으면 그 설명
+pub struct ExeNotice {
+    version: Option<Version>,
+    schema: Option<u64>,
+    pub text: String,
 }
 
 fn exe_release(state: &UpdateState) -> Option<ExeRelease> {
@@ -399,19 +381,60 @@ fn exe_release(state: &UpdateState) -> Option<ExeRelease> {
     (release.version() > Version::parse(env!("CARGO_PKG_VERSION")).ok()?).then_some(release)
 }
 
-fn exe_notice(state: &UpdateState) -> Option<ExeNotice> {
-    let release = exe_release(state)?;
-    state
-        .needs_exe_notice(release.version())
-        .then(|| ExeNotice {
-            text: format!("새 버전 {}이 나왔어요", release.version()),
-            action_text: "릴리스 페이지 열기",
-            release,
-        })
+/// 버전 뒤 조사는 끝 숫자를 읽은 소리로, 2·4·5·9로 끝나면 "가"
+fn version_text(version: Version) -> String {
+    let particle = if matches!(version.patch % 10, 2 | 4 | 5 | 9) {
+        "가"
+    } else {
+        "이"
+    };
+    format!("새 버전 {version}{particle} 나왔어요")
+}
+
+fn exe_notice(state: &UpdateState, schema: Option<u64>) -> Option<ExeNotice> {
+    let version = exe_release(state)
+        .map(|release| release.version())
+        .filter(|&version| state.needs_exe_notice(version));
+    let text = match schema {
+        Some(_) => OUTDATED_TEXT.to_owned(),
+        None => version_text(version?),
+    };
+    Some(ExeNotice {
+        version,
+        schema,
+        text,
+    })
 }
 
 fn exe_status(state: &UpdateState) -> Option<String> {
-    exe_release(state).map(|release| format!("새 버전 {}이 나왔어요", release.version()))
+    exe_release(state).map(|release| version_text(release.version()))
+}
+
+/// 검증한 태그와 고정 경로로 만든 주소, 새 버전을 모르면 최신 릴리즈 주소
+fn release_page(state: &UpdateState) -> String {
+    exe_release(state).map_or_else(|| feed::EXE_LATEST_URL.to_owned(), |r| r.page_url())
+}
+
+fn open_url(url: &str) -> std::io::Result<()> {
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use windows::core::{HSTRING, PCWSTR, w};
+
+    let url = HSTRING::from(url);
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            w!("open"),
+            &url,
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if result.0 as isize <= 32 {
+        return Err(std::io::Error::other("could not open release page"));
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -456,11 +479,14 @@ impl Failure {
 pub struct Updater {
     pub active: Arc<Active>,
     pub status_text: String,
-    pub schema_text: Option<String>,
     pub exe_status_text: Option<String>,
     pub exe_notice: Option<ExeNotice>,
-    pub data_notice: Option<&'static str>,
+    pub data_notice: Option<DataNotice>,
     pub phase: Phase,
+    /// 아직 알리지 않은 못 읽는 데이터 형식
+    schema_notice: Option<u64>,
+    /// 마지막 데이터 확인이 형식 때문에 실패함
+    outdated: bool,
     state: UpdateState,
     baseline: Snapshot,
     scheduler: Scheduler,
@@ -491,11 +517,12 @@ impl Updater {
         Self {
             active: startup.active.clone(),
             status_text,
-            schema_text: None,
             exe_status_text: exe_status(&startup.state),
             exe_notice: None,
-            data_notice: (!startup.active.has_data()).then_some("곡 데이터를 받고 있어요"),
+            data_notice: (!startup.active.has_data()).then_some(DataNotice::Loading),
             phase: Phase::Idle,
+            schema_notice: None,
+            outdated: false,
             state: startup.state.clone(),
             baseline: startup.baseline.clone(),
             scheduler: Scheduler::default(),
@@ -521,11 +548,17 @@ impl Updater {
     }
 
     /// 선곡 화면을 확인하고 검색창이 실제로 열렸을 때 확인 시작
+    /// 초기 로딩 중엔 새 버전 안내도 안 만듦, 뒤늦게 끝난 로딩이 알림 기록을 덮어쓰지 않게
     pub fn opened(&mut self, busy: bool, refs: Option<Arc<RefSet>>) {
         if self.initializing {
             return;
         }
-        self.exe_notice = exe_notice(&self.state);
+        self.exe_notice = exe_notice(&self.state, self.schema_notice);
+        self.begin(CheckOrigin::Search, busy, refs);
+    }
+
+    /// 안내 카드의 다시 시도, 기한은 무시하되 Retry-After는 지킴
+    pub fn retry(&mut self, busy: bool, refs: Option<Arc<RefSet>>) {
         self.begin(CheckOrigin::Search, busy, refs);
     }
 
@@ -552,7 +585,7 @@ impl Updater {
             self.phase = Phase::Checking;
             self.origin = origin;
             if !self.active.has_data() {
-                self.data_notice = Some("곡 데이터를 받고 있어요");
+                self.data_notice = Some(DataNotice::Loading);
             }
             if self
                 .commands
@@ -584,22 +617,53 @@ impl Updater {
         }
     }
 
-    /// 실제로 표시한 버전만 기록
-    #[allow(dead_code)]
-    pub fn exe_notice_shown(&mut self, version: Version) {
-        if self
-            .exe_notice
-            .as_ref()
-            .is_some_and(|notice| notice.version() == version)
-        {
+    /// 이번 열기의 안내를 실제로 표시함, 그 버전과 형식만 한 번 기록해 다음 열기부터 안 보이게
+    /// 안내는 이번 열기 동안 그대로 둠
+    pub fn exe_notice_shown(&mut self) {
+        let Some(notice) = &self.exe_notice else {
+            return;
+        };
+        let (version, schema) = (notice.version, notice.schema);
+        if let Some(version) = version.filter(|&v| self.state.needs_exe_notice(v)) {
             self.state.record_exe_notice(version);
-            self.exe_notice = None;
             let _ = self.commands.send(Command::ExeNoticeShown(version));
+        }
+        if let Some(schema) = schema.filter(|&s| self.state.needs_schema_notice(s)) {
+            self.state.record_schema_notice(schema);
+            if self.schema_notice == Some(schema) {
+                self.schema_notice = None;
+            }
+            let _ = self.commands.send(Command::SchemaNoticeShown(schema));
         }
     }
 
+    /// 새 데이터를 읽었으면 형식 문제가 풀림, 이번 열기의 형식 안내도 뺌
+    /// 새 버전 안내만 있었으면 그대로 둠
+    fn schema_resolved(&mut self) {
+        self.schema_notice = None;
+        self.outdated = false;
+        if self.exe_notice.as_ref().is_some_and(|n| n.schema.is_some()) {
+            self.exe_notice = None;
+        }
+    }
+
+    /// 안내 카드의 릴리즈 페이지 버튼
+    pub fn open_page(&self) -> std::io::Result<()> {
+        open_url(&release_page(&self.state))
+    }
+
+    /// 설정 시트 머리 줄 문구, 새 버전이 있으면 그 안내 (true면 조금 밝게)
+    pub fn status_line(&self) -> Option<(String, bool)> {
+        match &self.exe_status_text {
+            Some(text) => Some((text.clone(), true)),
+            None => (!self.status_text.is_empty()).then(|| (self.status_text.clone(), false)),
+        }
+    }
+
+    /// 알림 기록은 이 스레드에서만 바꿈, worker가 돌려준 상태로 되돌리지 않음
     fn accept_state(&mut self, mut state: UpdateState) {
         state.notified_version = state.notified_version.max(self.state.notified_version);
+        state.notified_schema = self.state.notified_schema;
         self.exe_status_text = exe_status(&state);
         self.state = state;
     }
@@ -613,9 +677,11 @@ impl Updater {
                 Phase::Checking | Phase::Preparing | Phase::Ready
             )
         {
-            Some("곡 데이터를 받고 있어요")
+            Some(DataNotice::Loading)
+        } else if self.outdated {
+            Some(DataNotice::Outdated)
         } else {
-            Some("곡 데이터를 받지 못했어요")
+            Some(DataNotice::Failed)
         };
     }
 
@@ -639,10 +705,11 @@ impl Updater {
                             if let Err(error) = other {
                                 if let Some(schema) = error.schema {
                                     if self.state.needs_schema_notice(schema) {
-                                        self.schema_text = Some("앱 업데이트가 필요해요".into());
+                                        self.schema_notice = Some(schema);
                                     }
                                 }
                                 if !error.cancelled {
+                                    self.outdated = error.schema.is_some();
                                     self.status_text = failure_text(&self.state);
                                 }
                             } else if checked_data {
@@ -654,7 +721,7 @@ impl Updater {
                                         success_text(&g.manifest.published_at, &Summary::default())
                                     })
                                     .unwrap_or_else(|| "곡 데이터 확인됨".into());
-                                self.schema_text = None;
+                                self.schema_resolved();
                             }
                             self.phase = Phase::Idle;
                             self.scheduler.finish();
@@ -733,7 +800,7 @@ impl Updater {
             let _ = self.commands.send(Command::Baseline(self.baseline.clone()));
         }
         self.data_notice = None;
-        self.schema_text = None;
+        self.schema_resolved();
         if self.initializing {
             self.initializing = false;
             self.phase = Phase::Idle;
@@ -811,6 +878,15 @@ fn worker(
                 });
                 if let Err(error) = result {
                     eprintln!("version notice: {error}");
+                }
+            }
+            Command::SchemaNoticeShown(schema) => {
+                let result = UpdateState::load(&state_path).and_then(|mut state| {
+                    state.record_schema_notice(schema);
+                    state.save(&state_path)
+                });
+                if let Err(error) = result {
+                    eprintln!("schema notice: {error}");
                 }
             }
             Command::Apply {
