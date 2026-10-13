@@ -93,7 +93,7 @@ impl Snapshot {
         Self::parse(&crate::store::read_limited(path, MAX_DYNAMIC_BYTES)?)
     }
 
-    /// 알림을 실제로 보여 준 뒤에만 호출
+    /// 알림을 보여 준 뒤, 또는 기준이 없을 때 첫 기준으로 저장
     pub fn save(&self, path: &Path) -> Result<()> {
         crate::store::atomic_write(path, &self.to_json())
     }
@@ -152,11 +152,10 @@ fn pattern_tags(dynamic: &Dynamic, key: PatternKey) -> Option<&BTreeMap<String, 
 }
 
 impl Summary {
-    pub fn between(old_core: &Core, old: &Dynamic, new_core: &Core, new: &Dynamic) -> Self {
-        let before = Snapshot::from_data(old_core, old);
-        let after = Snapshot::from_data(new_core, new);
+    /// `before`·`after`는 각 데이터의 `Snapshot::from_data`, 호출부가 이미 들고 있음
+    pub fn between(before: &Snapshot, old: &Dynamic, after: &Snapshot, new: &Dynamic) -> Self {
         let mut summary = Self {
-            notice: before.changes_to(&after),
+            notice: before.changes_to(after),
             ..Self::default()
         };
         for &key in before.patterns.intersection(&after.patterns) {

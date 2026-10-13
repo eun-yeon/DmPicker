@@ -1,4 +1,4 @@
-//! gzip JSON과 STORE zip 자켓 검증, 원격 바이트라 인덱싱 대신 `range`로만 읽음
+//! 원격 바이트라 인덱싱 대신 `range`로만 읽음
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
@@ -6,20 +6,16 @@ use std::io::Read;
 use flate2::bufread::GzDecoder;
 
 use crate::model::{Core, JacketAsset, JsonAsset};
-use crate::{
-    sha256, Error, Result, MAX_DYNAMIC_BYTES, MAX_GZIP_BYTES, MAX_JACKET_BYTES, MAX_SONGS,
-    MAX_ZIP_BYTES,
-};
+use crate::{sha256, Error, Result, MAX_GZIP_BYTES, MAX_JACKET_BYTES, MAX_ZIP_BYTES};
 
 /// 압축본과 원문을 모두 확인한 JSON 바이트
-pub fn decode_json_gzip(bytes: &[u8], asset: &JsonAsset, max_output: usize) -> Result<Vec<u8>> {
+pub fn decode_json_gzip(bytes: &[u8], asset: &JsonAsset, limit: usize) -> Result<Vec<u8>> {
     if bytes.len() > MAX_GZIP_BYTES || bytes.len() != asset.gz_bytes {
         return Err(Error::invalid("gzip size mismatch"));
     }
     if sha256(bytes) != asset.gz_sha256 {
         return Err(Error::invalid("gzip hash mismatch"));
     }
-    let limit = max_output.min(MAX_DYNAMIC_BYTES);
     if asset.bytes > limit {
         return Err(Error::invalid("JSON exceeds size limit"));
     }
@@ -54,7 +50,8 @@ pub struct Jacket<'a> {
     pub bytes: &'a [u8],
 }
 
-/// 이름·해시·헤더 검사를 마친 자켓만 반환
+/// 이름·해시·헤더를 모두 검사, 하나라도 틀리면 전체 실패
+/// id 순으로 반환
 pub fn read_jackets<'a>(
     bytes: &'a [u8],
     asset: &JacketAsset,
@@ -76,12 +73,16 @@ pub fn read_jackets<'a>(
         || count == usize::from(u16::MAX)
         || count != asset.count
         || count != core.songs.len()
-        || count > MAX_SONGS
     {
         return Err(Error::invalid("zip entry count or disk mismatch"));
     }
-    let directory_size = usize32(u32_at(eocd, 12)?)?;
-    let directory_start = usize32(u32_at(eocd, 16)?)?;
+    let directory_size = u32_at(eocd, 12)?;
+    let directory_start = u32_at(eocd, 16)?;
+    if directory_size == u32::MAX || directory_start == u32::MAX {
+        return Err(Error::invalid("ZIP64 is unsupported"));
+    }
+    let directory_size = usize32(directory_size)?;
+    let directory_start = usize32(directory_start)?;
     if add(directory_start, directory_size)? != end {
         return Err(Error::invalid("invalid zip directory range"));
     }
@@ -92,11 +93,8 @@ pub fn read_jackets<'a>(
         .iter()
         .map(|song| (song.id, song.jacket.as_str()))
         .collect();
-    if expected.len() != core.songs.len() {
-        return Err(Error::invalid("duplicate core jacket id"));
-    }
     let mut seen = BTreeSet::new();
-    let mut occupied = Vec::with_capacity(count);
+    let mut total = 0;
     let mut jackets = Vec::with_capacity(count);
     for _ in 0..count {
         let entry = central_entry(directory)?;
@@ -110,25 +108,19 @@ pub fn read_jackets<'a>(
         if !seen.insert(id) {
             return Err(Error::invalid("duplicate jacket id"));
         }
-        let (payload, extent) = local_entry(files, &entry)?;
+        let payload = local_entry(files, &entry)?;
+        total = add(total, payload.len())?;
+        if total > MAX_ZIP_BYTES {
+            return Err(Error::invalid("jackets exceed size limit"));
+        }
         if sha256(payload) != *hash {
             return Err(Error::invalid("jacket hash mismatch"));
         }
         validate_webp(payload)?;
-        occupied.push((entry.offset, extent));
         jackets.push(Jacket { id, bytes: payload });
     }
     if !directory.is_empty() {
         return Err(Error::invalid("trailing zip directory data"));
-    }
-    // 항목 사이 빈틈은 허용, 겹치면 거부
-    occupied.sort_unstable();
-    let mut next = 0;
-    for (start, end) in occupied {
-        if start < next {
-            return Err(Error::invalid("overlapping zip entry"));
-        }
-        next = end;
     }
     jackets.sort_unstable_by_key(|jacket| jacket.id);
     Ok(jackets)
@@ -168,10 +160,6 @@ pub fn validate_webp(bytes: &[u8]) -> Result<()> {
 
 struct CentralEntry<'a> {
     name: &'a [u8],
-    version: u16,
-    time: u16,
-    date: u16,
-    crc: u32,
     size: usize,
     offset: usize,
     length: usize,
@@ -179,20 +167,16 @@ struct CentralEntry<'a> {
 
 fn central_entry(bytes: &[u8]) -> Result<CentralEntry<'_>> {
     let header = range(bytes, 0, 46)?;
-    let version = u16_at(header, 6)?;
-    let attributes = u32_at(header, 38)?;
-    let file_type = (attributes >> 16) & 0xf000;
     let compressed = u32_at(header, 20)?;
     let size = u32_at(header, 24)?;
-    // 필요 버전 2.0 이하, 플래그 0 (암호화·data descriptor 없음), STORE, 디스크 0
-    // 외부 속성은 DOS 디렉터리 거부, 유닉스 형식이면 일반 파일만 (링크 거부)
+    let offset = u32_at(header, 42)?;
+    // 플래그 0만 허용해서 암호화와 data descriptor를 따로 해석하지 않음
     if range(header, 0, 4)? != b"PK\x01\x02"
-        || version > 20
         || u16_at(header, 8)? != 0
         || u16_at(header, 10)? != 0
         || u16_at(header, 34)? != 0
-        || attributes & 0x10 != 0
-        || (file_type != 0 && file_type != 0x8000)
+        || size == u32::MAX
+        || offset == u32::MAX
         || compressed != size
         || usize32(size)? > MAX_JACKET_BYTES
     {
@@ -203,33 +187,25 @@ fn central_entry(bytes: &[u8]) -> Result<CentralEntry<'_>> {
     let comment_length = usize::from(u16_at(header, 32)?);
     let name = range(bytes, 46, name_length)?;
     let extra_at = add(46, name_length)?;
-    validate_extra(range(bytes, extra_at, extra_length)?)?;
+    range(bytes, extra_at, extra_length)?;
     let length = add(add(extra_at, extra_length)?, comment_length)?;
     range(bytes, 0, length)?;
     Ok(CentralEntry {
         name,
-        version,
-        time: u16_at(header, 12)?,
-        date: u16_at(header, 14)?,
-        crc: u32_at(header, 16)?,
         size: usize32(size)?,
-        offset: usize32(u32_at(header, 42)?)?,
+        offset: usize32(offset)?,
         length,
     })
 }
 
-fn local_entry<'a>(bytes: &'a [u8], entry: &CentralEntry<'_>) -> Result<(&'a [u8], usize)> {
+fn local_entry<'a>(bytes: &'a [u8], entry: &CentralEntry<'_>) -> Result<&'a [u8]> {
     let local = bytes
         .get(entry.offset..)
         .ok_or_else(|| Error::invalid("invalid zip local offset"))?;
     let header = range(local, 0, 30)?;
     if range(header, 0, 4)? != b"PK\x03\x04"
-        || u16_at(header, 4)? != entry.version
         || u16_at(header, 6)? != 0
         || u16_at(header, 8)? != 0
-        || u16_at(header, 10)? != entry.time
-        || u16_at(header, 12)? != entry.date
-        || u32_at(header, 14)? != entry.crc
         || usize32(u32_at(header, 18)?)? != entry.size
         || usize32(u32_at(header, 22)?)? != entry.size
     {
@@ -241,11 +217,9 @@ fn local_entry<'a>(bytes: &'a [u8], entry: &CentralEntry<'_>) -> Result<(&'a [u8
         return Err(Error::invalid("zip name mismatch"));
     }
     let extra_at = add(30, name_length)?;
-    validate_extra(range(local, extra_at, extra_length)?)?;
+    range(local, extra_at, extra_length)?;
     let data_at = add(extra_at, extra_length)?;
-    let data = range(local, data_at, entry.size)?;
-    let extent = add(entry.offset, add(data_at, entry.size)?)?;
-    Ok((data, extent))
+    range(local, data_at, entry.size)
 }
 
 fn end_record(bytes: &[u8]) -> Result<usize> {
@@ -264,20 +238,6 @@ fn end_record(bytes: &[u8]) -> Result<usize> {
         }
     }
     Err(Error::invalid("missing zip end record"))
-}
-
-fn validate_extra(mut bytes: &[u8]) -> Result<()> {
-    while !bytes.is_empty() {
-        let tag = u16_at(bytes, 0)?;
-        let length = usize::from(u16_at(bytes, 2)?);
-        if tag == 1 {
-            return Err(Error::invalid("ZIP64 is unsupported"));
-        }
-        bytes = bytes
-            .get(add(4, length)?..)
-            .ok_or_else(|| Error::invalid("truncated zip extra field"))?;
-    }
-    Ok(())
 }
 
 fn jacket_id(name: &[u8]) -> Result<u32> {

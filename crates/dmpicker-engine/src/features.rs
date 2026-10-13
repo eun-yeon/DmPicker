@@ -14,12 +14,8 @@
 //! 회색조 크롭용으로 같은 방법의 단일 채널(luma) 버전도 같이 둠 (온라인 방에선 잠긴 곡이 회색으로 나옴)
 
 use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::io::{self, Read};
-use std::path::{Path, PathBuf};
+use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-
-use sha2::{Digest, Sha256};
 
 use crate::img::{apply_plane, apply_rgb, Op1d, Rgb, RgbView};
 
@@ -55,7 +51,7 @@ pub fn kept_cell(x: usize, y: usize) -> bool {
 pub type Feature = [f32; FEAT_LEN];
 /// L2 정규화된 회색조 특징
 pub type GrayFeature = [f32; GRAY_LEN];
-/// djmax.gg 곡 id (`djmaxgg_songs.json`의 `song.title`, 재킷 파일 이름과 같음)
+/// djmax.gg 곡 id (core.json `id`, 재킷 파일 이름과 같음)
 pub type SongId = u32;
 /// 프리스타일 RANDOM 항목의 가짜 곡 id (? 재킷, 내장 템플릿)
 pub const RANDOM_ID: SongId = u32::MAX;
@@ -180,7 +176,6 @@ pub struct RefSet {
     by_id: HashMap<SongId, Vec<u32>>,
     /// 재킷 그림이 원래 회색인 곡 (이런 곡은 크롭이 회색이어도 LOCKED 표시가 아님)
     grey_art: HashSet<SongId>,
-    skipped: Vec<PathBuf>,
 }
 
 impl std::fmt::Debug for RefSet {
@@ -209,19 +204,9 @@ impl RefSet {
         self.ids.is_empty()
     }
 
-    /// 서로 다른 곡 id 개수
-    pub fn song_count(&self) -> usize {
-        self.by_id.len()
-    }
-
     /// `id`의 기준이 하나라도 있는지
     pub fn contains(&self, id: SongId) -> bool {
         self.by_id.contains_key(&id)
-    }
-
-    /// 마지막 폴더 읽기에서 디코딩 못 한 파일
-    pub fn skipped(&self) -> &[PathBuf] {
-        &self.skipped
     }
 
     /// 미리 계산한 특징으로 기준 추가 (게임에서 학습한 크롭 등, [`crate::read::RowRead::feature`])
@@ -258,16 +243,7 @@ impl RefSet {
         self.add_image(RANDOM_ID, im.view());
     }
 
-    /// `dir`의 `<song_id>.webp`(또는 `.png`)를 전부 읽고 내장 템플릿도 추가
-    /// 디코딩은 모든 코어에서 돌림
-    pub fn load_dir(dir: impl AsRef<Path>) -> io::Result<Self> {
-        let files = list_jackets(dir.as_ref())?;
-        let mut set = compute_refs(&files);
-        set.add_builtin_templates();
-        Ok(set)
-    }
-
-    /// 검증된 자켓 목록을 처음 읽을 때만 최대 16개 스레드로 특징 계산
+    /// 재킷 목록 전체를 최대 16개 스레드로 새로 계산, 이전 특징은 안 물려받음
     /// `decode`는 WebP 형식을 지정해 디코딩한 128×128 이미지를 반환해야 함
     /// 디코딩 못 한 곡은 건너뛰고 취소 오류는 전체 중단
     pub fn load_jackets(
@@ -335,27 +311,7 @@ impl RefSet {
         Ok(set)
     }
 
-    /// [`RefSet::load_dir`]와 같지만 `cache_file`의 바이너리 특징 캐시가 폴더 목록과 맞으면 재사용
-    /// id, 자켓 내용 해시, 특징 버전을 비교, 안 맞으면 다시 계산해서 덮어씀 (쓰기 실패는 무시)
-    pub fn load_dir_cached(
-        dir: impl AsRef<Path>,
-        cache_file: impl AsRef<Path>,
-    ) -> io::Result<Self> {
-        let files = list_jackets(dir.as_ref())?;
-        let sig = signature(files.iter().map(|f| (f.id, f.hash.as_str())));
-        let mut set = match read_cache(cache_file.as_ref(), &sig) {
-            Ok(s) => s,
-            Err(_) => {
-                let s = compute_refs(&files);
-                let _ = write_cache(cache_file.as_ref(), &sig, &s);
-                s
-            }
-        };
-        set.add_builtin_templates();
-        Ok(set)
-    }
-
-    /// 검증된 자켓 목록을 순차 갱신, 내용이 같은 곡의 특징은 그대로 복사
+    /// 검증된 재킷 목록을 순차 갱신, 내용이 같은 곡의 특징은 그대로 복사
     /// `decode`는 WebP 형식을 지정해 디코딩한 128×128 이미지를 반환해야 함
     /// 디코딩 못 한 곡은 건너뛰고 취소 오류는 전체 중단
     pub fn update_jackets(
@@ -444,7 +400,7 @@ impl RefSet {
         Ok(!rows.is_empty())
     }
 
-    /// 특징 버전과 자켓 내용 서명이 맞는 캐시를 읽고 내장 자켓을 추가
+    /// 특징 버전과 재킷 내용 서명이 맞는 캐시를 읽고 내장 재킷을 추가
     pub fn from_cache_bytes(bytes: &[u8], signature: &str) -> io::Result<Self> {
         validate_signature(signature)?;
         if bytes.len() > MAX_CACHE_BYTES {
@@ -570,103 +526,9 @@ impl RefSet {
     }
 }
 
-struct JacketFile {
-    id: SongId,
-    path: PathBuf,
-    hash: String,
-}
-
-fn list_jackets(dir: &Path) -> io::Result<Vec<JacketFile>> {
-    let mut out = Vec::new();
-    for e in fs::read_dir(dir)? {
-        let e = e?;
-        let path = e.path();
-        let ext = path
-            .extension()
-            .and_then(|x| x.to_str())
-            .map(|x| x.to_ascii_lowercase());
-        if !matches!(ext.as_deref(), Some("webp") | Some("png")) {
-            continue;
-        }
-        let Some(id) = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .and_then(|s| s.parse::<SongId>().ok())
-        else {
-            continue;
-        };
-        let mut file = fs::File::open(&path)?;
-        let mut hasher = Sha256::new();
-        let mut buffer = [0u8; 64 * 1024];
-        loop {
-            let size = file.read(&mut buffer)?;
-            if size == 0 {
-                break;
-            }
-            hasher.update(
-                buffer
-                    .get(..size)
-                    .ok_or_else(|| invalid_cache("invalid jacket read"))?,
-            );
-        }
-        out.push(JacketFile {
-            id,
-            path,
-            hash: format!("{:x}", hasher.finalize()),
-        });
-    }
-    out.sort_by(|a, b| a.id.cmp(&b.id).then(a.path.cmp(&b.path)));
-    Ok(out)
-}
-
 type RefRow = (SongId, Box<Feature>, Box<GrayFeature>, bool);
 
-fn compute_refs(files: &[JacketFile]) -> RefSet {
-    let nthreads = std::thread::available_parallelism()
-        .map_or(4, |n| n.get())
-        .clamp(1, 16);
-    let chunk = files.len().div_ceil(nthreads).max(1);
-    let results: Vec<(Vec<RefRow>, Vec<PathBuf>)> = std::thread::scope(|s| {
-        let handles: Vec<_> = files
-            .chunks(chunk)
-            .map(|part| {
-                s.spawn(move || {
-                    let mut ok = Vec::with_capacity(part.len());
-                    let mut bad = Vec::new();
-                    for f in part {
-                        match fs::read(&f.path).ok().and_then(|b| Rgb::decode(&b).ok()) {
-                            Some(im) => ok.push((
-                                f.id,
-                                Box::new(jacket_feature(im.view())),
-                                Box::new(jacket_feature_gray(im.view())),
-                                is_grey(im.view()),
-                            )),
-                            None => bad.push(f.path.clone()),
-                        }
-                    }
-                    (ok, bad)
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().expect("feature worker panicked"))
-            .collect()
-    });
-    let mut set = RefSet::new();
-    for (ok, bad) in results {
-        for (id, c, g, grey) in ok {
-            set.add_features(id, &c, &g);
-            if grey {
-                set.grey_art.insert(id);
-            }
-        }
-        set.skipped.extend(bad);
-    }
-    set
-}
-
-/// 자켓 4096곡과 내장 자켓의 특징이 들어가는 상한
+/// 재킷 4096곡과 내장 재킷의 특징이 들어가는 상한
 pub const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const CACHE_MAGIC: &[u8; 8] = b"PKREFS03";
 const CACHE_HEADER_BYTES: usize = 80;
@@ -716,27 +578,6 @@ fn check_cancel(cancel: &AtomicBool) -> io::Result<()> {
     }
 }
 
-/// 정렬한 자켓 목록의 JSON 해시와 특징 버전을 묶은 서명
-pub fn jacket_signature(jackets: &[(SongId, String)]) -> io::Result<String> {
-    Ok(signature(checked_jackets(jackets)?))
-}
-
-fn signature<'a>(jackets: impl IntoIterator<Item = (SongId, &'a str)>) -> String {
-    let mut set = Sha256::new();
-    set.update(b"[");
-    for (index, (id, hash)) in jackets.into_iter().enumerate() {
-        if index != 0 {
-            set.update(b",")
-        }
-        set.update(format!("[{id},\"{hash}\"]").as_bytes());
-    }
-    set.update(b"]");
-    let mut result = Sha256::new();
-    result.update(FEATURE_VERSION.to_le_bytes());
-    result.update(format!("{:x}", set.finalize()).as_bytes());
-    format!("{:x}", result.finalize())
-}
-
 fn cache_len(count: usize) -> io::Result<usize> {
     count
         .checked_mul(CACHE_ROW_BYTES)
@@ -754,22 +595,4 @@ fn take<const N: usize>(cursor: &mut &[u8]) -> io::Result<[u8; N]> {
         .get(N..)
         .ok_or_else(|| invalid_cache("truncated feature cache"))?;
     Ok(value)
-}
-
-fn write_cache(path: &Path, sig: &str, set: &RefSet) -> io::Result<()> {
-    let buf = set.to_cache_bytes(sig)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, &buf)?;
-    fs::rename(&tmp, path)
-}
-
-fn read_cache(path: &Path, sig: &str) -> io::Result<RefSet> {
-    let mut bytes = Vec::new();
-    fs::File::open(path)?
-        .take(MAX_CACHE_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)?;
-    RefSet::from_cache_bytes(&bytes, sig)
 }

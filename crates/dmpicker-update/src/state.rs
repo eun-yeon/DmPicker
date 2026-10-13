@@ -6,12 +6,12 @@ use serde_json::{Map, Value, json};
 
 use crate::exe::Version;
 use crate::model::validate_release_tag;
-use crate::store::{atomic_write, read_limited, validate_generation_name};
+use crate::store::{atomic_write, generation_name, read_limited, validate_generation_name};
 use crate::time::{DAY, HOUR, retry_after_deadline};
 use crate::{Error, Result, valid_hash};
 
 pub const STATE_FILE: &str = "update-state.json";
-pub const STATE_MAX_BYTES: usize = 64 * 1024;
+const STATE_MAX_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CheckError {
@@ -21,7 +21,6 @@ pub struct CheckError {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct UpdateState {
-    pub last_check_start: Option<i64>,
     pub last_success: Option<i64>,
     pub failure_count: u32,
     pub next_eligible_at: Option<i64>,
@@ -34,6 +33,7 @@ pub struct UpdateState {
     pub confirmed_active_tag: Option<String>,
     pub preparing: Option<String>,
     pub loading: Option<String>,
+    /// 판단엔 안 씀, 사용자 문의 때 상태 파일로 보는 진단 기록
     pub last_error: Option<CheckError>,
     pub notified_schema: Option<u64>,
 }
@@ -129,7 +129,6 @@ impl UpdateState {
             })
             .transpose()?;
         Ok(Self {
-            last_check_start: optional_time(object, "lastCheckStart")?,
             last_success: optional_time(object, "lastSuccess")?,
             failure_count,
             next_eligible_at: optional_time(object, "nextEligibleAt")?,
@@ -149,7 +148,6 @@ impl UpdateState {
 
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         let bytes = serde_json::to_vec_pretty(&json!({
-            "lastCheckStart": self.last_check_start,
             "lastSuccess": self.last_success,
             "failureCount": self.failure_count,
             "nextEligibleAt": self.next_eligible_at,
@@ -210,6 +208,9 @@ impl UpdateState {
         self.applied_tag = Some(tag.to_owned());
         self.confirmed_tag = None;
         self.confirmed_active_tag = None;
+        if self.loading.as_deref() == Some(generation_name(tag).as_str()) {
+            self.loading = None;
+        }
         Ok(())
     }
 
@@ -241,72 +242,57 @@ impl UpdateState {
         self.last_error = Some(error);
     }
 
-    /// 준비 중에 꺼진 manifest는 다시 준비하지 않음, 다음 다른 태그부터 다시 시도
-    pub fn can_prepare(&self, manifest_hash: &str) -> bool {
-        self.preparing.as_deref() != Some(manifest_hash)
+    /// 쓸 데이터가 없으면 중단됐던 데이터라도 다시 시도
+    pub fn can_prepare(&self, manifest_hash: &str, has_active: bool) -> bool {
+        !has_active || self.preparing.as_deref() != Some(manifest_hash)
     }
 
-    /// 표식을 디스크에 쓴 뒤에만 준비 시작
-    pub fn begin_preparing(&mut self, path: &Path, manifest_hash: &str) -> Result<bool> {
+    pub fn begin_preparing(&mut self, path: &Path, manifest_hash: &str) -> Result<()> {
         if !valid_hash(manifest_hash) {
             return Err(Error::invalid("invalid preparing hash"));
         }
-        if !self.can_prepare(manifest_hash) {
-            return Ok(false);
-        }
-        let mut next = self.clone();
-        next.preparing = Some(manifest_hash.to_owned());
-        next.save(path)?;
-        *self = next;
-        Ok(true)
+        self.preparing = Some(manifest_hash.to_owned());
+        self.save_marker(path);
+        Ok(())
     }
 
     /// 성공과 일반 실패 모두 표식을 지움
-    pub fn finish_preparing(&mut self, path: &Path) -> Result<()> {
-        let mut next = self.clone();
-        next.preparing = None;
-        next.save(path)?;
-        *self = next;
-        Ok(())
+    pub fn finish_preparing(&mut self, path: &Path) {
+        self.preparing = None;
+        self.save_marker(path);
     }
 
     pub fn blocked_generation(&self) -> Option<&str> {
         self.loading.as_deref()
     }
 
-    /// 남은 표식과 같은 세대는 건너뜀
+    /// 다른 후보를 읽는 동안 기존 중단 표식을 보존
     pub fn begin_loading(&mut self, path: &Path, generation: &str) -> Result<bool> {
         validate_generation_name(generation)?;
-        if self.loading.as_deref() == Some(generation) {
+        if self.loading.is_some() {
             return Ok(false);
         }
-        let mut next = self.clone();
-        next.loading = Some(generation.to_owned());
-        next.save(path)?;
-        *self = next;
+        self.loading = Some(generation.to_owned());
+        self.save_marker(path);
         Ok(true)
     }
 
-    pub fn finish_loading(&mut self, path: &Path) -> Result<()> {
-        let mut next = self.clone();
-        next.loading = None;
-        next.save(path)?;
-        *self = next;
-        Ok(())
+    pub fn finish_loading(&mut self, path: &Path) {
+        self.loading = None;
+        self.save_marker(path);
     }
 
-    /// 지금 앱보다 높고 이미 확인한 버전보다 새로울 때만 기록
+    /// 표식을 못 써도 업데이트는 멈추지 않음
+    fn save_marker(&self, path: &Path) {
+        if let Err(error) = self.save(path) {
+            eprintln!("update marker save: {error}");
+        }
+    }
+
+    /// 서버의 최신 버전이 지금 앱보다 높을 때만 남김, 전에 본 버전보다 낮아져도 그대로 따름
     pub fn record_exe_available(&mut self, tag: &str, current: Version) -> Result<()> {
         let version = Version::parse(tag)?;
-        if version <= current {
-            return Ok(());
-        }
-        if let Some(latest) = &self.latest_version {
-            if version <= Version::parse(latest)? {
-                return Ok(());
-            }
-        }
-        self.latest_version = Some(tag.to_owned());
+        self.latest_version = (version > current).then(|| tag.to_owned());
         Ok(())
     }
 
@@ -342,11 +328,6 @@ pub enum CheckAction {
     },
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct Scheduler {
-    in_flight: bool,
-}
-
 /// 시계가 뒤로 가서 기록이 미래면 최근으로 보지 않음
 fn recent(then: Option<i64>, now: i64, interval: i64) -> bool {
     then.and_then(|then| now.checked_sub(then))
@@ -358,58 +339,35 @@ fn waiting(deadline: Option<i64>, now: i64) -> bool {
     deadline.is_some_and(|deadline| deadline > now && deadline.saturating_sub(now) <= DAY)
 }
 
-impl Scheduler {
-    /// 앱 시작은 Retry-After만 지키고 성공·실패 간격은 무시
-    pub fn startup(&mut self, state: &mut UpdateState, now: i64, jobs_busy: bool) -> CheckAction {
-        self.start(
-            state,
-            now,
-            jobs_busy,
-            !waiting(state.retry_after_until, now),
-        )
-    }
+/// 앱 시작은 Retry-After만 지키고 성공·실패 간격은 무시
+pub fn startup(state: &UpdateState, now: i64, jobs_busy: bool) -> CheckAction {
+    start(
+        state,
+        now,
+        jobs_busy,
+        !waiting(state.retry_after_until, now),
+    )
+}
 
-    /// 검색창 열기에서 데이터와 exe 기한을 따로 확인
-    /// 받은 세대가 없어도 Retry-After는 지키고 성공·실패 간격만 무시
-    pub fn due(
-        &mut self,
-        state: &mut UpdateState,
-        now: i64,
-        jobs_busy: bool,
-        force_data: bool,
-    ) -> CheckAction {
-        let check_data = !waiting(state.retry_after_until, now)
-            && (force_data
-                || (!waiting(state.next_eligible_at, now)
-                    && !recent(state.last_success, now, HOUR)));
-        self.start(state, now, jobs_busy, check_data)
-    }
+/// 검색창 열기에서 데이터와 exe 기한을 따로 확인
+/// `force_data`(받은 세대 없음)면 성공·실패 간격은 무시, Retry-After는 지킴
+pub fn due(state: &UpdateState, now: i64, jobs_busy: bool, force_data: bool) -> CheckAction {
+    let check_data = !waiting(state.retry_after_until, now)
+        && (force_data
+            || (!waiting(state.next_eligible_at, now) && !recent(state.last_success, now, HOUR)));
+    start(state, now, jobs_busy, check_data)
+}
 
-    fn start(
-        &mut self,
-        state: &mut UpdateState,
-        now: i64,
-        jobs_busy: bool,
-        check_data: bool,
-    ) -> CheckAction {
-        if self.in_flight || jobs_busy {
-            return CheckAction::None;
-        }
-        let check_exe = !recent(state.last_exe_check, now, DAY);
-        if !check_data && !check_exe {
-            return CheckAction::None;
-        }
-        self.in_flight = true;
-        if check_data {
-            state.last_check_start = Some(now);
-        }
-        CheckAction::Start {
-            check_data,
-            check_exe,
-        }
+fn start(state: &UpdateState, now: i64, jobs_busy: bool, check_data: bool) -> CheckAction {
+    if jobs_busy {
+        return CheckAction::None;
     }
-
-    pub fn finish(&mut self) {
-        self.in_flight = false;
+    let check_exe = !recent(state.last_exe_check, now, DAY);
+    if !check_data && !check_exe {
+        return CheckAction::None;
+    }
+    CheckAction::Start {
+        check_data,
+        check_exe,
     }
 }

@@ -1,9 +1,9 @@
-//! 발행 시각 형식과 Retry-After 읽기
+//! Retry-After 읽기
 
 use crate::{Error, Result};
 
-pub const HOUR: i64 = 60 * 60;
-pub const DAY: i64 = 24 * HOUR;
+pub(crate) const HOUR: i64 = 60 * 60;
+pub(crate) const DAY: i64 = 24 * HOUR;
 
 fn number(text: &str) -> Result<i64> {
     if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
@@ -77,52 +77,6 @@ fn clock(text: &str) -> Result<(i64, i64, i64)> {
     Ok((part(text, 0..2)?, part(text, 3..5)?, part(text, 6..8)?))
 }
 
-/// 발행 시각은 형식만 검사, 순서 판정에는 쓰지 않음
-pub fn validate_rfc3339(text: &str) -> Result<()> {
-    if text.len() < 20
-        || text.get(4..5) != Some("-")
-        || text.get(7..8) != Some("-")
-        || !matches!(text.get(10..11), Some("T" | "t"))
-    {
-        return Err(Error::invalid("invalid timestamp"));
-    }
-    part(text, 0..4)?;
-    let (hour, minute, second) = clock(
-        text.get(11..19)
-            .ok_or_else(|| Error::invalid("invalid timestamp"))?,
-    )?;
-    if !(1..=12).contains(&part(text, 5..7)?)
-        || !(1..=31).contains(&part(text, 8..10)?)
-        || hour > 23
-        || minute > 59
-        || second > 59
-    {
-        return Err(Error::invalid("invalid timestamp"));
-    }
-    let mut suffix = text
-        .get(19..)
-        .ok_or_else(|| Error::invalid("invalid timestamp"))?;
-    if let Some(fraction) = suffix.strip_prefix('.') {
-        let digits = fraction.bytes().take_while(u8::is_ascii_digit).count();
-        if digits == 0 {
-            return Err(Error::invalid("empty timestamp fraction"));
-        }
-        suffix = fraction
-            .get(digits..)
-            .ok_or_else(|| Error::invalid("invalid timestamp fraction"))?;
-    }
-    if !matches!(suffix, "Z" | "z")
-        && (suffix.len() != 6
-            || !matches!(suffix.get(..1), Some("+" | "-"))
-            || suffix.get(3..4) != Some(":")
-            || part(suffix, 1..3)? > 23
-            || part(suffix, 4..6)? > 59)
-    {
-        return Err(Error::invalid("invalid timestamp offset"));
-    }
-    Ok(())
-}
-
 fn month(text: &str) -> Result<i64> {
     match text {
         "Jan" => Ok(1),
@@ -142,7 +96,7 @@ fn month(text: &str) -> Result<i64> {
 }
 
 /// HTTP-date의 IMF-fixdate 형식을 UTC 초로 읽음
-pub fn parse_http_date(text: &str) -> Result<i64> {
+fn parse_http_date(text: &str) -> Result<i64> {
     if text.len() != 29
         || !matches!(
             text.get(..3),
@@ -174,7 +128,7 @@ pub fn parse_http_date(text: &str) -> Result<i64> {
 }
 
 /// Retry-After를 기한으로 변환, 최대 24시간만 기다림
-pub fn retry_after_deadline(value: &str, now: i64) -> Option<i64> {
+pub(crate) fn retry_after_deadline(value: &str, now: i64) -> Option<i64> {
     let value = value.trim();
     let seconds = if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
         value.bytes().fold(0i64, |n, b| {

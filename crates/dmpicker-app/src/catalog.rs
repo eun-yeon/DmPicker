@@ -1,10 +1,12 @@
 //! 로컬 곡 목록과 검색 (dmpicker-search), 재킷 폴더 위치
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub use dmpicker_search::Song;
 use dmpicker_search::{Filter, Mode, Searcher};
+use dmpicker_update::store::JACKETS_DIR;
 
 use crate::keywords::{Keywords, UNREADABLE};
 
@@ -13,7 +15,6 @@ pub struct Catalog {
     searcher: Searcher,
     pub jacket_dir: PathBuf,
     keywords: Option<Keywords>,
-    dynamic: Option<dmpicker_update::Dynamic>,
 }
 
 impl Catalog {
@@ -21,24 +22,19 @@ impl Catalog {
     pub fn empty(data_dir: &Path) -> Self {
         let cat = dmpicker_search::Catalog { songs: Vec::new() };
         let searcher = Searcher::new(&cat);
-        Self { songs: cat.songs, searcher, jacket_dir: data_dir.join("jackets"), keywords: None, dynamic: None }
+        Self { songs: cat.songs, searcher, jacket_dir: data_dir.join(JACKETS_DIR), keywords: None }
     }
 
     /// 검증된 세대의 곡과 패턴을 검색 목록으로 준비
     pub fn from_feed(core: &dmpicker_update::Core, dynamic: &dmpicker_update::Dynamic, data_dir: &Path) -> Result<Self, String> {
         let cat = dmpicker_search::Catalog::from_feed(core, dynamic)?;
         let searcher = Searcher::new(&cat);
-        Ok(Self {
-            songs: cat.songs,
-            searcher,
-            jacket_dir: data_dir.join("jackets"),
-            keywords: None,
-            dynamic: Some(dynamic.clone()),
-        })
+        Ok(Self { songs: cat.songs, searcher, jacket_dir: data_dir.join(JACKETS_DIR), keywords: None })
     }
 
-    pub fn dynamic(&self) -> Option<&dmpicker_update::Dynamic> {
-        self.dynamic.as_ref()
+    /// 곡 id별 제목, 작업 스레드와 나눠 씀
+    pub fn titles(&self) -> Arc<HashMap<u32, String>> {
+        Arc::new(self.songs.iter().map(|song| (song.id, song.name.clone())).collect())
     }
 
     /// 교체 직전의 키워드와 저장 경로를 옮긴 뒤 새 곡에 다시 적용

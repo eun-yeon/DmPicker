@@ -1,7 +1,6 @@
 //! 새 exe 버전 확인과 릴리스 페이지 주소
 
 use std::fmt;
-use std::str::FromStr;
 
 use crate::{Error, Result, EXE_RELEASE_BASE};
 
@@ -37,14 +36,6 @@ impl fmt::Display for Version {
     }
 }
 
-impl FromStr for Version {
-    type Err = Error;
-
-    fn from_str(text: &str) -> Result<Self> {
-        Self::parse(text)
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExeRelease {
     tag: String,
@@ -52,6 +43,14 @@ pub struct ExeRelease {
 }
 
 impl ExeRelease {
+    /// 태그가 릴리스 페이지 주소에 들어가서 정식 버전 꼴만 받음
+    pub fn from_tag(tag: &str) -> Result<Self> {
+        Ok(Self {
+            tag: tag.to_owned(),
+            version: Version::parse(tag)?,
+        })
+    }
+
     pub fn tag(&self) -> &str {
         &self.tag
     }
@@ -71,11 +70,7 @@ pub fn parse_exe_location(location: &str) -> Result<ExeRelease> {
     let tag = location
         .strip_prefix(EXE_RELEASE_BASE)
         .ok_or_else(|| Error::invalid("invalid executable release location"))?;
-    let version = Version::parse(tag)?;
-    Ok(ExeRelease {
-        tag: tag.to_owned(),
-        version,
-    })
+    ExeRelease::from_tag(tag)
 }
 
 fn version_part(text: Option<&str>) -> Result<u64> {

@@ -68,7 +68,6 @@ struct App {
     retired_jobs: Vec<std::thread::JoinHandle<()>>,
     peek_job: Option<std::thread::JoinHandle<()>>,
     initial_refs: Option<std::thread::JoinHandle<update::InitialLoad>>,
-    generation: u64,
     updates: update::Updater,
     /// 곡 이동 중 화면이 저장된 목록과 달랐음
     /// 새 목록이 저장되거나 다음 이동이 도착할 때까지 검색창에서 다시 인식을 권함
@@ -429,18 +428,16 @@ fn reap_jobs(a: &mut App) {
     }
     if a.initial_refs.as_ref().is_some_and(|h| h.is_finished()) {
         if let Some(handle) = a.initial_refs.take() {
-            if let Ok((generation, result)) = handle.join() {
-                if generation == a.generation {
-                    match result {
-                        Ok(startup) => {
-                            if let Some(refs) = a.updates.initial_loaded(startup) {
-                                if let Ok(mut slot) = a.refs.lock() { *slot = Some(refs); }
-                            }
+            if let Ok(result) = handle.join() {
+                match result {
+                    Ok(startup) => {
+                        if let Some(refs) = a.updates.initial_loaded(startup) {
+                            if let Ok(mut slot) = a.refs.lock() { *slot = Some(refs); }
                         }
-                        Err(error) => {
-                            a.updates.initial_failed();
-                            eprintln!("jacket refs failed: {error}");
-                        }
+                    }
+                    Err(error) => {
+                        a.updates.initial_failed();
+                        eprintln!("jacket refs failed: {error}");
                     }
                 }
             }
@@ -455,7 +452,7 @@ fn apply_mode(had_data: bool, visible: bool, open: bool, busy: bool) -> Option<b
     (!busy && (!visible || fill)).then_some(fill)
 }
 
-/// 교체 관문과 메모리 교체를 한 번에 처리
+/// 지금 바꿔도 되면 받아 둔 새 곡 데이터로 교체
 fn apply_ready(a: &mut App) {
     let had_data = a.updates.active.has_data();
     let busy = a.peeking || jobs_busy(a);
@@ -480,7 +477,6 @@ fn apply_ready(a: &mut App) {
         let owned = refill_owned(&a.store, a.open_kind, &a.titles);
         a.popup.fill_catalog(catalog, owned);
     }
-    a.generation = a.generation.wrapping_add(1);
     a.updates.applied(active, &summary);
     // 치던 검색어가 플레이리스트 주소면 새 목록으로 다시 받음
     if fill {
@@ -553,13 +549,12 @@ fn stop_updates(a: &mut App) {
     a.updates.stop();
 }
 
-/// 트레이 메뉴의 종료: 돌던 작업을 취소하고 아이콘을 지운 뒤 메시지 루프를 끝냄
-/// 데이터 작업은 종료까지 기다림, 인식·이동은 키를 떼도록 1초 더 기다림
+/// 트레이 메뉴 종료와 Windows 종료·로그오프: 돌던 작업을 취소하고 아이콘을 지운 뒤 메시지 루프를 끝냄
+/// 데이터 작업은 끝날 때까지 기다림, 인식·이동은 누르던 키를 떼게 최대 1초만 기다림
 fn quit(a: &mut App) {
     if let Some((cancel, _)) = &a.job { cancel.store(true, Ordering::Relaxed); }
     stop_updates(a);
-    if let Some((cancel, handle)) = a.job.take() {
-        cancel.store(true, Ordering::Relaxed);
+    if let Some((_, handle)) = a.job.take() {
         let t0 = std::time::Instant::now();
         while !handle.is_finished() && t0.elapsed() < std::time::Duration::from_secs(1) {
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -720,7 +715,7 @@ fn main() -> Result<()> {
             driver::ensure_both(&store_dir(), &|id| titles.get(&id).cloned().unwrap_or_default());
         }
         let refs = Arc::new(Mutex::new(startup.refs.clone()));
-        let initial_refs = startup.active.has_data().then(|| update::start_initial(store_dir(), dir.clone(), 0));
+        let initial_refs = startup.active.has_data().then(|| update::start_initial(store_dir(), dir.clone()));
         let updates = update::Updater::new(store_dir(), dir.clone(), &startup);
         let mut app_box = Box::new(App {
             popup: Popup::new(hwnd, startup.catalog),
@@ -735,7 +730,6 @@ fn main() -> Result<()> {
             retired_jobs: Vec::new(),
             peek_job: None,
             initial_refs,
-            generation: 0,
             updates,
             stale: Arc::new(AtomicBool::new(false)),
             peeking: false,

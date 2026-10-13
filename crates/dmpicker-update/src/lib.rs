@@ -1,5 +1,7 @@
 //! 곡 데이터 검증과 로컬 업데이트 상태
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 pub mod archive;
 pub mod exe;
 pub mod model;
@@ -28,8 +30,8 @@ pub const MAX_DYNAMIC_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_ZIP_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_JACKET_BYTES: usize = 64 * 1024;
 pub const MAX_SONGS: usize = 4096;
-pub const MAX_STRING_BYTES: usize = 1024;
-pub const MAX_ARRAY_ITEMS: usize = 256;
+pub(crate) const MAX_STRING_BYTES: usize = 1024;
+pub(crate) const MAX_ARRAY_ITEMS: usize = 256;
 pub const MANIFEST_TIMEOUT_SECS: u64 = 10;
 pub const JSON_TIMEOUT_SECS: u64 = 30;
 pub const JACKETS_TIMEOUT_SECS: u64 = 300;
@@ -79,18 +81,24 @@ pub fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-pub fn valid_hash(value: &str) -> bool {
+pub(crate) fn valid_hash(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// 실제 길이와 해시를 함께 확인
-pub fn validate_bytes(bytes: &[u8], hash: &str, expected: usize, cap: usize) -> Result<()> {
-    if bytes.len() > cap
-        || bytes.len() != expected
-        || !valid_hash(hash)
-        || sha256(bytes) != hash.to_ascii_lowercase()
-    {
+/// `hash`는 manifest를 읽을 때 이미 소문자 SHA-256으로 검사됨
+pub(crate) fn validate_bytes(bytes: &[u8], hash: &str, expected: usize) -> Result<()> {
+    if bytes.len() != expected || sha256(bytes) != hash {
         return Err(Error::invalid("asset size or hash mismatch"));
     }
     Ok(())
+}
+
+/// 취소됐으면 `Interrupted` 오류, 호출부는 이걸로 실패와 취소를 구분함
+pub fn ensure_running(cancel: &AtomicBool) -> Result<()> {
+    if cancel.load(Ordering::Relaxed) {
+        Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "update cancelled").into())
+    } else {
+        Ok(())
+    }
 }

@@ -110,6 +110,7 @@ pub fn playlist(url: &str) -> Result<Vec<u8>, Failure> {
     download_inner(
         url,
         1_048_576,
+        // 이름 풀이·연결·보내기 3초씩, 헤더 10초, 본문 8초를 다 더한 것보다 조금 넉넉한 전체 상한
         30,
         Some(Duration::from_secs(8)),
         PLAYLIST_RECEIVE_TIMEOUT_MS,
@@ -185,7 +186,7 @@ impl Url {
         let url = url.split('#').next().ok_or_else(invalid)?;
         let wide: Vec<u16> = url.encode_utf16().collect();
         let mut parts = URL_COMPONENTS {
-            dwStructSize: std::mem::size_of::<URL_COMPONENTS>() as u32,
+            dwStructSize: size_of::<URL_COMPONENTS>() as u32,
             dwHostNameLength: u32::MAX,
             dwUserNameLength: u32::MAX,
             dwPasswordLength: u32::MAX,
@@ -444,7 +445,7 @@ unsafe extern "system" fn callback(
             Event::Data(std::slice::from_raw_parts(info.cast::<u8>(), size as usize).to_vec())
         }
         WINHTTP_CALLBACK_STATUS_REQUEST_ERROR
-            if !info.is_null() && size as usize >= std::mem::size_of::<WINHTTP_ASYNC_RESULT>() =>
+            if !info.is_null() && size as usize >= size_of::<WINHTTP_ASYNC_RESULT>() =>
         {
             let result = std::ptr::read_unaligned(info.cast::<WINHTTP_ASYNC_RESULT>());
             Event::Error(Failure::system_code(result.dwError))

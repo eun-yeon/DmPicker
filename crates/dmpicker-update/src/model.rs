@@ -31,7 +31,6 @@ pub struct JacketAsset {
 pub struct Manifest {
     pub release_tag: String,
     pub published_at: String,
-    pub source_commit: String,
     pub core: JsonAsset,
     pub dynamic: JsonAsset,
     pub jackets: JacketAsset,
@@ -66,12 +65,6 @@ impl Manifest {
         let release_tag = string(field(root, "releaseTag")?)?.to_owned();
         validate_release_tag(&release_tag)?;
         let published_at = string(field(root, "publishedAt")?)?.to_owned();
-        crate::time::validate_rfc3339(&published_at)?;
-        let source = object(field(root, "source")?)?;
-        let source_commit = string(field(source, "commit")?)?;
-        if source_commit.len() != 40 || !source_commit.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(Error::invalid("invalid source commit"));
-        }
         let jackets = object(field(root, "jackets")?)?;
         if string(field(jackets, "file")?)? != JACKETS_FILE {
             return Err(Error::invalid("invalid jackets filename"));
@@ -83,7 +76,6 @@ impl Manifest {
         Ok(Self {
             release_tag,
             published_at,
-            source_commit: source_commit.to_ascii_lowercase(),
             core: json_asset(field(root, "core")?, CORE_FILE, MAX_CORE_BYTES)?,
             dynamic: json_asset(field(root, "dynamic")?, DYNAMIC_FILE, MAX_DYNAMIC_BYTES)?,
             jackets: JacketAsset {
@@ -104,10 +96,6 @@ impl Manifest {
         }
         Ok(manifest)
     }
-
-    pub fn generation_name(&self) -> String {
-        format!("gen-{}", self.release_tag)
-    }
 }
 
 fn json_asset(value: &Value, file: &str, max: usize) -> Result<JsonAsset> {
@@ -124,7 +112,7 @@ fn json_asset(value: &Value, file: &str, max: usize) -> Result<JsonAsset> {
     })
 }
 
-/// URL과 폴더 이름에 쓸 발행 태그
+/// URL과 폴더 이름에 들어가서 `data-<16자 시각>-<run>-<attempt>` 꼴만 받음
 pub fn validate_release_tag(tag: &str) -> Result<()> {
     let invalid = || Error::invalid("invalid data release tag");
     let tail = tag.strip_prefix("data-").ok_or_else(invalid)?;
@@ -233,7 +221,7 @@ impl Core {
         crate::sha256(Value::Array(values).to_string().as_bytes())
     }
 
-    /// 특징 버전과 자켓 내용이 같으면 재사용
+    /// 특징 버전과 재킷 내용이 같으면 재사용
     pub fn feature_signature(&self, version: u32) -> String {
         let mut bytes = version.to_le_bytes().to_vec();
         bytes.extend_from_slice(self.set_hash().as_bytes());
@@ -241,7 +229,7 @@ impl Core {
     }
 }
 
-pub fn validate_set_hash(manifest: &Manifest, core: &Core) -> Result<()> {
+pub(crate) fn validate_set_hash(manifest: &Manifest, core: &Core) -> Result<()> {
     if manifest.jackets.count != core.songs.len() || manifest.jackets.set_hash != core.set_hash() {
         return Err(Error::invalid("jacket set mismatch"));
     }
@@ -509,11 +497,8 @@ pub(crate) fn string(value: &Value) -> Result<&str> {
     Ok(s)
 }
 
-/// 1 KiB 넘는 문자열과 제어 문자·방향 제어 문자 거부, ZWJ 같은 다른 서식 문자는 허용
-pub fn check_string(s: &str) -> Result<()> {
-    if s.len() > MAX_STRING_BYTES || s.chars().any(|c| {
-        c.is_control() || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
-    }) {
+pub(crate) fn check_string(s: &str) -> Result<()> {
+    if s.len() > MAX_STRING_BYTES || s.chars().any(char::is_control) {
         return Err(Error::invalid("invalid string length or control character"));
     }
     Ok(())

@@ -4,12 +4,14 @@
 //! **한글 IME 조합 중 갱신까지 포함해 키를 칠 때마다** 부르는 걸 전제로 함
 //!
 //! ```no_run
+//! # fn demo(core: &dmpicker_update::Core, dynamic: &dmpicker_update::Dynamic) {
 //! use dmpicker_search::{Catalog, Searcher};
-//! let cat = Catalog::load("data/djmaxgg_songs.json").unwrap();
+//! let cat = Catalog::from_feed(core, dynamic).unwrap();
 //! let searcher = Searcher::new(&cat);
 //! for hit in searcher.search("빗", 10) {          // "비상"을 치는 중의 IME 상태
 //!     println!("{} ({})", cat.songs[hit.index].name, hit.score);
 //! }
+//! # }
 //! ```
 //!
 //! ## 매칭

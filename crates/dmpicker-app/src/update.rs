@@ -3,15 +3,15 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use dmpicker_engine::{RefSet, features::FEATURE_VERSION};
+use dmpicker_engine::{features::FEATURE_VERSION, RefSet};
 use dmpicker_update as feed;
 use feed::exe::{ExeRelease, Version};
 use feed::notify::{Notice, Snapshot, Summary};
-use feed::state::{CheckAction, CheckError, Scheduler, UpdateState};
+use feed::state::{self, CheckAction, CheckError, UpdateState};
 use feed::store::{self, Generation, Pointer, Staging};
 use windows::Win32::System::Threading::{
     GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN,
@@ -20,6 +20,10 @@ use windows::Win32::System::Threading::{
 use crate::{catalog::Catalog, http};
 
 const BASELINE_FILE: &str = "notified-baseline.json";
+const CHECKED_TEXT: &str = "곡 데이터 확인됨";
+const SAVE_FAILED_TEXT: &str = "곡 데이터를 저장하지 못했어요";
+/// 예전 버전이 남긴 특징 캐시, 이제는 세대 폴더의 features.bin을 씀
+const OLD_REFS_CACHE: &str = "refs.cache";
 
 pub struct Active {
     pub generation: Option<Arc<Generation>>,
@@ -27,6 +31,7 @@ pub struct Active {
 }
 
 impl Active {
+    /// 검색할 곡이 있음(로컬 동봉 데이터 포함), 받은 세대 여부는 `generation`으로 구분
     pub fn has_data(&self) -> bool {
         !self.snapshot.songs.is_empty()
     }
@@ -40,7 +45,7 @@ impl Active {
     /// 받아 둔 세대의 폴더 이름
     fn name(&self) -> Option<String> {
         self.generation.as_ref().and_then(|g| {
-            let name = g.manifest.generation_name();
+            let name = store::generation_name(&g.manifest.release_tag);
             (g.path.file_name().and_then(|n| n.to_str()) == Some(name.as_str())).then_some(name)
         })
     }
@@ -59,14 +64,15 @@ pub fn preview(root: &Path, bundled: &Path) -> Result<Startup, String> {
     load_startup(root, bundled, false)
 }
 
-pub type InitialLoad = (u64, Result<Startup, String>);
+pub type InitialLoad = Result<Startup, String>;
 
-/// 시작 준비는 별도 스레드에서 마치고 세대 번호와 함께 전달
-pub fn start_initial(root: PathBuf, bundled: PathBuf, generation: u64) -> JoinHandle<InitialLoad> {
-    std::thread::spawn(move || (generation, load_startup(&root, &bundled, true)))
+/// 시작 준비는 별도 스레드에서 마침
+pub fn start_initial(root: PathBuf, bundled: PathBuf) -> JoinHandle<InitialLoad> {
+    std::thread::spawn(move || load_startup(&root, &bundled, true))
 }
 
-/// 시작 준비가 끝난 뒤에만 pointer를 고치고 남은 세대를 정리
+/// `prepare`면 특징까지 준비한 뒤 pointer를 고치고 남은 세대 정리
+/// 아니면 화면을 먼저 띄우려고 곡 목록만 읽음
 fn load_startup(root: &Path, bundled: &Path, prepare: bool) -> Result<Startup, String> {
     let data = root.join("data");
     if prepare {
@@ -77,10 +83,9 @@ fn load_startup(root: &Path, bundled: &Path, prepare: bool) -> Result<Startup, S
     let state_path = root.join(feed::state::STATE_FILE);
     let mut state = UpdateState::load(&state_path).unwrap_or_default();
     let blocked = state.blocked_generation().map(str::to_owned);
-    let selected = store::choose_generation(&data, blocked.as_deref(), |candidate| {
-        if !state.begin_loading(&state_path, &candidate.name)? {
-            return Err(feed::Error::invalid("generation was interrupted"));
-        }
+    #[allow(unused_mut)]
+    let mut loaded = store::choose_generation(&data, blocked.as_deref(), |candidate| {
+        let marked = state.begin_loading(&state_path, &candidate.name)?;
         let result = (|| {
             let generation = candidate.load()?;
             let refs = if prepare {
@@ -88,43 +93,34 @@ fn load_startup(root: &Path, bundled: &Path, prepare: bool) -> Result<Startup, S
             } else {
                 None
             };
-            if let Some(refs) = &refs {
-                if let Err(error) = store::atomic_write(
-                    &generation.path.join("features.bin"),
-                    &refs.to_cache_bytes(&generation.core.feature_signature(FEATURE_VERSION))?,
-                ) {
-                    eprintln!("data features: {error}");
-                }
-            }
-            let catalog =
-                Catalog::from_feed(&generation.core, &generation.dynamic, &generation.path)
-                    .map_err(feed::Error::invalid)?;
+            let catalog = feed_catalog(&generation)?;
             let snapshot = Snapshot::from_data(&generation.core, &generation.dynamic);
             Ok((catalog, refs, Some(Arc::new(generation)), snapshot))
         })();
-        if prepare {
-            if let Err(error) = state.finish_loading(&state_path) {
+        if prepare && marked {
+            state.finish_loading(&state_path);
+        } else if !prepare {
+            // 미리 보기에서 꺼지면 다음 실행은 이 세대를 뒤로 미룸
+            // 다 읽었으면 표식을 원래대로 돌려 판단은 시작 준비에 맡김
+            state.loading = blocked.clone();
+            if let Err(error) = state.save(&state_path) {
                 eprintln!("data loading marker: {error}");
             }
-        } else {
-            state.loading = blocked.clone();
-            state.save(&state_path)?;
         }
         result
-    })
-    .map_err(|e| e.to_string())?;
-    #[allow(unused_mut)]
-    let mut loaded = selected.map(|selected| selected.value);
+    });
     let (catalog, refs, generation, snapshot) =
         loaded.unwrap_or_else(|| (Catalog::empty(bundled), None, None, Snapshot::default()));
+    if generation.is_some() {
+        let _ = std::fs::remove_file(root.join(OLD_REFS_CACHE));
+    }
     if let Some(generation) = generation
         .as_ref()
         .filter(|g| prepare && g.path.parent() == Some(data.as_path()))
     {
-        let name = generation.manifest.generation_name();
-        let previous = ["pointer.json", "pointer.bak"]
+        let name = store::generation_name(&generation.manifest.release_tag);
+        let previous = store::read_pointers(&data)
             .into_iter()
-            .filter_map(|file| store::read_pointer(&data.join(file)).ok())
             .flat_map(|p| std::iter::once(p.active).chain(p.previous))
             .find(|other| {
                 other != &name
@@ -138,6 +134,8 @@ fn load_startup(root: &Path, bundled: &Path, prepare: bool) -> Result<Startup, S
                     state
                         .record_data_applied(&generation.manifest.release_tag)
                         .map_err(|e| e.to_string())?;
+                } else if state.loading.as_deref() == Some(&name) {
+                    state.finish_loading(&state_path);
                 }
                 if let Err(error) = state.save(&state_path) {
                     eprintln!("data state: {error}");
@@ -174,13 +172,11 @@ fn prepare_refs(
     cancel: &AtomicBool,
     parallel: bool,
 ) -> feed::Result<Arc<RefSet>> {
-    interrupted(cancel)?;
-    let jackets: Vec<_> = generation
-        .core
-        .songs
-        .iter()
-        .map(|s| (s.id, s.jacket.clone()))
-        .collect();
+    feed::ensure_running(cancel)?;
+    if let Some(refs) = cached_refs(generation) {
+        return Ok(refs);
+    }
+    let jackets = jacket_list(&generation.core);
     let old: Vec<_> = active
         .map(|a| {
             a.snapshot
@@ -190,31 +186,41 @@ fn prepare_refs(
                 .collect()
         })
         .unwrap_or_default();
-    // 자켓이 그대로면 지금 RefSet을 그대로 씀, 레벨만 바뀐 갱신은 다시 계산 안 함
+    // 재킷이 그대로면 지금 RefSet을 그대로 씀, 레벨만 바뀐 갱신은 다시 계산 안 함
     if jackets == old {
         if let Some(previous) = previous {
+            save_refs(generation, previous);
             return Ok(previous.clone());
         }
     }
-    if let Some(refs) = cached_refs(generation) {
-        return Ok(refs);
-    }
+    // 앱 시작 확인은 특징이 빨리 준비돼야 해서 여러 스레드로 새로 계산
+    // 검색창에서 시작한 갱신은 한 스레드로 바뀐 재킷만 계산
     if parallel {
-        let refs = initial_refs(generation)?;
-        interrupted(cancel)?;
+        let refs = compute_refs(generation, &jackets)?;
+        feed::ensure_running(cancel)?;
         return Ok(refs);
     }
     let reuse = previous.map(|refs| (refs.as_ref(), old.as_slice()));
     let refs = RefSet::update_jackets(&jackets, reuse, cancel, |id| {
         decode_jacket(&generation.path, id)
     })?;
+    save_refs(generation, &refs);
     Ok(Arc::new(refs))
+}
+
+fn save_refs(generation: &Generation, refs: &RefSet) {
+    let result = refs
+        .to_cache_bytes(&generation.core.feature_signature(FEATURE_VERSION))
+        .and_then(|bytes| std::fs::write(generation.path.join(store::FEATURES_FILE), bytes));
+    if let Err(error) = result {
+        eprintln!("data features: {error}");
+    }
 }
 
 fn cached_refs(generation: &Generation) -> Option<Arc<RefSet>> {
     let signature = generation.core.feature_signature(FEATURE_VERSION);
     let bytes = store::read_limited(
-        &generation.path.join("features.bin"),
+        &generation.path.join(store::FEATURES_FILE),
         dmpicker_engine::features::MAX_CACHE_BYTES,
     )
     .ok()?;
@@ -227,24 +233,22 @@ fn initial_refs(generation: &Generation) -> feed::Result<Arc<RefSet>> {
     if let Some(refs) = cached_refs(generation) {
         return Ok(refs);
     }
-    let jackets: Vec<_> = generation
-        .core
-        .songs
-        .iter()
-        .map(|s| (s.id, s.jacket.clone()))
-        .collect();
-    Ok(Arc::new(RefSet::load_jackets(&jackets, |id| {
-        decode_jacket(&generation.path, id)
-    })?))
+    compute_refs(generation, &jacket_list(&generation.core))
+}
+
+/// 캐시 없이 모든 재킷을 여러 스레드로 계산하고 캐시를 남김
+fn compute_refs(generation: &Generation, jackets: &[(u32, String)]) -> feed::Result<Arc<RefSet>> {
+    let refs = RefSet::load_jackets(jackets, |id| decode_jacket(&generation.path, id))?;
+    save_refs(generation, &refs);
+    Ok(Arc::new(refs))
+}
+
+fn jacket_list(core: &feed::Core) -> Vec<(u32, String)> {
+    core.songs.iter().map(|s| (s.id, s.jacket.clone())).collect()
 }
 
 fn decode_jacket(path: &Path, id: u32) -> std::io::Result<dmpicker_engine::img::Rgb> {
-    let bytes = store::read_limited(
-        &path.join("jackets").join(format!("{id}.webp")),
-        feed::MAX_JACKET_BYTES,
-    )
-    .map_err(std::io::Error::other)?;
-    feed::archive::validate_webp(&bytes).map_err(std::io::Error::other)?;
+    let bytes = store::read_jacket(path, id, None).map_err(std::io::Error::other)?;
     let image = image::load_from_memory_with_format(&bytes, image::ImageFormat::WebP)
         .map_err(std::io::Error::other)?
         .into_rgb8();
@@ -255,32 +259,9 @@ fn decode_jacket(path: &Path, id: u32) -> std::io::Result<dmpicker_engine::img::
         .ok_or_else(|| std::io::Error::other("invalid jacket pixels"))
 }
 
-fn interrupted(cancel: &AtomicBool) -> feed::Result<()> {
-    if cancel.load(Ordering::Relaxed) {
-        Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "update cancelled").into())
-    } else {
-        Ok(())
-    }
-}
-
-fn copy_jackets(
-    staging: &Staging,
-    source: &Generation,
-    core: &feed::Core,
-    cancel: &AtomicBool,
-) -> feed::Result<()> {
-    for song in &core.songs {
-        interrupted(cancel)?;
-        let bytes = store::read_limited(
-            &source
-                .path
-                .join("jackets")
-                .join(format!("{}.webp", song.id)),
-            feed::MAX_JACKET_BYTES,
-        )?;
-        staging.write_jacket(song.id, &bytes)?;
-    }
-    Ok(())
+fn feed_catalog(generation: &Generation) -> feed::Result<Catalog> {
+    Catalog::from_feed(&generation.core, &generation.dynamic, &generation.path)
+        .map_err(feed::Error::invalid)
 }
 
 pub struct Ready {
@@ -304,7 +285,7 @@ impl Ready {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Phase {
+enum Phase {
     Idle,
     Checking,
     Preparing,
@@ -318,16 +299,18 @@ enum CheckOrigin {
     Search,
 }
 
+struct CheckRequest {
+    id: u64,
+    state: UpdateState,
+    active: Arc<Active>,
+    refs: Option<Arc<RefSet>>,
+    check_data: bool,
+    check_exe: bool,
+    origin: CheckOrigin,
+}
+
 enum Command {
-    Check {
-        id: u64,
-        state: UpdateState,
-        active: Arc<Active>,
-        refs: Option<Arc<RefSet>>,
-        check_data: bool,
-        check_exe: bool,
-        origin: CheckOrigin,
-    },
+    Check(CheckRequest),
     Apply {
         id: u64,
         state: UpdateState,
@@ -335,8 +318,11 @@ enum Command {
         previous: Option<String>,
     },
     Baseline(Snapshot),
-    ExeNoticeShown(Version),
-    SchemaNoticeShown(u64),
+    /// 화면에 나간 새 버전·형식 안내
+    Noticed {
+        version: Option<Version>,
+        schema: Option<u64>,
+    },
     Stop,
 }
 
@@ -345,7 +331,7 @@ enum Event {
     Checked {
         id: u64,
         state: UpdateState,
-        result: Result<Option<Box<Ready>>, Failure>,
+        result: Result<Option<Box<Ready>>, CheckFailure>,
         checked_data: bool,
     },
     Applied {
@@ -374,11 +360,13 @@ pub struct ExeNotice {
     pub text: String,
 }
 
+fn current_version() -> Option<Version> {
+    Version::parse(env!("CARGO_PKG_VERSION")).ok()
+}
+
 fn exe_release(state: &UpdateState) -> Option<ExeRelease> {
-    let tag = state.latest_version.as_deref()?;
-    let release =
-        feed::exe::parse_exe_location(&format!("{}{tag}", feed::EXE_RELEASE_BASE)).ok()?;
-    (release.version() > Version::parse(env!("CARGO_PKG_VERSION")).ok()?).then_some(release)
+    let release = ExeRelease::from_tag(state.latest_version.as_deref()?).ok()?;
+    (release.version() > current_version()?).then_some(release)
 }
 
 /// 버전 뒤 조사는 끝 숫자를 읽은 소리로, 2·4·5·9로 끝나면 "가"
@@ -416,9 +404,9 @@ fn release_page(state: &UpdateState) -> String {
 }
 
 fn open_url(url: &str) -> std::io::Result<()> {
+    use windows::core::{w, HSTRING, PCWSTR};
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-    use windows::core::{HSTRING, PCWSTR, w};
 
     let url = HSTRING::from(url);
     let result = unsafe {
@@ -438,7 +426,7 @@ fn open_url(url: &str) -> std::io::Result<()> {
 }
 
 #[derive(Debug)]
-struct Failure {
+struct CheckFailure {
     stage: &'static str,
     status: Option<u16>,
     retry_after: Option<String>,
@@ -446,7 +434,7 @@ struct Failure {
     cancelled: bool,
 }
 
-impl From<feed::Error> for Failure {
+impl From<feed::Error> for CheckFailure {
     fn from(error: feed::Error) -> Self {
         let schema = match &error {
             feed::Error::UnsupportedSchema(value) => Some(*value),
@@ -454,8 +442,20 @@ impl From<feed::Error> for Failure {
         };
         let cancelled =
             matches!(&error, feed::Error::Io(e) if e.kind() == std::io::ErrorKind::Interrupted);
+        if !cancelled {
+            eprintln!("data check: {error}");
+        }
+        // 진단 기록에서 디스크 읽기·쓰기 실패를 데이터 검증 실패와 구분
+        // 압축이 깨지면 나는 InvalidData·InvalidInput·UnexpectedEof는 검증 쪽
+        let storage = matches!(&error, feed::Error::Io(e) if !matches!(
+            e.kind(),
+            std::io::ErrorKind::InvalidData
+                | std::io::ErrorKind::InvalidInput
+                | std::io::ErrorKind::UnexpectedEof
+        ));
+        let stage = if storage { "storage" } else { "validation" };
         Self {
-            stage: "validation",
+            stage,
             status: None,
             retry_after: None,
             schema,
@@ -464,8 +464,11 @@ impl From<feed::Error> for Failure {
     }
 }
 
-impl Failure {
+impl CheckFailure {
     fn http(stage: &'static str, error: http::Failure) -> Self {
+        if !error.cancelled() {
+            eprintln!("data {stage}: {error:?}");
+        }
         Self {
             stage,
             status: error.status,
@@ -478,18 +481,17 @@ impl Failure {
 
 pub struct Updater {
     pub active: Arc<Active>,
-    pub status_text: String,
-    pub exe_status_text: Option<String>,
+    status_text: String,
+    exe_status_text: Option<String>,
     pub exe_notice: Option<ExeNotice>,
     pub data_notice: Option<DataNotice>,
-    pub phase: Phase,
+    phase: Phase,
     /// 아직 알리지 않은 못 읽는 데이터 형식
     schema_notice: Option<u64>,
     /// 마지막 데이터 확인이 형식 때문에 실패함
     outdated: bool,
     state: UpdateState,
     baseline: Snapshot,
-    scheduler: Scheduler,
     id: u64,
     ready: Option<Ready>,
     initializing: bool,
@@ -508,15 +510,9 @@ impl Updater {
         let cancel = Arc::new(AtomicBool::new(false));
         let flag = cancel.clone();
         let worker = std::thread::spawn(move || worker(root, bundled, receive, send, flag));
-        let status_text = startup
-            .active
-            .generation
-            .as_ref()
-            .map(|g| success_text(&g.manifest.published_at, &Summary::default()))
-            .unwrap_or_default();
         Self {
             active: startup.active.clone(),
-            status_text,
+            status_text: data_status(&startup.active).unwrap_or_default(),
             exe_status_text: exe_status(&startup.state),
             exe_notice: None,
             data_notice: (!startup.active.has_data()).then_some(DataNotice::Loading),
@@ -525,7 +521,6 @@ impl Updater {
             outdated: false,
             state: startup.state.clone(),
             baseline: startup.baseline.clone(),
-            scheduler: Scheduler::default(),
             id: 0,
             ready: None,
             initializing: startup.active.has_data(),
@@ -567,13 +562,10 @@ impl Updater {
             return;
         }
         let action = match origin {
-            CheckOrigin::Startup => self.scheduler.startup(&mut self.state, now(), busy),
-            CheckOrigin::Search => self.scheduler.due(
-                &mut self.state,
-                now(),
-                busy,
-                self.active.generation.is_none(),
-            ),
+            CheckOrigin::Startup => state::startup(&self.state, now(), busy),
+            CheckOrigin::Search => {
+                state::due(&self.state, now(), busy, self.active.generation.is_none())
+            }
         };
         if let CheckAction::Start {
             check_data,
@@ -589,7 +581,7 @@ impl Updater {
             }
             if self
                 .commands
-                .send(Command::Check {
+                .send(Command::Check(CheckRequest {
                     id: self.id,
                     state: self.state.clone(),
                     active: self.active.clone(),
@@ -597,14 +589,17 @@ impl Updater {
                     check_data,
                     check_exe,
                     origin,
-                })
+                }))
                 .is_err()
             {
-                self.scheduler.finish();
-                self.phase = Phase::Idle;
+                self.end_check();
                 self.refresh_data_notice();
             }
         }
+    }
+
+    fn end_check(&mut self) {
+        self.phase = Phase::Idle;
     }
 
     /// 받은 세대가 있으면 검색창에서 시작한 받기와 준비만 중단
@@ -617,23 +612,25 @@ impl Updater {
         }
     }
 
-    /// 이번 열기의 안내를 실제로 표시함, 그 버전과 형식만 한 번 기록해 다음 열기부터 안 보이게
-    /// 안내는 이번 열기 동안 그대로 둠
+    /// 이번 열기의 안내가 화면에 나간 뒤 호출, 그 버전과 형식을 기록해 다음 열기부터 안 보이게
+    /// 이번 열기 동안은 안내를 그대로 둠
     pub fn exe_notice_shown(&mut self) {
         let Some(notice) = &self.exe_notice else {
             return;
         };
-        let (version, schema) = (notice.version, notice.schema);
-        if let Some(version) = version.filter(|&v| self.state.needs_exe_notice(v)) {
+        let version = notice.version.filter(|&v| self.state.needs_exe_notice(v));
+        let schema = notice.schema.filter(|&s| self.state.needs_schema_notice(s));
+        if let Some(version) = version {
             self.state.record_exe_notice(version);
-            let _ = self.commands.send(Command::ExeNoticeShown(version));
         }
-        if let Some(schema) = schema.filter(|&s| self.state.needs_schema_notice(s)) {
+        if let Some(schema) = schema {
             self.state.record_schema_notice(schema);
             if self.schema_notice == Some(schema) {
                 self.schema_notice = None;
             }
-            let _ = self.commands.send(Command::SchemaNoticeShown(schema));
+        }
+        if version.is_some() || schema.is_some() {
+            let _ = self.commands.send(Command::Noticed { version, schema });
         }
     }
 
@@ -701,40 +698,34 @@ impl Updater {
                             self.ready = Some(*ready);
                             self.phase = Phase::Ready;
                         }
-                        other => {
-                            if let Err(error) = other {
-                                if let Some(schema) = error.schema {
-                                    if self.state.needs_schema_notice(schema) {
-                                        self.schema_notice = Some(schema);
-                                    }
+                        Err(error) => {
+                            if let Some(schema) = error.schema {
+                                if self.state.needs_schema_notice(schema) {
+                                    self.schema_notice = Some(schema);
                                 }
-                                if !error.cancelled {
-                                    self.outdated = error.schema.is_some();
-                                    self.status_text = failure_text(&self.state);
-                                }
-                            } else if checked_data {
-                                self.status_text = self
-                                    .active
-                                    .generation
-                                    .as_ref()
-                                    .map(|g| {
-                                        success_text(&g.manifest.published_at, &Summary::default())
-                                    })
-                                    .unwrap_or_else(|| "곡 데이터 확인됨".into());
+                            }
+                            if !error.cancelled {
+                                self.outdated = error.schema.is_some();
+                                self.status_text = failure_text(&self.state);
+                            }
+                            self.end_check();
+                        }
+                        Ok(None) => {
+                            if checked_data {
+                                self.status_text =
+                                    data_status(&self.active).unwrap_or_else(|| CHECKED_TEXT.into());
                                 self.schema_resolved();
                             }
-                            self.phase = Phase::Idle;
-                            self.scheduler.finish();
+                            self.end_check();
                         }
                     }
                 }
                 Event::Applied { id, state, result } if id == self.id => {
                     self.accept_state(state);
                     if result.is_err() {
-                        self.status_text = "곡 데이터를 저장하지 못했어요".into();
+                        self.status_text = SAVE_FAILED_TEXT.into();
                     }
-                    self.phase = Phase::Idle;
-                    self.scheduler.finish();
+                    self.end_check();
                 }
                 _ => {}
             }
@@ -753,14 +744,7 @@ impl Updater {
             (None, None) => self.active.snapshot == startup.active.snapshot,
             _ => false,
         };
-        let titles = Arc::new(
-            startup
-                .catalog
-                .songs
-                .iter()
-                .map(|song| (song.id, song.name.clone()))
-                .collect(),
-        );
+        let titles = startup.catalog.titles();
         self.state = startup.state;
         self.exe_status_text = exe_status(&self.state);
         self.baseline = startup.baseline;
@@ -784,6 +768,7 @@ impl Updater {
         self.initializing = false;
         self.status_text = "곡 데이터를 준비하지 못했어요".into();
     }
+
     pub fn keep_ready(&mut self, ready: Ready) {
         self.ready = Some(ready);
     }
@@ -801,6 +786,7 @@ impl Updater {
         }
         self.data_notice = None;
         self.schema_resolved();
+        // 시작 준비가 pointer와 적용 기록을 이미 저장함
         if self.initializing {
             self.initializing = false;
             self.phase = Phase::Idle;
@@ -818,9 +804,8 @@ impl Updater {
             })
             .is_err()
         {
-            self.phase = Phase::Idle;
-            self.scheduler.finish();
-            self.status_text = "곡 데이터를 저장하지 못했어요".into();
+            self.end_check();
+            self.status_text = SAVE_FAILED_TEXT.into();
         }
     }
 
@@ -871,22 +856,18 @@ fn worker(
                     eprintln!("data notice: {error}");
                 }
             }
-            Command::ExeNoticeShown(version) => {
+            Command::Noticed { version, schema } => {
                 let result = UpdateState::load(&state_path).and_then(|mut state| {
-                    state.record_exe_notice(version);
+                    if let Some(version) = version {
+                        state.record_exe_notice(version);
+                    }
+                    if let Some(schema) = schema {
+                        state.record_schema_notice(schema);
+                    }
                     state.save(&state_path)
                 });
                 if let Err(error) = result {
-                    eprintln!("version notice: {error}");
-                }
-            }
-            Command::SchemaNoticeShown(schema) => {
-                let result = UpdateState::load(&state_path).and_then(|mut state| {
-                    state.record_schema_notice(schema);
-                    state.save(&state_path)
-                });
-                if let Err(error) = result {
-                    eprintln!("schema notice: {error}");
+                    eprintln!("update notice: {error}");
                 }
             }
             Command::Apply {
@@ -900,77 +881,90 @@ fn worker(
                         .generation
                         .as_ref()
                         .ok_or_else(|| feed::Error::invalid("missing generation"))?;
-                    let pointer =
-                        Pointer::new(&generation.manifest.generation_name(), previous.as_deref())?;
-                    store::write_pointer(&root.join("data"), &pointer)?;
+                    let name = store::generation_name(&generation.manifest.release_tag);
+                    let pointer = Pointer::new(&name, previous.as_deref())?;
+                    let permit = store::write_pointer(&root.join("data"), &pointer)?;
                     state.record_data_applied(&generation.manifest.release_tag)?;
-                    state.save(&state_path)
+                    if let Err(error) = state.save(&state_path) {
+                        eprintln!("data state: {error}");
+                    }
+                    let _ = std::fs::remove_file(root.join(OLD_REFS_CACHE));
+                    if let Err(error) = store::cleanup(&permit) {
+                        eprintln!("data cleanup: {error}");
+                    }
+                    Ok(())
                 })();
                 let _ = send.send(Event::Applied { id, state, result });
             }
-            Command::Check {
-                id,
-                mut state,
-                active,
-                refs,
-                check_data,
-                check_exe,
-                origin,
-            } => {
-                if check_exe && !cancel.load(Ordering::Relaxed) {
-                    check_exe_version(&exe_latest_url(), &state_path, &mut state, &cancel);
-                }
-                let mut result = if check_data {
-                    state
-                        .save(&state_path)
-                        .map_err(Failure::from)
-                        .and_then(|_| {
-                            check(
-                                &source,
-                                &root.join("data"),
-                                &state_path,
-                                id,
-                                &mut state,
-                                &active,
-                                refs.as_ref(),
-                                &cancel,
-                                &send,
-                                &Preparation {
-                                    bundled: &bundled,
-                                    parallel: origin == CheckOrigin::Startup,
-                                },
-                            )
-                        })
-                } else {
-                    Ok(None)
-                };
-                if check_data {
-                    match &result {
-                        Ok(_) => state.record_success(now()),
-                        Err(error) if !error.cancelled => state.record_failure(
-                            now(),
-                            CheckError {
-                                stage: error.stage.into(),
-                                http_status: error.status,
-                            },
-                            error.retry_after.as_deref(),
-                        ),
-                        Err(_) => {}
-                    }
-                }
-                if let Err(error) = state.save(&state_path) {
-                    if check_data {
-                        result = Err(error.into());
-                    }
-                }
-                let _ = send.send(Event::Checked {
-                    id,
-                    state,
-                    result: result.map(|ready| ready.map(Box::new)),
-                    checked_data: check_data,
-                });
+            Command::Check(request) => {
+                let event = run_check(&source, &root, &bundled, &cancel, &send, request);
+                let _ = send.send(event);
             }
         }
+    }
+}
+
+/// exe와 데이터를 확인하고 확인 결과를 상태 파일에 남김
+fn run_check(
+    source: &Source,
+    root: &Path,
+    bundled: &Path,
+    cancel: &AtomicBool,
+    events: &mpsc::Sender<Event>,
+    request: CheckRequest,
+) -> Event {
+    let CheckRequest {
+        id,
+        mut state,
+        active,
+        refs,
+        check_data: wants_data,
+        check_exe: wants_exe,
+        origin,
+    } = request;
+    let state_path = root.join(feed::state::STATE_FILE);
+    if wants_exe && !cancel.load(Ordering::Relaxed) {
+        check_exe_version(&exe_latest_url(), &state_path, &mut state, cancel);
+    }
+    let result = if wants_data {
+        if let Err(error) = state.save(&state_path) {
+            eprintln!("data state: {error}");
+        }
+        let job = CheckJob {
+            state_path: &state_path,
+            id,
+            cancel,
+            events,
+            refs: refs.as_ref(),
+            bundled,
+            parallel: origin == CheckOrigin::Startup,
+        };
+        check_data(source, &root.join("data"), &job, &mut state, &active)
+    } else {
+        Ok(None)
+    };
+    if wants_data {
+        match &result {
+            Ok(_) => state.record_success(now()),
+            Err(error) if !error.cancelled => state.record_failure(
+                now(),
+                CheckError {
+                    stage: error.stage.into(),
+                    http_status: error.status,
+                },
+                error.retry_after.as_deref(),
+            ),
+            Err(_) => {}
+        }
+    }
+    if let Err(error) = state.save(&state_path) {
+        eprintln!("data state: {error}");
+    }
+    Event::Checked {
+        id,
+        state,
+        result: result.map(|ready| ready.map(Box::new)),
+        checked_data: wants_data,
     }
 }
 
@@ -984,13 +978,17 @@ fn check_exe_version(url: &str, state_path: &Path, state: &mut UpdateState, canc
     if result.as_ref().is_err_and(http::Failure::cancelled) {
         return;
     }
-    if let Ok(location) = result {
-        if let (Ok(release), Ok(current)) = (
-            feed::exe::parse_exe_location(&location),
-            Version::parse(env!("CARGO_PKG_VERSION")),
-        ) {
-            let _ = state.record_exe_available(release.tag(), current);
+    match result {
+        Ok(location) => {
+            if let (Ok(release), Some(current)) =
+                (feed::exe::parse_exe_location(&location), current_version())
+            {
+                let _ = state.record_exe_available(release.tag(), current);
+            }
         }
+        // 최신 릴리즈가 없어지면 알던 새 버전 안내도 내림
+        Err(error) if error.status == Some(404) => state.latest_version = None,
+        Err(_) => {}
     }
     state.record_exe_check(now());
     let _ = state.save(state_path);
@@ -1013,24 +1011,25 @@ impl Source {
         feed::model::data_location(location)
     }
 
+    /// 파일 이름은 호출부의 고정 이름만 들어옴
     fn asset(&self, tag: &str, file: &str) -> feed::Result<String> {
         feed::model::validate_release_tag(tag)?;
-        if !matches!(
-            file,
-            "manifest.json" | feed::CORE_FILE | feed::DYNAMIC_FILE | feed::JACKETS_FILE
-        ) {
-            return Err(feed::Error::invalid("invalid asset name"));
-        }
         Ok(format!("{}{tag}/{file}", self.base))
     }
 }
 
-struct Preparation<'a> {
+/// 데이터 확인 한 번에 같이 쓰는 값
+struct CheckJob<'a> {
+    state_path: &'a Path,
+    id: u64,
+    cancel: &'a AtomicBool,
+    events: &'a mpsc::Sender<Event>,
+    refs: Option<&'a Arc<RefSet>>,
     bundled: &'a Path,
     parallel: bool,
 }
 
-/// 동봉 자켓이 모두 맞으면 복사, 하나라도 없거나 다르면 zip을 받음
+/// 동봉 재킷이 모두 맞으면 복사, 하나라도 없거나 다르면 zip을 받음
 fn copy_bundled_jackets(
     staging: &Staging,
     bundled: &Path,
@@ -1039,19 +1038,8 @@ fn copy_bundled_jackets(
 ) -> feed::Result<bool> {
     let mut total = 0usize;
     for song in &core.songs {
-        interrupted(cancel)?;
-        let valid = (|| {
-            let bytes = store::read_limited(
-                &bundled.join("jackets").join(format!("{}.webp", song.id)),
-                feed::MAX_JACKET_BYTES,
-            )?;
-            if feed::sha256(&bytes) != song.jacket {
-                return Err(feed::Error::invalid("bundled jacket hash mismatch"));
-            }
-            feed::archive::validate_webp(&bytes)?;
-            Ok(bytes)
-        })();
-        let Ok(bytes) = valid else {
+        feed::ensure_running(cancel)?;
+        let Ok(bytes) = store::read_jacket(bundled, song.id, Some(&song.jacket)) else {
             return Ok(false);
         };
         let Some(size) = total
@@ -1067,46 +1055,31 @@ fn copy_bundled_jackets(
 }
 
 /// 첫 302로 태그를 읽고 바뀐 파일만 받아 준비, 받을 게 없으면 None
-#[allow(clippy::too_many_arguments)]
-fn check(
+fn check_data(
     source: &Source,
     root: &Path,
-    state_path: &Path,
-    id: u64,
+    job: &CheckJob<'_>,
     state: &mut UpdateState,
     active: &Active,
-    refs: Option<&Arc<RefSet>>,
-    cancel: &AtomicBool,
-    events: &mpsc::Sender<Event>,
-    preparation: &Preparation<'_>,
-) -> Result<Option<Ready>, Failure> {
-    interrupted(cancel)?;
+) -> Result<Option<Ready>, CheckFailure> {
+    let cancel = job.cancel;
+    feed::ensure_running(cancel)?;
     let location = http::first_redirect(&source.latest, feed::MANIFEST_TIMEOUT_SECS, cancel)
-        .map_err(|e| Failure::http("latest", e))?;
+        .map_err(|e| CheckFailure::http("latest", e))?;
     let tag = source.tag(&location)?;
     if !state.needs_manifest(&tag, active.tag())? {
         return Ok(None);
     }
-    if let Some(generation) = store::existing_generation(root, &tag)? {
-        return prepare_existing(
-            generation,
-            state_path,
-            id,
-            state,
-            active,
-            refs,
-            cancel,
-            events,
-            preparation.parallel,
-        );
+    if let Some(generation) = store::existing_generation(root, &tag, active.name().as_deref())? {
+        return prepare_existing(generation, job, state, active);
     }
     let bytes = http::download(
-        &source.asset(&tag, "manifest.json")?,
+        &source.asset(&tag, store::MANIFEST_FILE)?,
         feed::MAX_MANIFEST_BYTES,
         feed::MANIFEST_TIMEOUT_SECS,
         cancel,
     )
-    .map_err(|e| Failure::http("manifest", e))?;
+    .map_err(|e| CheckFailure::http("manifest", e))?;
     let manifest = feed::Manifest::for_tag(&bytes, &tag)?;
     let needs = feed::Needs::between(active.generation.as_ref().map(|g| &g.manifest), &manifest);
     if !needs.any() {
@@ -1115,23 +1088,26 @@ fn check(
         }
         return Ok(None);
     }
-    if !state.begin_preparing(state_path, &feed::sha256(&bytes))? {
+    let manifest_hash = feed::sha256(&bytes);
+    if !state.can_prepare(&manifest_hash, active.has_data()) {
         return Ok(None);
     }
-    let _ = events.send(Event::Preparing(id));
+    let _ = job.events.send(Event::Preparing(job.id));
+    let mut preparing = false;
     let result = (|| {
         let json = |asset: &feed::model::JsonAsset,
                     needed: bool,
                     cap,
                     plain: &str|
-         -> Result<Vec<u8>, Failure> {
-            interrupted(cancel)?;
+         -> Result<Vec<u8>, CheckFailure> {
+            feed::ensure_running(cancel)?;
             if !needed {
                 let previous = active
                     .generation
                     .as_ref()
                     .ok_or_else(|| feed::Error::invalid("missing active generation"))?;
-                return store::read_limited(&previous.path.join(plain), cap).map_err(Failure::from);
+                return store::read_limited(&previous.path.join(plain), cap)
+                    .map_err(CheckFailure::from);
             }
             let gz = http::download(
                 &source.asset(&tag, &asset.file)?,
@@ -1139,26 +1115,26 @@ fn check(
                 feed::JSON_TIMEOUT_SECS,
                 cancel,
             )
-            .map_err(|e| Failure::http("json", e))?;
-            feed::archive::decode_json_gzip(&gz, asset, cap).map_err(Failure::from)
+            .map_err(|e| CheckFailure::http("json", e))?;
+            feed::archive::decode_json_gzip(&gz, asset, cap).map_err(CheckFailure::from)
         };
         let core_bytes = json(
             &manifest.core,
             needs.core,
             feed::MAX_CORE_BYTES,
-            "core.json",
+            store::CORE_JSON,
         )?;
         let dynamic_bytes = json(
             &manifest.dynamic,
             needs.dynamic,
             feed::MAX_DYNAMIC_BYTES,
-            "dynamic.json",
+            store::DYNAMIC_JSON,
         )?;
         let core = feed::Core::parse(&core_bytes)?;
-        let staging = Staging::create(root, id)?;
+        let staging = Staging::create(root)?;
         staging.write_data(&bytes, &core_bytes, &dynamic_bytes)?;
         let bundled = active.generation.is_none()
-            && copy_bundled_jackets(&staging, preparation.bundled, &core, cancel)?;
+            && copy_bundled_jackets(&staging, job.bundled, &core, cancel)?;
         if needs.jackets && !bundled {
             let zip = http::download(
                 &source.asset(&tag, feed::JACKETS_FILE)?,
@@ -1166,9 +1142,9 @@ fn check(
                 feed::JACKETS_TIMEOUT_SECS,
                 cancel,
             )
-            .map_err(|e| Failure::http("jackets", e))?;
+            .map_err(|e| CheckFailure::http("jackets", e))?;
             for jacket in feed::archive::read_jackets(&zip, &manifest.jackets, &core)? {
-                interrupted(cancel)?;
+                feed::ensure_running(cancel)?;
                 staging.write_jacket(jacket.id, jacket.bytes)?;
             }
         } else if !needs.jackets {
@@ -1176,49 +1152,44 @@ fn check(
                 .generation
                 .as_ref()
                 .ok_or_else(|| feed::Error::invalid("missing active jackets"))?;
-            copy_jackets(&staging, previous, &core, cancel)?;
+            staging.copy_jackets(&previous.path, &core, cancel)?;
         }
         let (generation, (mut catalog, refs)) = staging.finish(|generation| {
-            let refs = prepare_refs(generation, Some(active), refs, cancel, preparation.parallel)?;
-            let catalog =
-                Catalog::from_feed(&generation.core, &generation.dynamic, &generation.path)
-                    .map_err(feed::Error::invalid)?;
-            let cache = refs.to_cache_bytes(&generation.core.feature_signature(FEATURE_VERSION))?;
-            store::atomic_write(&generation.path.join("features.bin"), &cache)?;
-            interrupted(cancel)?;
+            state.begin_preparing(job.state_path, &manifest_hash)?;
+            preparing = true;
+            let refs = prepare_refs(generation, Some(active), job.refs, cancel, job.parallel)?;
+            let catalog = feed_catalog(generation)?;
+            feed::ensure_running(cancel)?;
             Ok((catalog, refs))
         })?;
-        catalog.jacket_dir = generation.path.join("jackets");
+        // 준비할 땐 staging 폴더였음, 옮긴 세대 폴더의 재킷을 보게 함
+        catalog.jacket_dir = generation.path.join(store::JACKETS_DIR);
         Ok(make_ready(generation, catalog, refs, active))
     })();
-    state.finish_preparing(state_path)?;
+    if preparing {
+        state.finish_preparing(job.state_path);
+    }
     result.map(Some)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn prepare_existing(
     generation: Generation,
-    state_path: &Path,
-    id: u64,
+    job: &CheckJob<'_>,
     state: &mut UpdateState,
     active: &Active,
-    previous: Option<&Arc<RefSet>>,
-    cancel: &AtomicBool,
-    events: &mpsc::Sender<Event>,
-    parallel: bool,
-) -> Result<Option<Ready>, Failure> {
-    if !state.begin_preparing(state_path, &generation.manifest_hash)? {
+) -> Result<Option<Ready>, CheckFailure> {
+    if !state.can_prepare(&generation.manifest_hash, active.has_data()) {
         return Ok(None);
     }
-    let _ = events.send(Event::Preparing(id));
+    state.begin_preparing(job.state_path, &generation.manifest_hash)?;
+    let _ = job.events.send(Event::Preparing(job.id));
     let result = (|| {
-        let refs = prepare_refs(&generation, Some(active), previous, cancel, parallel)?;
-        let catalog = Catalog::from_feed(&generation.core, &generation.dynamic, &generation.path)
-            .map_err(feed::Error::invalid)?;
-        interrupted(cancel)?;
+        let refs = prepare_refs(&generation, Some(active), job.refs, job.cancel, job.parallel)?;
+        let catalog = feed_catalog(&generation)?;
+        feed::ensure_running(job.cancel)?;
         Ok(make_ready(generation, catalog, refs, active))
     })();
-    state.finish_preparing(state_path)?;
+    state.finish_preparing(job.state_path);
     result.map(Some)
 }
 
@@ -1234,22 +1205,9 @@ fn make_ready(
             notice: previous.snapshot.changes_to(&snapshot),
             ..Summary::default()
         },
-        |old| {
-            Summary::between(
-                &old.core,
-                &old.dynamic,
-                &generation.core,
-                &generation.dynamic,
-            )
-        },
+        |old| Summary::between(&previous.snapshot, &old.dynamic, &snapshot, &generation.dynamic),
     );
-    let titles = Arc::new(
-        catalog
-            .songs
-            .iter()
-            .map(|s| (s.id, s.name.clone()))
-            .collect(),
-    );
+    let titles = catalog.titles();
     Ready {
         catalog,
         refs,
@@ -1296,9 +1254,17 @@ fn notice_text(notice: &Notice, recognized: bool) -> Option<String> {
     Some(text)
 }
 
+/// 받아 둔 세대의 상태 줄 문구, 세대가 없으면 None
+fn data_status(active: &Active) -> Option<String> {
+    active
+        .generation
+        .as_ref()
+        .map(|g| success_text(&g.manifest.published_at, &Summary::default()))
+}
+
 fn success_text(published: &str, summary: &Summary) -> String {
     let mut text = published_label(published).map_or_else(
-        || "곡 데이터 확인됨".into(),
+        || CHECKED_TEXT.into(),
         |date| format!("곡 데이터 {date}"),
     );
     for (count, label) in [

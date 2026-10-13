@@ -199,7 +199,7 @@ enum Sheet {
 /// 결과 자리에 뜨는 안내 카드, 모두 같은 높이 (`CARD_H`)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Card {
-    /// 첫 실행에 곡 데이터를 받는 중, 버튼 없음
+    /// 받아 둔 곡 데이터가 없어 받는 중, 버튼 없음
     Loading,
     /// 곡 데이터를 받지 못함
     Failed,
@@ -953,11 +953,6 @@ impl Popup {
         std::mem::take(&mut self.version_seen)
     }
 
-    #[allow(dead_code)]
-    pub fn dynamic(&self) -> Option<&dmpicker_update::Dynamic> {
-        self.catalog.dynamic()
-    }
-
     pub fn has_recognition(&self) -> bool {
         self.owned.is_some()
     }
@@ -1054,7 +1049,7 @@ impl Popup {
         }
     }
 
-    /// 새 버전 안내 카드가 지금 보임, 그린 프레임마다 기록할 걸로 남김 (`take_version_seen`)
+    /// 새 버전 안내 카드가 이번 프레임에 보이는지, 기록은 `presented`에서
     fn version_card_visible(&self) -> bool {
         self.sheet == Sheet::Card
             && self.card_now == Some(Card::Update)
