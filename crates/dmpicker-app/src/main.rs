@@ -13,6 +13,7 @@ mod hands;
 mod hotkey;
 mod http;
 mod icons;
+mod ime;
 mod keywords;
 mod pace;
 mod playlist;
@@ -539,9 +540,8 @@ fn stop_updates(a: &mut App) {
     a.updates.stop();
 }
 
-/// 트레이 메뉴 종료와 Windows 종료·로그오프: 돌던 작업을 취소하고 아이콘을 지운 뒤 메시지 루프를 끝냄
 /// 데이터 작업은 끝날 때까지 기다림, 인식·이동은 누르던 키를 떼게 최대 1초만 기다림
-fn quit(a: &mut App) {
+fn stop_all(a: &mut App) {
     if let Some((cancel, _)) = &a.job { cancel.store(true, Ordering::Relaxed); }
     stop_updates(a);
     if let Some((_, handle)) = a.job.take() {
@@ -556,6 +556,13 @@ fn quit(a: &mut App) {
     for handle in a.retired_jobs.drain(..) {
         if handle.is_finished() { let _ = handle.join(); }
     }
+    // 기다려도 안 끝난 이동이 영문으로 바꿔 둔 게임 입력기
+    ime::restore_now();
+}
+
+/// 트레이 메뉴 종료와 Windows 종료·로그오프: 돌던 작업을 취소하고 아이콘을 지운 뒤 메시지 루프를 끝냄
+fn quit(a: &mut App) {
+    stop_all(a);
     a.tray.remove();
     unsafe { PostQuitMessage(0) };
 }
@@ -665,6 +672,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
 
 fn main() -> Result<()> {
     capture::init_dpi_awareness();
+    // panic = "abort"여도 훅은 끝나기 전에 돎
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        ime::restore_on_panic();
+        default_hook(info);
+    }));
 
     unsafe {
         CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
@@ -673,6 +686,8 @@ fn main() -> Result<()> {
             eprintln!("DmPicker is already running");
             return Ok(());
         }
+        // 다른 인스턴스가 이동 중일 수 있어서 단일 실행을 확인한 뒤에
+        ime::recover();
 
         let dir = match data_dir() {
             Ok(dir) => dir,
@@ -738,7 +753,7 @@ fn main() -> Result<()> {
             if animating {
                 while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
                     if msg.message == WM_QUIT {
-                        if let Some(a) = app() { stop_updates(a); }
+                        if let Some(a) = app() { stop_all(a); }
                         return Ok(());
                     }
                     let _ = TranslateMessage(&msg);
@@ -764,7 +779,7 @@ fn main() -> Result<()> {
                 frame_start = std::time::Instant::now();
             } else {
                 if !GetMessageW(&mut msg, None, 0, 0).as_bool() {
-                    if let Some(a) = app() { stop_updates(a); }
+                    if let Some(a) = app() { stop_all(a); }
                     return Ok(());
                 }
                 let _ = TranslateMessage(&msg);
