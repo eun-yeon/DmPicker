@@ -1536,6 +1536,21 @@ impl Popup {
         rect(b.right - self.px(8.0 + lay::COND_W), cy - self.px(15.0), b.right - self.px(8.0), cy + self.px(15.0))
     }
 
+    /// 바에 채보 "4B · HD"가 보임, 키워드 입력 중과 결과 화면의 플레이리스트 주소엔 안 보임
+    /// 주소는 검색을 기다리지 않고 지금 글로 봄, 붙여 넣는 순간 입력 칸도 같이 넓어져 글이 나중에 안 튐
+    fn shows_cond(&self) -> bool {
+        match self.view {
+            View::Keywords => false,
+            View::Results => playlist::id(self.edit.text()).is_none(),
+            View::Settings | View::History => true,
+        }
+    }
+
+    /// 입력 칸 오른쪽 끝, 채보가 안 보이면 그 자리까지 써서 채보 글 끝과 같은 16 정렬선
+    fn text_right(&self) -> f32 {
+        if self.shows_cond() { self.cond_rect().left - self.px(8.0) } else { self.bar_rect().right - self.px(16.0) }
+    }
+
     fn text_origin(&self) -> (f32, f32) {
         let b = self.bar_rect();
         (b.left + self.px(46.0), b.top)
@@ -1810,7 +1825,7 @@ impl Popup {
         }
         let bar = self.bar_rect();
         if inside(&bar, x, y) {
-            return if x < self.cond_rect().left - self.px(8.0) { Hit::Text } else { Hit::Inside };
+            return if x < self.text_right() { Hit::Text } else { Hit::Inside };
         }
         // 그려진 대로 판정: 시트는 비켜난 자리, 내용은 같이 비켜난 자리 (`dy`)
         // 반 넘게 보이기 전엔 줄·버튼을 못 누름
@@ -2535,11 +2550,6 @@ impl Popup {
         let m = self.rolls.choices(&self.results).0.count();
         let left = if m < n { format!(" ({m}곡 남음)") } else { String::new() };
         Some(format!("{n}곡 중 하나{left}"))
-    }
-
-    /// 플레이리스트 결과를 보는 중 (바의 채보 글자를 숨김), 입력 중인 주소가 아니라 검색한 결과 기준
-    fn playlist_results(&self) -> bool {
-        self.view == View::Results && self.playlist.as_ref().is_some_and(|p| playlist::id(&self.searched) == Some(&p.id))
     }
 
     /// 그리는 시트가 플레이리스트 결과, 아래 칸처럼 검색어를 지워 사라지는 동안에도 그대로
@@ -4115,9 +4125,9 @@ impl Popup {
 
             // 곡 이동 때 고를 채보 "4B · HD", 보여주기만 함 (설정은 톱니 버튼이나 Tab으로 엶)
             // 레벨 조건 검색 중엔 실제로 적용될 모드·난이도, 키워드 입력 중엔 안 보임
-            // 플레이리스트 결과는 항목마다 채보가 정해져 있어 안 보임
-            let cr = self.cond_rect();
-            if !keywords && !self.playlist_results() {
+            // 플레이리스트는 항목마다 채보가 정해져 있어 안 보임 (`shows_cond`)
+            if self.shows_cond() {
+                let cr = self.cond_rect();
                 let searching = matches!(self.view, View::Results | View::History);
                 let cond = match self.catalog.parse_filter(&self.searched).filter(|_| searching) {
                     Some(Filter { level: Some(q), .. }) => format!("{} · {}", q.mode.unwrap_or(self.mode_choice).label(), q.diff.label()),
@@ -4131,7 +4141,7 @@ impl Popup {
             }
 
             let (tx, _) = self.text_origin();
-            let tw = (cr.left - self.px(8.0) - tx).max(10.0);
+            let tw = (self.text_right() - tx).max(10.0);
             let q = self.query();
             if q.is_empty() {
                 let ph = g.brush(FAINT)?;
