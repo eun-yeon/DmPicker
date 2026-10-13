@@ -89,9 +89,6 @@ const BEAD_HISTORY: usize = 0;
 const BEAD_GEAR: usize = 1;
 /// 두 버튼 시차: 나올 땐 히스토리 다음 톱니, 들어갈 땐 톱니 다음 히스토리
 const BEAD_STAGGER: Duration = Duration::from_millis(70);
-/// 두 버튼 스프링 (stiffness, damping): 나올 땐 튀고, 들어갈 땐 임계 감쇠라 바가 되튀지 않고 나올 때보다 빨리 멈춤
-const BEAD_OUT: (f32, f32) = (300.0, 17.0);
-const BEAD_IN: (f32, f32) = (439.0, 42.0);
 
 /// 논리 (96 dpi) 레이아웃, 검색창 전체 너비는 늘 `W`
 mod lay {
@@ -695,11 +692,11 @@ pub struct Popup {
     hover: Hit,
     // 애니메이션
     open_s: Spring,      // 띄울 때 0에서 1로 (살짝 튐)
-    reveal: [Spring; 2], // 버튼별 0 숨김 .. 1 표시 (하나당 바가 54 줄어듦), 나올 때만 튐
+    reveal: [Spring; 2], // 버튼별 0 숨김 .. 1 표시 (하나당 바가 54 줄어듦), 튐
     beads_out: bool,     // 두 버튼을 내보내는 중 (스프링은 시차를 두고 따라감)
     reveal_follow: Option<(Instant, usize, f32)>, // 시차 뒤에 움직일 버튼과 목표
     icon_alpha: Tween,      // 두 버튼 아이콘
-    panel_h: Spring,        // 보이는 패널의 높이, 내용이 바뀔 때만 움직임 (임계 감쇠라 안 튐)
+    panel_h: Spring,        // 보이는 패널의 높이, 내용이 바뀔 때만 움직임
     shown: Tween,           // 패널 보임 0 .. 1, 나타나고 사라질 때의 페이드
     close: Tween,           // 닫는 동안 0에서 1로
     sel_y: Spring,          // 선택 강조 위쪽, 패널 px (높이는 한 줄)
@@ -889,11 +886,11 @@ impl Popup {
             keyword_edit: None,
             hover: Hit::None,
             open_s: OPEN_SPRING,
-            reveal: [Spring::new(0.0, BEAD_OUT.0, BEAD_OUT.1); 2],
+            reveal: [Spring::new(0.0, 300.0, 17.0); 2],
             beads_out: false,
             reveal_follow: None,
             icon_alpha: Tween::new(0.0),
-            panel_h: Spring::new(0.0, 322.0, 36.0),
+            panel_h: Spring::new(0.0, 330.0, 29.0),
             shown: Tween::new(0.0),
             close: Tween::new(0.0),
             sel_y: SEL_SPRING,
@@ -2847,8 +2844,6 @@ impl Popup {
             return;
         }
         self.beads_out = want;
-        let feel = if want { BEAD_OUT } else { BEAD_IN };
-        self.reveal.iter_mut().for_each(|r| r.tune(feel));
         // 들어갈 땐 지금 민 거리에서 바와 같이 돌아옴 (`return_scroll`)
         let r = self.bar_reveal();
         self.text_return = (!want && r > 0.0).then_some((self.text_scroll, r));
@@ -3929,7 +3924,7 @@ impl Popup {
             // 3) 패널 내용 기록: 7)에서 이걸 그리고, 다음 프레임에 보기·카드·탭이 바뀌면 흐려 보냄 (`Crossfade`)
             // 히스토리 줄 목록은 탭만 바뀔 때 혼자 흐려 보내려고 먼저 따로 기록
             if has_panel {
-                let list = if self.sheet == Sheet::History { Some(record(dc, &draw_list)?) } else { None };
+                let list = if self.sheet == Sheet::History { Some(record(dc, draw_list)?) } else { None };
                 sheet_drawn = Some(record(dc, || draw_sheet(list.as_ref()))?);
                 list_drawn = list;
             }
