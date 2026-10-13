@@ -805,7 +805,7 @@ const NO_FRAME: &str = "게임 화면을 읽지 못했어요";
 /// 곡 목록이 없음, 작업 시작 때부터 없거나 도중에 사라짐
 const NOT_HERE: &str = "선곡 화면에서 다시 시도해 주세요";
 const TAB_ASK: &str = "ALL TRACK 탭으로 바꾼 뒤 다시 시도해 주세요";
-/// 온라인 방에선 방장만 목록을 움직임, 방장은 늘 1P 자리
+/// 온라인 방에선 방장만 목록을 움직임
 const NOT_HOST: &str = "방장만 곡을 고를 수 있어요";
 /// 앞뒤가 안 맞는 인식 (오인식, 키와 다르게 움직인 목록), 저장 안 함
 const MISREAD: &str = "목록을 제대로 읽지 못했어요. 다시 인식해 주세요";
@@ -1760,7 +1760,7 @@ pub fn run_pick(ctx: &Ctx, song: u32, mode: ButtonMode, diff: usize, cancel: &At
         Err(r) => return r,
     };
     // 방장이 아니면 키를 하나도 안 누름, 화면을 못 읽으면 막지 않음
-    if screen.grab().is_ok_and(|img| room::guest_seat(&img)) {
+    if screen.grab().is_ok_and(|img| room::not_host(&img)) {
         return JobResult::Failed(NOT_HOST.into());
     }
     eprintln!("job: focused, reading screen");
