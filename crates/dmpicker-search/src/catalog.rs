@@ -81,6 +81,9 @@ impl Diff {
     }
 }
 
+/// 패턴 하나의 특성 (이름, 0..=3)
+pub type PatternTags = Vec<(String, u8)>;
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Song {
     /// djmax.gg 숫자 곡 id (core.json `id`, 재킷 파일 이름과 같음)
@@ -110,6 +113,8 @@ pub struct Song {
     pub levels: [[Option<u8>; 4]; 4],
     /// 서열표 난이도 `[mode][diff]` (djmax.gg `floor`, 소수 한 자리), 모든 SC와 일부 NM·HD·MX에 있음
     pub floors: [[Option<f32>; 4]; 4],
+    /// 패턴 특성 `[mode][diff]` (특성 이름, 0..=3), 평가가 없는 패턴은 None
+    pub pattern_tags: [[Option<PatternTags>; 4]; 4],
 }
 
 impl Song {
@@ -121,6 +126,11 @@ impl Song {
     #[inline]
     pub fn floor(&self, mode: Mode, diff: Diff) -> Option<f32> {
         self.floors[mode.index()][diff.index()]
+    }
+
+    #[inline]
+    pub fn pattern_tags(&self, mode: Mode, diff: Diff) -> Option<&[(String, u8)]> {
+        self.pattern_tags[mode.index()][diff.index()].as_deref()
     }
 }
 
@@ -187,6 +197,18 @@ impl Catalog {
                         }
                     }
                 }
+                let mut pattern_tags: [[Option<PatternTags>; 4]; 4] = Default::default();
+                for info in dynamic.pattern_info.get(&s.id).into_iter().flatten() {
+                    // 특성이 하나도 없으면 아직 평가 안 된 패턴
+                    if info.tags.is_empty() {
+                        continue;
+                    }
+                    let m = FeedMode::ALL.iter().position(|&m| m == info.mode);
+                    let d = Difficulty::ALL.iter().position(|&d| d == info.difficulty);
+                    if let (Some(m), Some(d)) = (m, d) {
+                        pattern_tags[m][d] = Some(info.tags.iter().map(|(name, &v)| (name.clone(), v)).collect());
+                    }
+                }
                 Ok(Song {
                     id: s.id,
                     name: s.name.clone(),
@@ -203,6 +225,7 @@ impl Catalog {
                     user_keys: Vec::new(),
                     levels,
                     floors,
+                    pattern_tags,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;

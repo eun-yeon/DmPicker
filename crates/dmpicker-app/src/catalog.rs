@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub use dmpicker_search::Song;
-use dmpicker_search::{Filter, Mode, Searcher};
+use dmpicker_search::{Diff, Filter, Mode, Searcher, TagNames};
 use dmpicker_update::store::JACKETS_DIR;
 
 use crate::keywords::{Keywords, UNREADABLE};
@@ -13,6 +13,7 @@ use crate::keywords::{Keywords, UNREADABLE};
 pub struct Catalog {
     pub songs: Vec<Song>,
     searcher: Searcher,
+    tag_names: TagNames,
     pub jacket_dir: PathBuf,
     keywords: Option<Keywords>,
 }
@@ -22,14 +23,15 @@ impl Catalog {
     pub fn empty(data_dir: &Path) -> Self {
         let cat = dmpicker_search::Catalog { songs: Vec::new() };
         let searcher = Searcher::new(&cat);
-        Self { songs: cat.songs, searcher, jacket_dir: data_dir.join(JACKETS_DIR), keywords: None }
+        Self { songs: cat.songs, searcher, tag_names: TagNames::default(), jacket_dir: data_dir.join(JACKETS_DIR), keywords: None }
     }
 
     /// 검증된 세대의 곡과 패턴을 검색 목록으로 준비
     pub fn from_feed(core: &dmpicker_update::Core, dynamic: &dmpicker_update::Dynamic, data_dir: &Path) -> Result<Self, String> {
         let cat = dmpicker_search::Catalog::from_feed(core, dynamic)?;
         let searcher = Searcher::new(&cat);
-        Ok(Self { songs: cat.songs, searcher, jacket_dir: data_dir.join(JACKETS_DIR), keywords: None })
+        let tag_names = TagNames::from_songs(&cat.songs);
+        Ok(Self { songs: cat.songs, searcher, tag_names, jacket_dir: data_dir.join(JACKETS_DIR), keywords: None })
     }
 
     /// 곡 id별 제목, 작업 스레드와 나눠 씀
@@ -78,8 +80,13 @@ impl Catalog {
         self.searcher.search_where(query, limit, |i| self.allowed(i, owned)).into_iter().map(|h| h.index).collect()
     }
 
-    /// 조건 검색: `f`에 맞는 곡의 `songs` 인덱스 전부 (개수 제한 없음), 레벨 조건은 모드 `mode`로 봄
-    pub fn filter(&self, f: &Filter, mode: Mode, owned: Option<&HashSet<u32>>) -> Vec<usize> {
+    /// 검색어가 조건 검색이면 그 조건, 패턴 특성 이름은 지금 곡 데이터에 있는 것만
+    pub fn parse_filter(&self, query: &str) -> Option<Filter> {
+        Filter::parse(query, &self.tag_names)
+    }
+
+    /// 조건 검색: `f`에 맞는 (`songs` 인덱스, 패턴 난이도) 전부 (개수 제한 없음), 패턴은 모드 `mode`로 봄
+    pub fn filter(&self, f: &Filter, mode: Mode, owned: Option<&HashSet<u32>>) -> Vec<(usize, Option<Diff>)> {
         f.find(&self.songs, mode, |i| self.allowed(i, owned))
     }
 

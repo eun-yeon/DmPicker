@@ -3,12 +3,13 @@
 //!
 //! * 모드 4b·5b·6b·8b (없으면 설정의 모드), 난이도 nm·hd·mx·sc (꼭 있어야 함), 레벨 1..15
 //! * 범위 구분은 '-' 또는 '~', 양 끝 포함, 거꾸로 쓴 범위도 받음
+//! * 한쪽 끝을 비우면 그 이상·이하 ("sc14~", "sc~14")
 //! * 난이도가 없으면 ("15", "4b15") 숫자가 든 곡 이름을 찾는 텍스트 검색
 //! * 대소문자·공백 무시
 //! * 한글 모드로 친 것도 받음, 자모를 2벌식 자판의 영문 키로 읽음 ("ㄴㅊ15"는 sc15)
 
 use crate::catalog::{Diff, Mode, Song};
-use crate::filter::keys;
+use crate::filter::{keys, range};
 
 const MODE_KEYS: [(&str, Mode); 4] = [("4b", Mode::B4), ("5b", Mode::B5), ("6b", Mode::B6), ("8b", Mode::B8)];
 const DIFF_KEYS: [(&str, Diff); 4] = [("nm", Diff::NM), ("hd", Diff::HD), ("mx", Diff::MX), ("sc", Diff::SC)];
@@ -44,10 +45,8 @@ impl LevelQuery {
         let diff = DIFF_KEYS.iter().find(|(k, _)| take(k)).map(|&(_, d)| d)?;
         // 레벨은 숫자 한두 자리, `parse`가 받는 '+'는 `keys`에서 이미 걸러짐
         let parse_level = |s: &str| s.parse::<u8>().ok().filter(|l| s.len() <= 2 && (1..=15).contains(l));
-        // 범위는 구분자 하나로 이은 두 레벨, 구분자가 더 있으면 뒤쪽이 숫자가 아니라서 걸림
-        let (a, b) = rest.split_once(['-', '~']).unwrap_or((rest, rest));
-        let (a, b) = (parse_level(a)?, parse_level(b)?);
-        Some(LevelQuery { mode, diff, lo: a.min(b), hi: a.max(b) })
+        let (lo, hi) = range(rest, parse_level, 1, 15)?;
+        Some(LevelQuery { mode, diff, lo, hi })
     }
 
     /// 모드 `mode` (실제로 적용할 모드)에서 이 난이도·레벨 범위인 패턴이 있음

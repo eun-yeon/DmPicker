@@ -895,7 +895,7 @@ impl Popup {
             self.playlist_request = None;
             self.find(&query)
         };
-        self.bpm_rows = Filter::parse(&query).is_some_and(|f| f.bpm.is_some());
+        self.bpm_rows = self.catalog.parse_filter(&query).is_some_and(|f| f.bpm.is_some());
         self.searched.clear();
         self.reset_rows();
         self.panel_h.snap(0.0);
@@ -1914,7 +1914,7 @@ impl Popup {
         let norm = dmpicker_search::normalize(word);
         let why = if norm.is_empty() {
             Some("글자나 숫자를 넣어 주세요")
-        } else if Filter::parse(word).is_some() {
+        } else if self.catalog.parse_filter(word).is_some() {
             Some("sc15나 bpm150 같은 조건 검색어는 키워드로 쓸 수 없어요")
         } else if song.user_keys.iter().any(|k| dmpicker_search::normalize(k) == norm) {
             Some("이미 있는 키워드예요")
@@ -2261,7 +2261,7 @@ impl Popup {
                 self.playlist_request = None;
                 self.results = self.find(&q);
             }
-            self.bpm_rows = Filter::parse(&q).is_some_and(|f| f.bpm.is_some());
+            self.bpm_rows = self.catalog.parse_filter(&q).is_some_and(|f| f.bpm.is_some());
             if self.sel_of == Sheet::Results {
                 self.reset_rows();
             }
@@ -2505,14 +2505,14 @@ impl Popup {
     }
 
     /// 검색어로 찾은 줄: 조건 검색이면 무작위 줄과 맞는 줄 전부, 아니면 잘 맞는 곡
-    /// 레벨 조건이 있으면 그 패턴, BPM 조건만이면 곡 (설정의 모드·난이도로 이동)
+    /// 레벨이나 패턴 특성 조건이 있으면 맞는 패턴마다, BPM 조건만이면 곡 (설정의 모드·난이도로 이동)
     fn find(&self, q: &str) -> Vec<Row> {
-        let Some(f) = Filter::parse(q) else {
+        let Some(f) = self.catalog.parse_filter(q) else {
             return self.catalog.search(q, LIMIT, self.owned.as_ref()).into_iter().map(Row::Song).collect();
         };
         let mode = f.level.and_then(|l| l.mode).unwrap_or(self.mode_choice);
-        let row = |i| match f.level {
-            Some(l) => Row::Chart(i, mode, l.diff),
+        let row = |(i, diff)| match diff {
+            Some(d) => Row::Chart(i, mode, d),
             None => Row::Song(i),
         };
         let hits = self.catalog.filter(&f, mode, self.owned.as_ref());
@@ -2755,10 +2755,10 @@ impl Popup {
         self.set_mode(Mode::ALL[i]);
     }
 
-    /// 모드를 정하지 않은 레벨 조건 검색은 설정 모드의 패턴이라 다시 찾음
+    /// 모드를 정하지 않은 레벨·패턴 특성 조건 검색은 설정 모드의 패턴이라 다시 찾음
     fn set_mode(&mut self, m: Mode) {
         self.mode_choice = m;
-        if Filter::parse(&self.searched).and_then(|f| f.level).is_some_and(|l| l.mode.is_none()) {
+        if self.catalog.parse_filter(&self.searched).is_some_and(|f| f.uses_mode_setting()) {
             self.searched.clear();
             self.search_now();
         }
@@ -3620,11 +3620,12 @@ impl Popup {
             // 플레이리스트 결과는 항목마다 채보가 정해져 있어 안 보임
             let cr = self.cond_rect();
             if !keywords && !self.playlist_results() {
-                let (cm, cd) = match Filter::parse(&self.searched).and_then(|f| f.level).filter(|_| self.view == View::Results) {
-                    Some(q) => (q.mode.unwrap_or(self.mode_choice), q.diff),
-                    None => (self.mode_choice, self.diff_choice),
+                let cond = match self.catalog.parse_filter(&self.searched).filter(|_| self.view == View::Results) {
+                    Some(Filter { level: Some(q), .. }) => format!("{} · {}", q.mode.unwrap_or(self.mode_choice).label(), q.diff.label()),
+                    // 레벨 조건 없이 특성 조건이 있으면 난이도는 줄마다 달라서 모드만
+                    Some(c) if !c.tags.is_empty() => self.mode_choice.label().to_owned(),
+                    _ => format!("{} · {}", self.mode_choice.label(), self.diff_choice.label()),
                 };
-                let cond = format!("{} · {}", cm.label(), cd.label());
                 let cl_ = g.layout_centered(&cond, &f.small, cr.right - cr.left, cr.bottom - cr.top)?;
                 dc.DrawTextLayout(gfx::pt(cr.left, cr.top), &cl_, &sub_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
             }
