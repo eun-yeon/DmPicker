@@ -13,7 +13,6 @@ mod hands;
 mod hotkey;
 mod http;
 mod icons;
-mod ime;
 mod keywords;
 mod pace;
 mod playlist;
@@ -555,8 +554,6 @@ fn stop_all(a: &mut App) {
     for handle in a.retired_jobs.drain(..) {
         if handle.is_finished() { let _ = handle.join(); }
     }
-    // 기다려도 안 끝난 이동이 영문으로 바꿔 둔 게임 입력기
-    ime::restore_now();
 }
 
 /// 트레이 메뉴 종료와 Windows 종료·로그오프: 돌던 작업을 취소하고 아이콘을 지운 뒤 메시지 루프를 끝냄
@@ -671,12 +668,6 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
 
 fn main() -> Result<()> {
     capture::init_dpi_awareness();
-    // panic = "abort"여도 훅은 끝나기 전에 돎
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        ime::restore_on_panic();
-        default_hook(info);
-    }));
 
     unsafe {
         CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
@@ -685,8 +676,6 @@ fn main() -> Result<()> {
             eprintln!("DmPicker is already running");
             return Ok(());
         }
-        // 다른 인스턴스가 이동 중일 수 있어서 단일 실행을 확인한 뒤에
-        ime::recover();
 
         let dir = match data_dir() {
             Ok(dir) => dir,

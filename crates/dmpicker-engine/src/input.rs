@@ -13,6 +13,7 @@
 //! * 게임은 프레임마다 한 번 키 상태를 읽어서 누름과 뗌을 각각 1프레임 이상 유지해야 함
 //!   ~40 ms면 ~25 fps까지 안전, 60 fps가 안정적이면 17 ms도 됨
 //! * 가짜 포커스 메시지는 절대 안 보냄
+//! * 글자 키만 게임 창에 바로 넣음, 키보드 길로 보내면 입력기가 한글일 때 조합으로 바뀜
 
 use std::fmt;
 use std::thread::sleep;
@@ -22,7 +23,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, VIRTUAL_KEY,
 };
-use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, SetForegroundWindow};
+use windows::Win32::Foundation::{LPARAM, WPARAM};
+use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, PostMessageW, SetForegroundWindow, WM_KEYDOWN, WM_KEYUP};
 
 use crate::capture::Hwnd;
 
@@ -126,6 +128,11 @@ impl Key {
         let u = c.to_ascii_uppercase();
         u.is_ascii_uppercase()
             .then(|| Key::LETTERS[(u as u8 - b'A') as usize])
+    }
+
+    /// 글자 키의 가상 키 코드 ('A'..'Z')
+    pub fn letter_vk(self) -> Option<u8> {
+        Key::LETTERS.iter().position(|&k| k == self).map(|i| b'A' + i as u8)
     }
 
     /// Set-1 기준 scan code
@@ -275,6 +282,15 @@ fn send(key: Key, up: bool) {
     send_scan(key.scan(), key_flags(key, up));
 }
 
+/// 뗌은 이전 상태·전환 비트(30, 31)를 켬
+fn post_letter(game: Hwnd, vk: u8, scan: u16, up: bool) {
+    let (msg, bits) = if up { (WM_KEYUP, 0xC000_0001) } else { (WM_KEYDOWN, 1) };
+    let lparam = bits | (scan as isize) << 16;
+    unsafe {
+        let _ = PostMessageW(Some(game.raw()), msg, WPARAM(vk as usize), LPARAM(lparam));
+    }
+}
+
 fn ms(v: u64) {
     if v > 0 {
         sleep(Duration::from_millis(v));
@@ -283,7 +299,10 @@ fn ms(v: u64) {
 
 /// 키 하나 누르고 뗌 (포커스 확인, 누름, `hold_ms` 유지, 포커스 확인, 뗌, `gap_ms` 대기)
 pub fn press(game: Hwnd, key: Key, hold_ms: u64, gap_ms: u64) -> Result<(), FocusLost> {
-    tap(game, |up| send(key, up), hold_ms, gap_ms)
+    match key.letter_vk() {
+        Some(vk) => tap(game, |up| post_letter(game, vk, key.scan(), up), hold_ms, gap_ms),
+        None => tap(game, |up| send(key, up), hold_ms, gap_ms),
+    }
 }
 
 /// 정렬 창 키용 [`press`]

@@ -1694,8 +1694,6 @@ pub fn run_scan(ctx: &Ctx, cancel: &AtomicBool, mut progress: impl FnMut(ScanSta
             // 제목 순서가 거꾸로 가는 곳은 양옆 중 한 칸이 오인식일 가능성이 큼
             let doubtful = recheck_targets(doubtful, &l, &ctx.titles);
             let at = Instant::now();
-            // 다시 보기도 글자 키로 건너뜀
-            let _latin = crate::ime::LatinInput::new(screen.game, cancel);
             if let Err(stop) = recheck(&screen, ctx, &mut l, &doubtful, cancel, &hands, |done| progress(ScanStage::Rechecking(done, doubtful.len()))) {
                 return stop.into();
             }
@@ -1798,8 +1796,6 @@ pub fn run_pick(ctx: &Ctx, song: u32, mode: ButtonMode, diff: usize, cancel: &At
             Err(stop) => return stop.into(),
         }
     }
-    // 글자 키로 건너뛰는 이동, 이 함수를 나갈 때 입력기를 원래대로
-    let _latin = crate::ime::LatinInput::new(screen.game, cancel);
     let mut first_rows = Some(rows);
     // 온라인엔 목록에 없는 LOCKED 곡이 보일 수 있음, 하나씩 익히고 다시 이동
     for _ in 0..4 {
