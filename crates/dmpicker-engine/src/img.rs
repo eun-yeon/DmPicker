@@ -1,5 +1,5 @@
 //! packed RGB8 이미지 타입과 엔진에 필요한 필터 몇 개 (분리형 가우시안 블러, 안티앨리어싱 bilinear 축소)
-//! 외부 이미지 처리 라이브러리는 안 씀
+//! 필터는 직접 구현, 디코딩만 image 크레이트
 
 use std::path::Path;
 
@@ -252,7 +252,7 @@ pub struct Op1d {
 impl Op1d {
     /// 가우시안 블러(표준편차 `sigma`, 가장자리는 끝 값으로 채움) 뒤 `in_len`개 샘플을 `out_len`개로
     /// 안티앨리어싱 bilinear 리샘플 (축소 비율만큼 폭이 넓어지는 삼각 필터)
-    /// `sigma <= 0`이면 블러 없음, `out_len == in_len`이면 리샘플 없음
+    /// `sigma <= 0.05`면 블러 없음, `out_len == in_len`이면 리샘플 없음
     pub fn blur_resize(in_len: usize, out_len: usize, sigma: f32) -> Op1d {
         assert!(in_len > 0 && out_len > 0);
         let n = in_len as i64;

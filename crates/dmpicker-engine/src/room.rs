@@ -5,6 +5,7 @@
 
 use std::sync::OnceLock;
 
+use crate::features::dot;
 use crate::geom::find_list;
 use crate::img::{luma_feature, Rect, Rgb};
 use crate::state::{layout_kind, ScreenKind, MIN_ROWS, ONLINE_BAR_X};
@@ -58,7 +59,7 @@ fn f4_scores(img: &Rgb) -> Option<(f32, f32)> {
     let v = img.sub(r);
     let lit = (0..v.height).flat_map(|y| v.row(y).chunks_exact(3)).filter(|p| light([p[0], p[1], p[2]])).count();
     let lit = lit as f32 / (v.width * v.height) as f32;
-    let m = luma_feature(v, THUMB, THUMB).iter().zip(template()).map(|(a, b)| a * b).sum();
+    let m = dot(&luma_feature(v, THUMB, THUMB), template());
     Some((lit, m))
 }
 

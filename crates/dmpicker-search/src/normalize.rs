@@ -20,16 +20,13 @@ pub(crate) struct NormChar {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Script {
     Latin,
-    Digit,
     Hangul,
     Cjk,
     Other,
 }
 
 fn script(c: char) -> Script {
-    if c.is_ascii_digit() {
-        Script::Digit
-    } else if c.is_ascii_alphabetic() || ('\u{00C0}'..='\u{024F}').contains(&c) {
+    if c.is_ascii_alphabetic() || ('\u{00C0}'..='\u{024F}').contains(&c) {
         Script::Latin
     } else if hangul::is_hangul(c) {
         Script::Hangul

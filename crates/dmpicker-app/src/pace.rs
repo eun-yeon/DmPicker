@@ -38,7 +38,8 @@ impl Pace {
             self.run = 0;
         } else if first < presses {
             // 놓쳤거나 늦은 입력, 한 단계 느리게 하되 25 ms보다 느려지진 않음
-            self.burnt = self.burnt.max(self.ms);
+            // 25 ms와 그보다 느린 속도는 안 태움, 태우면 멈춤으로 느려진 뒤 25 ms로 못 돌아옴
+            self.burnt = self.burnt.max(self.ms).min(SAFE_MS - 1);
             if let Some(&slower) = PACE_MS.iter().find(|&&p| p > self.ms) {
                 self.ms = slower;
             }

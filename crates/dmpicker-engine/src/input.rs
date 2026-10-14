@@ -86,8 +86,6 @@ pub enum Key {
     Numpad6,
     /// LCtrl과 같이 누르면 8B
     Numpad8,
-    /// 버튼 모드를 4B, 5B, 6B, 8B 순서로 돌림
-    Tab,
     /// 정렬 창
     F4,
 }
@@ -177,7 +175,6 @@ impl Key {
             Key::Numpad5 => 0x4C,
             Key::Numpad6 => 0x4D,
             Key::Numpad8 => 0x48,
-            Key::Tab => 0x0F,
             Key::F4 => 0x3E,
         }
     }

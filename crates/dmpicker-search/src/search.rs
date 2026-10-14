@@ -26,7 +26,7 @@ pub struct Hit {
 }
 
 /// 키의 종류 (점수 등급을 정함)
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
     Name,
     /// core.json `segments` 중 제목 별칭·발음

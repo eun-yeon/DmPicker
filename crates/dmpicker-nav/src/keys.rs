@@ -36,9 +36,6 @@ pub enum Key {
     PgDn,
     /// 글자 키 `'A'..='Z'`: 그 그룹으로 점프, 이미 그룹 안이면 다음 항목
     Letter(char),
-    /// LShift+RShift 동시 누름: 목록 처음으로 (같은 탭)
-    /// 한쪽만 먹히면 Shift 하나로 탭이 바뀌어서 위험, 따로 켜지 않으면 플래너가 안 씀
-    Reset,
     /// 왼쪽 방향키: 이전 난이도 (있는 것만, 순환)
     Left,
     /// 오른쪽 방향키: 다음 난이도 (있는 것만, 순환)
@@ -48,14 +45,14 @@ pub enum Key {
 }
 
 impl Key {
-    /// 커서를 멀리 옮기는 키 (글자, 페이지, 리셋)
+    /// 커서를 멀리 옮기는 키 (글자, 페이지)
     /// 스크롤 애니메이션이 길고, 누락되면 커서가 크게 어긋남
     pub fn is_jump(self) -> bool {
-        matches!(self, Key::Letter(_) | Key::PgUp | Key::PgDn | Key::Reset)
+        matches!(self, Key::Letter(_) | Key::PgUp | Key::PgDn)
     }
     /// 곡 목록에 작용하는 키 (난이도·모드 키 말고)
     pub fn is_list_key(self) -> bool {
-        matches!(self, Key::Up | Key::Down | Key::PgUp | Key::PgDn | Key::Letter(_) | Key::Reset)
+        matches!(self, Key::Up | Key::Down | Key::PgUp | Key::PgDn | Key::Letter(_))
     }
 }
 
@@ -66,7 +63,6 @@ impl Key {
 ///   L 그룹이 없으면 그대로
 /// * PgDn: 다음 그룹의 첫 항목, RANDOM으로는 절대 안 감 (Z 다음은 Kanji)
 /// * PgUp: 이전 그룹의 마지막 항목, RANDOM으로는 절대 안 감 (Kanji 이전은 Z의 마지막)
-/// * Reset: [`ListModel::reset_pos`]
 /// * Left/Right/Mode: 목록 커서는 안 움직임
 pub fn step(model: &ListModel, pos: usize, key: Key) -> usize {
     let n = model.len();
@@ -96,7 +92,6 @@ pub fn step(model: &ListModel, pos: usize, key: Key) -> usize {
             Some(r) => model.runs()[r].last(n),
             None => pos,
         },
-        Key::Reset => model.reset_pos(),
         Key::Left | Key::Right | Key::Mode(_) => pos,
     }
 }

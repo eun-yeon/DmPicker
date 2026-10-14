@@ -47,20 +47,6 @@ impl Difficulty {
         Difficulty::Maximum,
         Difficulty::SC,
     ];
-
-    /// djmax.gg 패턴 키 (NM, HD, MX, SC)
-    pub const fn code(self) -> &'static str {
-        match self {
-            Difficulty::Normal => "NM",
-            Difficulty::Hard => "HD",
-            Difficulty::Maximum => "MX",
-            Difficulty::SC => "SC",
-        }
-    }
-
-    pub const fn index(self) -> usize {
-        self as usize
-    }
 }
 
 /// 난이도 칸 하나의 상태

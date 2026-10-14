@@ -176,7 +176,6 @@ fn request_open(a: &mut App) {
         }
     }
     a.peeking = true;
-    if let Some(handle) = a.peek_job.take() { a.retired_jobs.push(handle); }
     let (slot, hwnd) = (a.peeked.clone(), a.popup.hwnd.0 as isize);
     let (store, titles) = (a.store.clone(), a.titles.clone());
     a.peek_job = Some(std::thread::spawn(move || {
@@ -361,7 +360,7 @@ fn on_action(a: &mut App, act: Action) {
         Action::PlaylistPick(id, pattern) => on_pick(a, pattern.title, Some((pattern.mode, pattern.diff)), Some(id)),
         Action::Scan => on_scan(a),
         Action::Retry => {
-            let busy = a.peeking || jobs_busy(a);
+            let busy = jobs_busy(a);
             let refs = a.refs.lock().ok().and_then(|slot| slot.clone());
             a.updates.retry(busy, refs);
             sync_notices(a);
@@ -406,9 +405,10 @@ fn request_playlist(a: &mut App) {
 }
 
 fn jobs_busy(a: &App) -> bool {
-    a.job.as_ref().is_some_and(|(_, h)| !h.is_finished())
+    // 화면 확인 스레드가 도는 동안은 늘 `peeking`이라 스레드는 따로 안 봄
+    a.peeking
+        || a.job.as_ref().is_some_and(|(_, h)| !h.is_finished())
         || a.retired_jobs.iter().any(|h| !h.is_finished())
-        || a.peek_job.as_ref().is_some_and(|h| !h.is_finished())
         || a.initial_refs.is_some()
 }
 
@@ -445,14 +445,14 @@ fn apply_mode(had_data: bool, visible: bool, open: bool, busy: bool) -> Option<b
 /// 지금 바꿔도 되면 받아 둔 새 곡 데이터로 교체
 fn apply_ready(a: &mut App) {
     let had_data = a.updates.active.has_data();
-    let busy = a.peeking || jobs_busy(a);
+    let busy = jobs_busy(a);
     let Some(fill) = apply_mode(had_data, a.popup.visible, a.popup.is_open(), busy) else { return; };
     let Some(ready) = a.updates.take_ready() else { return; };
     let changed = ready.changed_jackets(&a.updates.active);
     let update::Ready { catalog, active, refs, titles, summary } = ready;
     let fill_with = if fill {
         Some(catalog)
-    } else if let Err(catalog) = a.popup.replace_catalog(catalog, &changed, None) {
+    } else if let Err(catalog) = a.popup.replace_catalog(catalog, &changed) {
         a.updates.keep_ready(update::Ready { catalog: *catalog, active, refs, titles, summary });
         return;
     } else {
@@ -504,7 +504,7 @@ fn sync_notices(a: &mut App) {
 }
 
 fn start_update(a: &mut App) {
-    let busy = a.peeking || jobs_busy(a);
+    let busy = jobs_busy(a);
     let refs = a.refs.lock().ok().and_then(|slot| slot.clone());
     a.updates.started(busy, refs);
 }
@@ -518,14 +518,14 @@ fn update_opened(a: &mut App) {
     if a.popup.take_schema_seen() {
         a.updates.schema_notice_shown();
     }
-    let busy = a.peeking || jobs_busy(a);
+    let busy = jobs_busy(a);
     let refs = a.refs.lock().ok().and_then(|slot| slot.clone());
     a.updates.opened(busy, refs);
     sync_notices(a);
 }
 
 fn show_update_notice(a: &mut App) {
-    if !a.popup.is_open() || a.peeking || jobs_busy(a)
+    if !a.popup.is_open() || jobs_busy(a)
         || a.status.lock().map_or(true, |slot| slot.is_some()) { return; }
     if let Some(text) = a.updates.notice(a.popup.has_recognition()) {
         a.toast.show(&text, Badge::None, Some(4.0));
@@ -635,7 +635,6 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             return LRESULT(0);
         }
         if msg == playlist::READY {
-            // 응답을 결과에 넣고 다시 그림
             while let Some(reply) = a.playlists.take() {
                 a.popup.playlist_reply(reply);
             }
@@ -694,7 +693,7 @@ fn main() -> Result<()> {
         let toast = Toast::new(Some(wndproc))?;
         let tray = tray::Tray::new(Some(wndproc))?;
 
-        let titles: Arc<HashMap<u32, String>> = Arc::new(startup.catalog.songs.iter().map(|s| (s.id, s.name.clone())).collect());
+        let titles = startup.catalog.titles();
         // 한쪽 모드에서 인식한 목록을 다른 모드에도 씀
         if startup.active.has_data() {
             driver::ensure_both(&store_dir(), &|id| titles.get(&id).cloned().unwrap_or_default());

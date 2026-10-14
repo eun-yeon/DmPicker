@@ -184,13 +184,8 @@ unsafe fn with_dib(
 
 /// `PrintWindow(PW_CLIENTONLY | PW_RENDERFULLCONTENT)`로 게임 클라이언트 영역 캡처
 /// 창 모드 / 테두리 없는 창이면 창이 가려져 있거나 포커스가 없어도 됨
+/// 창이 있는지·최소화됐는지는 [`capture`]에서 봄
 pub fn capture_window(hwnd: Hwnd) -> Result<Rgb, CaptureError> {
-    if !hwnd.is_window() {
-        return Err(CaptureError::WindowGone);
-    }
-    if hwnd.is_minimized() {
-        return Err(CaptureError::Minimized);
-    }
     let (w, h) = client_size(hwnd).ok_or(CaptureError::Empty)?;
     unsafe {
         let wdc = GetDC(Some(hwnd.raw()));
@@ -264,17 +259,15 @@ pub enum CaptureMethod {
 /// 고른 방법으로 게임 클라이언트 영역을 캡처한 인식용 프레임
 /// 16:9보다 세로로 길면 가운데 16:9 띠만 (`crop_game_frame`), 좌표는 이 프레임 기준
 pub fn capture(hwnd: Hwnd, method: CaptureMethod) -> Result<Rgb, CaptureError> {
+    if !hwnd.is_window() {
+        return Err(CaptureError::WindowGone);
+    }
+    if hwnd.is_minimized() {
+        return Err(CaptureError::Minimized);
+    }
     match method {
         CaptureMethod::PrintWindow => capture_window(hwnd),
-        CaptureMethod::ScreenBlt => {
-            if !hwnd.is_window() {
-                return Err(CaptureError::WindowGone);
-            }
-            if hwnd.is_minimized() {
-                return Err(CaptureError::Minimized);
-            }
-            capture_screen_rect(client_rect_screen(hwnd).ok_or(CaptureError::Empty)?)
-        }
+        CaptureMethod::ScreenBlt => capture_screen_rect(client_rect_screen(hwnd).ok_or(CaptureError::Empty)?),
     }
     .map(crop_game_frame)
 }

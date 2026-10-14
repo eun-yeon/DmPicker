@@ -13,12 +13,12 @@
 //! 4. [`panel`]로 난이도 칸 읽기 (NORMAL / HARD / MAXIMUM / SC)
 //! 5. [`state::classify`]로 지금 화면 판별, [`tabs`]로 ALL TRACK 탭 찾기, [`sort`]로 정렬 창 읽기
 //!    [`room`]으로 온라인 방에서 방장인지 봄
-//! 6. [`input`]으로 scan code 키 입력, 게임이 포그라운드 창일 때만 보냄
+//! 6. [`input`]으로 키 입력, 게임이 포그라운드 창일 때만 보냄
 //!    위험한 키(Enter, Esc, F5, F7, F10, Space, 숫자, Alt)는 [`input::Key`]로 표현 불가
 //!    Enter와 Esc는 정렬 창이 화면에 뜬 뒤에 쓰는 [`input::PopupKey`]로만 있음
 //!
 //! 안티치트(XIGNCODE3) 때문에 게임 프로세스 핸들을 안 열고 메모리도 안 읽고 가짜 포커스 메시지도 안 보냄
-//! 쓰는 건 FindWindow, PrintWindow / GDI 캡처, GetForegroundWindow, SetForegroundWindow, SendInput뿐
+//! 쓰는 건 FindWindow, PrintWindow / GDI 캡처, GetForegroundWindow, SetForegroundWindow, SendInput, PostMessage(글자 키만)뿐
 
 pub mod features;
 pub mod geom;

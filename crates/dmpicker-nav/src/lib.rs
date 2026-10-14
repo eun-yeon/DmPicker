@@ -3,7 +3,7 @@
 //! Windows API 없음, I/O는 [`GameIo`]로만 함
 //! * [`ListModel`] / [`Group`] / [`Entry`]: 학습한 목록과 제목 그룹
 //!   (`A..Z`, RANDOM, Kanji, Hangul, Symbol, Digit 순으로 순환)
-//! * [`step`]: 게임의 키 동작 (Up/Down, 글자, PgUp/PgDn, LShift+RShift 리셋)
+//! * [`step`]: 게임의 키 동작 (Up/Down, 글자, PgUp/PgDn)
 //! * [`Planner`] / [`plan`]: 최소 비용 키 순서 (Dijkstra)
 //! * [`Navigator`]: 화면으로 확인하고 다시 계획하는 실행기
 //!   hold/gap 타이밍 자동 조정 포함 ([`TimingTuner`])

@@ -4,7 +4,7 @@
 use std::time::{Duration, Instant};
 
 use windows::core::{w, Interface, Result};
-use windows::Win32::Foundation::{COLORREF, HWND, RECT};
+use windows::Win32::Foundation::{COLORREF, HWND};
 use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::DirectWrite::*;
@@ -68,7 +68,7 @@ const INSET: f32 = 24.0;
 const CLOSE: (f32, f32) = (520.0, 46.0);
 /// 새 메시지가 지금 것을 바꿀 때 스프링에 주는 반동
 const BUMP: f32 = -0.8;
-/// 배지: 지름 24 px 원, 중심이 캡슐 안쪽으로 이만큼, 글은 그 뒤에
+/// 배지: 지름 24 DIP 원, 중심이 캡슐 안쪽으로 이만큼, 글은 그 뒤에
 const BADGE: f32 = 24.0;
 const BADGE_X: f32 = 32.0;
 const BADGE_TEXT_X: f32 = 56.0;
@@ -78,7 +78,7 @@ const EASE: Ease = Ease(0.25, 0.1, 0.25, 1.0);
 const SOFT: Ease = Ease(0.34, 1.35, 0.64, 1.0);
 const POP: Ease = Ease(0.34, 1.96, 0.94, 1.0);
 const LAND: Ease = Ease(0.14, 2.56, 0.94, 1.0);
-/// 24 px 배지 박스 안의 체크 (획 2, 둥근 끝)
+/// 24 DIP 배지 박스 안의 체크 (획 2, 둥근 끝)
 const CHECK: [(f32, f32); 3] = [(8.0, 12.5), (10.8, 15.5), (16.4, 9.5)];
 /// 실패 때 같은 박스에 그리는 X, 한 획씩: 오른쪽 위에서 왼쪽 아래, 다음은 왼쪽 위에서 오른쪽 아래
 const CROSS: [[(f32, f32); 2]; 2] = [[(15.5, 8.5), (8.5, 15.5)], [(8.5, 8.5), (15.5, 15.5)]];
@@ -88,13 +88,13 @@ const RED: D2D1_COLOR_F = D2D1_COLOR_F { r: 0.941, g: 0.267, b: 0.322, a: 1.0 };
 /// 진행 링과 트랙, 글처럼 이 불투명도의 흰색
 const RING: f32 = 0.85;
 const TRACK: f32 = 0.14;
-/// 진행 링 굵기 (px), 합성기가 그리는 호와 트랙이 같이 씀
+/// 진행 링 굵기 (DIP), 합성기가 그리는 호와 트랙이 같이 씀
 const RING_STROKE: f32 = 2.5;
 /// 진행 링이 다 찬 것으로 보는 채움, 완료면 여기서 체크로 바뀜
 const FULL: f32 = 0.995;
 
 /// 모션이 `t` ms 지났을 때 (트랙 링, 진행 링, 원) 불투명도, 배지 배율,
-/// 뛰어오른 높이 (px, 위가 음수), 체크가 그려진 비율
+/// 뛰어오른 높이 (DIP, 위가 음수), 체크가 그려진 비율
 fn morph(t: f32) -> (f32, f32, f32, f32, f32, f32) {
     let at = |ms: f32| (t / ms).clamp(0.0, 1.0);
     let hop = if t < 250.0 {
@@ -293,7 +293,7 @@ impl Toast {
         self.badge = badge;
         self.until = secs.map(|s| Instant::now() + Duration::from_secs_f32(s));
         let game = sys::game_rect();
-        let anchor = game.unwrap_or(RECT { left: 0, top: 0, right: 1920, bottom: 1080 });
+        let anchor = game.unwrap_or_else(sys::cursor_work_area);
         let scale = sys::ui_scale(&anchor, game.is_some());
         // 조금 다르면 그대로 둠, 창과 swapchain이 늘 같은 배율로 만들어짐
         if (scale - self.scale).abs() > 0.01 {

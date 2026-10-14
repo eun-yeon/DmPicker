@@ -115,6 +115,16 @@ pub fn monitor_work_area(m: HMONITOR) -> RECT {
     }
 }
 
+/// 게임이 없을 때 검색창·알림을 띄울 곳, 커서가 있는 모니터의 작업 영역
+pub fn cursor_work_area() -> RECT {
+    let mut p = POINT::default();
+    unsafe {
+        let _ = GetCursorPos(&mut p);
+    }
+    let rc = RECT { left: p.x, top: p.y, right: p.x + 1, bottom: p.y + 1 };
+    monitor_work_area(monitor_for_rect(&rc))
+}
+
 /// `hwnd`가 있는 모니터의 주사율 (모르면 60)
 pub fn refresh_hz(hwnd: HWND) -> u32 {
     unsafe {

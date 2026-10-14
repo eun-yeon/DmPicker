@@ -6,6 +6,7 @@
 
 use std::sync::OnceLock;
 
+use crate::features::dot;
 use crate::geom::ListGeom;
 use crate::img::{luma_feature, Rect, Rgb};
 use crate::state::{nominal_lists, ScreenKind};
@@ -65,7 +66,7 @@ fn scores<'a>(img: &'a Rgb, geom: &'a ListGeom, dx: f32, slack_x: f32) -> impl I
     let (sx, sy) = (steps(slack_x), steps(SLACK_Y));
     (-sx..=sx).flat_map(move |i| (-sy..=sy).map(move |j| (i, j))).filter_map(move |(i, j)| {
         let f = label(img, geom, dx + SLACK_STEP * i as f32, SLACK_STEP * j as f32)?;
-        Some(f.iter().zip(template()).map(|(a, b)| a * b).sum())
+        Some(dot(&f, template()))
     })
 }
 

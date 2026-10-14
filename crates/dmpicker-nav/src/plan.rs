@@ -15,27 +15,24 @@ pub struct CostWeights {
     pub arrow: u32,
     pub letter: u32,
     pub page: u32,
-    /// `None`이면 LShift+RShift를 계획에 안 씀 (기본값, 한쪽이 누락되면 탭이 바뀜)
-    pub reset: Option<u32>,
 }
 
 impl Default for CostWeights {
     fn default() -> Self {
-        CostWeights { arrow: 100, letter: 105, page: 105, reset: None }
+        CostWeights { arrow: 100, letter: 105, page: 105 }
     }
 }
 
 impl CostWeights {
     /// 모든 키 비용 1 (누른 횟수만 셈)
     pub fn presses() -> Self {
-        CostWeights { arrow: 1, letter: 1, page: 1, reset: None }
+        CostWeights { arrow: 1, letter: 1, page: 1 }
     }
     pub fn weight(&self, key: Key) -> Option<u32> {
         match key {
             Key::Up | Key::Down => Some(self.arrow),
             Key::Letter(_) => Some(self.letter),
             Key::PgUp | Key::PgDn => Some(self.page),
-            Key::Reset => self.reset,
             Key::Left | Key::Right | Key::Mode(_) => None,
         }
     }
@@ -64,8 +61,7 @@ impl Planner {
                 keys.push(Key::Letter(c));
             }
         }
-        keys.extend([Key::PgUp, Key::PgDn, Key::Reset]);
-        keys.retain(|k| weights.weight(*k).is_some());
+        keys.extend([Key::PgUp, Key::PgDn]);
         let wts = keys.iter().map(|k| weights.weight(*k).unwrap()).collect();
         let k = keys.len();
         let mut next = vec![0u16; n * k];

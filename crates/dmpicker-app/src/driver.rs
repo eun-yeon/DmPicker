@@ -421,7 +421,6 @@ fn press_engine(game: Hwnd, k: NKey, hold: u32, gap: u32) -> Result<(), Abort> {
             Some(k) => input::press(game, k, h, g),
             None => return Err(Abort::Io(format!("bad letter {c}"))),
         },
-        NKey::Reset => input::combo(game, &[EKey::LShift, EKey::RShift], h, g),
         NKey::Mode(m) => {
             let pad = match m {
                 ButtonMode::B4 => EKey::Numpad4,
@@ -767,7 +766,7 @@ const MIN_COMMON: usize = 3;
 const MIN_LEAD: f32 = 0.2;
 /// 안 맞는 창을 포기하기 전까지 다시 보는 횟수
 const REREADS: u32 = 2;
-/// 목록이 안 움직인 창(입력 씹힘)이 연속 이만큼이면 포기, 그때마다 누르는 시간을 늘림
+/// 목록이 안 움직인 창(입력 씹힘)이 연속 이만큼을 넘으면 포기, 그때마다 누르는 시간을 늘림
 const MAX_STALL: u32 = 6;
 /// 목록 끝 판정: `WRAP_SPAN`칸 구간 두 개가 다시 나오고 그중 `WRAP_FIRM`칸이 확실히 맞아야 함
 const WRAP_SPAN: i64 = 12;
@@ -1206,7 +1205,7 @@ pub enum JobResult {
     /// 안 맞는 경우는 다른 계정이거나 인식 뒤 곡을 사거나 풀었을 때
     ListMismatch,
     Scanned { entries: usize, unknown: usize, secs: f32 },
-    /// 사용자가 뭔가 건드려서 인식이 멈춤 (이유 문구)
+    /// 사용자가 뭔가 건드려서 작업이 멈춤 (이유 문구)
     Touched(&'static str),
     Cancelled,
     Failed(String),
@@ -1293,7 +1292,7 @@ fn focused_screen() -> Result<Screen, JobResult> {
     Ok(Screen { game, method: CaptureMethod::PrintWindow })
 }
 
-/// 탭 전환 애니메이션(~350 ms)이 끝난 뒤의 현재 탭 이름
+/// 탭 전환 애니메이션(~350 ms)이 끝나 현재 탭 이름이 멈춘 프레임
 fn tab_frame(screen: &Screen, geom: &ListGeom, cancel: &AtomicBool) -> Result<dmpicker_engine::Rgb, Stop> {
     let mut prev: Option<Vec<f32>> = None;
     for _ in 0..30 {
@@ -1666,6 +1665,7 @@ pub fn run_scan(ctx: &Ctx, cancel: &AtomicBool, mut progress: impl FnMut(ScanSta
     let t0 = Instant::now();
     let kind = layout_kind(&geom);
     let hands = HandsOff::begin(screen.game, ctx.hotkey);
+    let saved = Learned::load(&ctx.store, kind);
     // 목록은 제목순으로 익힘, 정렬 창으로 순서를 확인하고 맞춤
     // 사용자 키를 감시 못 하면 저장 목록에서 화면 위치를 찾을 때만 진행
     if hands.watching() {
@@ -1674,13 +1674,13 @@ pub fn run_scan(ctx: &Ctx, cancel: &AtomicBool, mut progress: impl FnMut(ScanSta
             return stop.into();
         }
         progress(ScanStage::Reading(0.0));
-    } else if !Learned::load(&ctx.store, kind).is_some_and(|l| placed(&read_window(&img, &geom, &ctx.refs), &l)) {
+    } else if !saved.as_ref().is_some_and(|l| placed(&read_window(&img, &geom, &ctx.refs), l)) {
         eprintln!("scan: the sort is unknown and the keys are not watched");
         return JobResult::Failed(SORT_ASK.into());
     }
     // 저장된 목록 길이, 처음이면 곡 데이터의 모든 곡과 RANDOM (ALL TRACK엔 가진 곡만 있어서 더 길게 잡힘)
     // 그리고 끝을 지나 더 읽는 구간
-    let songs = Learned::load(&ctx.store, kind).map_or(ctx.titles.len() + 1, |l| l.entries.len());
+    let songs = saved.map_or(ctx.titles.len() + 1, |l| l.entries.len());
     let est = songs as i64 + PAST_END;
     let reading = |seen: usize| if (seen as i64) < est { ScanStage::Reading(seen as f32 / est as f32) } else { ScanStage::FindingEnd };
     match scan(&screen, &ctx.refs, cancel, &hands, |seen| progress(reading(seen))) {
@@ -1861,12 +1861,12 @@ fn nav_failed(e: NavError) -> JobResult {
 }
 
 fn read_slots(screen: &Screen, cancel: &AtomicBool) -> Result<Option<[dmpicker_engine::SlotState; 4]>, Abort> {
-    // 곡이나 모드를 바꾸면 조금 뒤 난이도 칸이 다시 그려짐, 목록이 멈추길 기다렸다가 두 번 읽음
-    let Some((img, _)) = screen.settled(cancel, Duration::from_millis(1200))? else { return Ok(None) };
-    let a = dmpicker_engine::analyze(&img).slot_states;
+    // 곡이나 모드를 바꾸면 조금 뒤 난이도 칸이 다시 그려짐, 목록이 멈춘 뒤 60 ms 더 기다렸다가 새로 찍어 읽음
+    if screen.settled(cancel, Duration::from_millis(1200))?.is_none() {
+        return Ok(None);
+    }
     std::thread::sleep(Duration::from_millis(60));
-    let b = dmpicker_engine::analyze(&screen.grab()?).slot_states;
-    Ok(if a == b { a } else { b })
+    Ok(dmpicker_engine::analyze(&screen.grab()?).slot_states)
 }
 
 /// 목록이 멈춘 뒤 화면의 버튼 모드 (4, 5, 6, 8), 못 읽으면 `None`

@@ -64,7 +64,7 @@ pub fn open_scale(o: f32) -> (f32, f32) {
     (0.90 + 0.10 * o, 0.70 + 0.30 * o)
 }
 
-/// CSS식 cubic-bezier 이징 곡선
+/// cubic-bezier 이징 곡선
 #[derive(Clone, Copy, Debug)]
 pub struct Ease(pub f32, pub f32, pub f32, pub f32);
 

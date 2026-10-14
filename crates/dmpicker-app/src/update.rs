@@ -111,10 +111,7 @@ fn load_startup(root: &Path, bundled: &Path, prepare: bool) -> Startup {
     if generation.is_some() {
         let _ = std::fs::remove_file(root.join(OLD_REFS_CACHE));
     }
-    if let Some(generation) = generation
-        .as_ref()
-        .filter(|g| prepare && g.path.parent() == Some(data.as_path()))
-    {
+    if let Some(generation) = generation.as_ref().filter(|_| prepare) {
         let name = store::generation_name(&generation.manifest.release_tag);
         let previous = store::read_pointers(&data)
             .into_iter()
@@ -131,7 +128,7 @@ fn load_startup(root: &Path, bundled: &Path, prepare: bool) -> Startup {
                         eprintln!("data applied: {error}");
                     }
                 } else if state.loading.as_deref() == Some(&name) {
-                    state.finish_loading(&state_path);
+                    state.loading = None;
                 }
                 if let Err(error) = state.save(&state_path) {
                     eprintln!("data state: {error}");
@@ -163,7 +160,7 @@ fn load_startup(root: &Path, bundled: &Path, prepare: bool) -> Startup {
 
 fn prepare_refs(
     generation: &Generation,
-    active: Option<&Active>,
+    active: &Active,
     previous: Option<&Arc<RefSet>>,
     cancel: &AtomicBool,
     parallel: bool,
@@ -174,14 +171,11 @@ fn prepare_refs(
     }
     let jackets = jacket_list(&generation.core);
     let old: Vec<_> = active
-        .map(|a| {
-            a.snapshot
-                .songs
-                .iter()
-                .map(|(&id, hash)| (id, hash.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
+        .snapshot
+        .songs
+        .iter()
+        .map(|(&id, hash)| (id, hash.clone()))
+        .collect();
     // 재킷이 그대로면 지금 RefSet을 그대로 씀, 레벨만 바뀐 갱신은 다시 계산 안 함
     if jackets == old {
         if let Some(previous) = previous {
@@ -191,7 +185,8 @@ fn prepare_refs(
     }
     // 앱 시작 확인은 특징이 빨리 준비돼야 해서 여러 스레드로 새로 계산
     // 검색창에서 시작한 갱신은 한 스레드로 바뀐 재킷만 계산
-    if parallel {
+    // 다시 쓸 특징이 없으면 어차피 전부 계산이라 여러 스레드로
+    if parallel || previous.is_none() {
         let refs = compute_refs(generation, &jackets)?;
         feed::ensure_running(cancel)?;
         return Ok(refs);
@@ -373,7 +368,7 @@ fn version_text(version: Version) -> String {
 fn exe_notice(state: &UpdateState, schema: Option<u64>) -> Option<ExeNotice> {
     let text = match schema {
         Some(_) => OUTDATED_TEXT.to_owned(),
-        None => version_text(exe_release(state)?.version()),
+        None => exe_status(state)?,
     };
     Some(ExeNotice { schema, text })
 }
@@ -687,7 +682,8 @@ impl Updater {
                             }
                             if !error.cancelled {
                                 self.outdated = error.schema.is_some();
-                                self.status_text = failure_text(&self.state);
+                                self.status_text =
+                                    failure_text(&self.state, self.active.generation.is_some());
                             }
                             self.end_check();
                         }
@@ -856,8 +852,9 @@ fn worker(
                     let pointer = Pointer::new(&name, previous.as_deref())?;
                     let permit = store::write_pointer(&root.join("data"), &pointer)?;
                     state.record_data_applied(&generation.manifest.release_tag)?;
-                    // 실행 중에 새 데이터를 적용했으면 지난 중단 표식은 쓸모없음 (막혔던 세대는 아래 정리로 지워짐)
+                    // 실행 중에 새 데이터를 적용했으면 지난 중단 표식은 쓸모없음
                     // 안 지우면 표식이 영영 남아 다음 시작의 중단을 못 막음
+                    // 막혔던 세대는 아래 정리로 지워짐
                     state.loading = None;
                     if let Err(error) = state.save(&state_path) {
                         eprintln!("data state: {error}");
@@ -900,7 +897,8 @@ fn run_check(
     if wants_exe && !cancel.load(Ordering::Relaxed) {
         check_exe_version(&exe_latest_url(), &state_path, &mut state, cancel);
     }
-    let exe_retry_after_until = state.retry_after_until;
+    // 확인은 기한이 지나야 시작해서 아직 남은 기한은 이번 exe 응답이 준 것뿐, 지난 기한은 버림
+    let exe_retry_after_until = state.retry_after_until.filter(|&t| t > now());
     let result = if wants_data {
         if let Err(error) = state.save(&state_path) {
             eprintln!("data state: {error}");
@@ -1140,7 +1138,7 @@ fn check_data(
         let (generation, (mut catalog, refs)) = staging.finish(|generation| {
             state.begin_preparing(job.state_path, &manifest_hash)?;
             preparing = true;
-            let refs = prepare_refs(generation, Some(active), job.refs, cancel, job.parallel)?;
+            let refs = prepare_refs(generation, active, job.refs, cancel, job.parallel)?;
             let catalog = feed_catalog(generation)?;
             feed::ensure_running(cancel)?;
             Ok((catalog, refs))
@@ -1167,7 +1165,7 @@ fn prepare_existing(
     state.begin_preparing(job.state_path, &generation.manifest_hash)?;
     let _ = job.events.send(Event::Preparing(job.id));
     let result = (|| {
-        let refs = prepare_refs(&generation, Some(active), job.refs, job.cancel, job.parallel)?;
+        let refs = prepare_refs(&generation, active, job.refs, job.cancel, job.parallel)?;
         let catalog = feed_catalog(&generation)?;
         feed::ensure_running(job.cancel)?;
         Ok(make_ready(generation, catalog, refs, active))
@@ -1303,8 +1301,12 @@ fn published_label(published: &str) -> Option<String> {
     ))
 }
 
-/// 실패 간격과 Retry-After 중 늦은 쪽까지 확인을 안 함
-fn failure_text(state: &UpdateState) -> String {
+/// 받은 세대가 있으면 실패 간격과 Retry-After 중 늦은 쪽까지 확인을 안 함
+/// 없으면 실패 간격 없이 다음 검색창 열기에서 다시 확인해서 시간을 안 붙임
+fn failure_text(state: &UpdateState, has_generation: bool) -> String {
+    if !has_generation {
+        return "곡 데이터를 확인하지 못했어요".into();
+    }
     let seconds = state
         .next_eligible_at
         .max(state.retry_after_until)
