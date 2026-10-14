@@ -24,7 +24,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, VIRTUAL_KEY,
 };
 use windows::Win32::Foundation::{LPARAM, WPARAM};
-use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, PostMessageW, SetForegroundWindow, WM_KEYDOWN, WM_KEYUP};
+use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, PostMessageW, SetForegroundWindow, ShowWindow, SW_RESTORE, WM_KEYDOWN, WM_KEYUP};
 
 use crate::capture::Hwnd;
 
@@ -230,6 +230,14 @@ pub fn is_foreground(game: Hwnd) -> bool {
 /// Windows가 거절할 수 있어서 뒤에 [`is_foreground`]로 확인해야 함
 pub fn request_foreground(game: Hwnd) -> bool {
     unsafe { SetForegroundWindow(game.raw()).as_bool() }
+}
+
+/// 최소화된 게임 창을 펼쳐 달라고 요청 (작업 표시줄 버튼을 누를 때와 같은 `ShowWindow` 복원)
+/// 전체 화면 게임은 포커스를 뺏기면 최소화되고 포그라운드로만 올리면 안 펴짐
+pub fn request_restore(game: Hwnd) {
+    unsafe {
+        let _ = ShowWindow(game.raw(), SW_RESTORE);
+    }
 }
 
 /// 키 이벤트의 `KEYBDINPUT` 플래그

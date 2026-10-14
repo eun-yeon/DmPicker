@@ -21,7 +21,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RRF_SUBKEY_WOW6464KEY};
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
-use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, GetWindowLongW, GetWindowRect, GWL_STYLE, WS_CAPTION, WS_THICKFRAME};
+use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, GetWindowLongW, GetWindowRect, IsIconic, GWL_STYLE, WS_CAPTION, WS_THICKFRAME};
 
 use crate::driver::JobResult;
 
@@ -313,7 +313,8 @@ fn environment(game: Option<HWND>) -> String {
         let (screen, screen_rect) = monitor_info(monitor);
         let (mut rect, mut client) = (RECT::default(), RECT::default());
         let window = if GetWindowRect(game, &mut rect).is_ok() {
-            let shape = window_shape(GetWindowLongW(game, GWL_STYLE) as u32, rect, screen_rect);
+            // 전체 화면 게임은 포커스를 뺏기면 최소화돼서 작은 창 모드처럼 보임
+            let shape = if IsIconic(game).as_bool() { "최소화됨" } else { window_shape(GetWindowLongW(game, GWL_STYLE) as u32, rect, screen_rect) };
             format!("게임 창: {shape}\n창 크기: {}", size(rect))
         } else {
             format!("게임 창: {UNKNOWN}\n창 크기: {UNKNOWN}")

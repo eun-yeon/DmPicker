@@ -13,6 +13,7 @@ use dmpicker_engine::state::{classify, layout_kind};
 use dmpicker_engine::{features, read_window, room, sort, tabs, Candidate, Feature, ListGeom, RefSet, RowRead, ScreenKind, FEAT_LEN, RANDOM_ID};
 use dmpicker_nav::{order_key, Abort, ButtonMode, Entry, GameIo, Key as NKey, ListModel, NavConfig, NavError, Navigator, Observation, OrderKey, TimingTuner};
 use dmpicker_search::Diff;
+use windows::Win32::UI::Shell::{SHQueryUserNotificationState, QUNS_RUNNING_D3D_FULL_SCREEN};
 
 use crate::hands::Hands;
 use crate::hotkey::Hotkey;
@@ -350,12 +351,14 @@ impl Learned {
 
 pub struct Screen {
     pub game: Hwnd,
-    pub method: CaptureMethod,
 }
 
 impl Screen {
+    /// 전용 전체 화면에선 PrintWindow가 앞으로 가져온 순간 화면에 멈춰 있어서 화면에서 직접 찍음
+    /// 최소화에서 펴지는 중에 모드가 바뀌기도 해서 찍을 때마다 봄
     pub fn grab(&self) -> Result<dmpicker_engine::Rgb, Abort> {
-        capture::capture(self.game, self.method).map_err(|e| Abort::Io(format!("{e:?}")))
+        let method = if full_screen() { CaptureMethod::ScreenBlt } else { CaptureMethod::PrintWindow };
+        capture::capture(self.game, method).map_err(|e| Abort::Io(format!("{e:?}")))
     }
 
     /// 목록이 멈출 때까지 기다린 뒤 그 프레임과 목록 위치를 돌려줌
@@ -975,31 +978,44 @@ fn same_song(a: &Seen, b: &Seen) -> Option<u32> {
 fn fit_shift(prev: &[Seen], rows: &[Seen]) -> Result<(i64, f32), String> {
     let inner = |r: usize| r != 0 && r != rows.len() - 1;
     let common = |s: usize| (0..rows.len() - s).filter(move |&k| inner(k) && inner(k + s));
+    // (모순 수, 맞은 수, 비교한 수), `faint`면 한쪽이 확실하고 1순위가 같은 줄도 점수와 상관없이 맞은 걸로 셈
+    let tally = |s: usize, faint: bool| {
+        let (mut songs, mut others, mut contra, mut n) = (HashSet::new(), 0, 0, 0);
+        for k in common(s) {
+            let (a, b) = (&prev[k + s], &rows[k]);
+            n += 1;
+            match pair(a, b) {
+                Pair::Contradict => contra += 1,
+                Pair::Same => match same_song(a, b) {
+                    Some(id) => {
+                        songs.insert(id);
+                    }
+                    None => others += 1,
+                },
+                Pair::Unclear => {
+                    if let Some(id) = same_song(a, b).filter(|_| faint && (a.sure || b.sure)) {
+                        songs.insert(id);
+                    }
+                }
+            }
+        }
+        (contra, songs.len() + others, n)
+    };
     // (밀림, 모순 수, 맞은 수, 비교한 수, 점수)
     let mut fits: Vec<(usize, usize, usize, usize, f32)> = (0..=STEP)
         .map(|s| {
-            let (mut songs, mut others, mut contra, mut n) = (HashSet::new(), 0, 0, 0);
-            for k in common(s) {
-                let (a, b) = (&prev[k + s], &rows[k]);
-                n += 1;
-                match pair(a, b) {
-                    Pair::Contradict => contra += 1,
-                    Pair::Same => match same_song(a, b) {
-                        Some(id) => {
-                            songs.insert(id);
-                        }
-                        None => others += 1,
-                    },
-                    Pair::Unclear => {}
-                }
-            }
-            let m = songs.len() + others;
+            let (contra, m, n) = tally(s, false);
             (s, contra, m, n, m as f32 / n as f32 - 0.01 * (s as f32 - STEP as f32).abs())
         })
         .collect();
     fits.sort_by(|a, b| a.1.cmp(&b.1).then(b.4.total_cmp(&a.4)));
-    let (shift, contra, m, n, score) = fits[0];
+    let (shift, contra, mut m, n, score) = fits[0];
     let lead = fits.get(1).filter(|f| f.1 == 0).map_or(f32::INFINITY, |f| score - f.4);
+    // 다른 밀림이 모두 모순이면 위치는 이걸로 정해짐
+    // 느린 PC에선 새로 올라온 줄이 흐릴 때 읽혀 다시 봐도 점수가 바닥 아래였지만 1순위는 맞았음
+    if contra == 0 && lead.is_infinite() {
+        m = tally(shift, true).1;
+    }
     let share = m as f32 / n as f32;
     if contra == 0 && m >= MIN_COMMON && share >= MIN_OVERLAP && lead >= MIN_LEAD {
         return Ok((shift as i64, share));
@@ -1353,6 +1369,9 @@ pub fn searchable(store: &Path, k: ScreenKind, titles: &HashMap<u32, String>) ->
 }
 
 fn focus_game(game: Hwnd) -> bool {
+    if game.is_minimized() {
+        input::request_restore(game);
+    }
     let t0 = Instant::now();
     while !input::is_foreground(game) {
         if t0.elapsed() > Duration::from_millis(700) {
@@ -1367,10 +1386,38 @@ fn focus_game(game: Hwnd) -> bool {
 /// 포커스를 받은 게임 창 (호출하는 쪽이 포커스를 넘겨줌)
 fn focused_screen() -> Result<Screen, JobResult> {
     let Some(game) = capture::find_game_window() else { return Err(JobResult::Failed("DJMAX가 인식되지 않아요".into())) };
+    let minimized = game.is_minimized();
     if !focus_game(game) {
         return Err(JobResult::Failed("게임 창을 앞으로 가져오지 못했어요".into()));
     }
-    Ok(Screen { game, method: CaptureMethod::PrintWindow })
+    if minimized {
+        wait_restored(game);
+    }
+    if full_screen() {
+        diagnostic!("capture: full screen, reading the screen");
+    }
+    Ok(Screen { game })
+}
+
+/// 전체 화면 게임은 검색창에 포커스를 뺏기면 최소화되고 다시 펴질 때 화면 모드를 바꾸느라 2~3초 걸림
+/// 클라이언트 영역이 연달아 같을 때까지 기다림
+fn wait_restored(game: Hwnd) {
+    let t0 = Instant::now();
+    let mut last = None;
+    while t0.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(150));
+        let now = if game.is_minimized() { None } else { capture::client_rect_screen(game) };
+        if now.is_some() && now == last {
+            break;
+        }
+        last = now;
+    }
+    diagnostic!("job: waited {} ms for the game to come back", t0.elapsed().as_millis());
+}
+
+/// 창 모양으로는 화면을 다 덮는 테두리 없는 창과 구별이 안 돼서 셸 알림 상태로 봄, 한 번에 0.1 ms 안쪽
+fn full_screen() -> bool {
+    unsafe { SHQueryUserNotificationState() }.is_ok_and(|s| s == QUNS_RUNNING_D3D_FULL_SCREEN)
 }
 
 /// 탭 전환 애니메이션(~350 ms)이 끝나 현재 탭 이름이 멈춘 프레임
