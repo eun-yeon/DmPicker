@@ -8,7 +8,7 @@
 //!    16:9보다 세로로 길면 위아래 여백을 빼고 가운데 16:9 띠만 씀
 //! 2. [`geom::find_list`]로 곡 목록 위치 자동 보정 (줄 색 막대 + 재킷 열)
 //!    프리스타일 배치, 가운데 정렬된 온라인(OPEN MATCH) 배치 둘 다 됨
-//!    스크롤 애니메이션이 끝났는지는 [`geom::at_rest`]로 확인
+//!    스크롤이 멈췄는지는 [`geom::at_rest`]와 [`ListGeom::on_grid`]로 확인
 //! 3. [`read::read_window`]로 보이는 재킷 11개를 [`features::RefSet`]과 대조
 //! 4. [`panel`]로 난이도 칸 읽기 (NORMAL / HARD / MAXIMUM / SC)
 //! 5. [`state::classify`]로 지금 화면 판별, [`tabs`]로 ALL TRACK 탭 찾기, [`sort`]로 정렬 창 읽기

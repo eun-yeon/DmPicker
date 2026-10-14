@@ -39,6 +39,11 @@ pub trait GameIo {
     fn press(&mut self, key: Key, hold_ms: u32, gap_ms: u32) -> Result<(), Abort>;
     /// 목록이 멈추길 기다렸다가 커서 위치를 찾음
     fn read_pos(&mut self) -> Result<Observation, Abort>;
+    /// 움직이는 중인 화면에서 보이는 위치, 기다리지 않음 (못 읽으면 `None`)
+    /// 화면이 커서보다 늦게 따라와서 대략적인 위치임
+    fn glance(&mut self) -> Result<Option<usize>, Abort> {
+        Ok(None)
+    }
     /// 단조 증가 시계, ms 단위
     fn now_ms(&mut self) -> u64 {
         static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -158,8 +163,9 @@ impl TimingTuner {
 /// 실행기 한도와 정책
 #[derive(Clone, Debug, PartialEq)]
 pub struct NavConfig {
-    /// 화면 확인 사이에 보내는 최대 키 수, 기본 8 (보수적)
-    /// 늘리면 긴 방향키 연타에 ~300 ms 확인이 덜 필요해서 빨라짐, 대신 묶음마다 확인 없이 누르는 키가 늘어남
+    /// 확인 지점 사이 키 수, 기본 8 (보수적)
+    /// 지점마다 곁눈질([`GameIo::glance`])이 예상 위치 둘레면 멈추지 않고 이어 보냄
+    /// 못 읽거나 어긋나면 거기서 묶음을 끊고 멈춘 화면으로 확인
     pub max_burst: usize,
     /// 글자/PgUp/PgDn 바로 뒤에서 묶음을 끊음 (설명 안 되는 결과가 나온 뒤엔 항상 켜짐)
     pub verify_after_jump: bool,
@@ -244,6 +250,13 @@ impl fmt::Display for NavError {
 
 impl std::error::Error for NavError {}
 
+/// 곁눈질로 이어 갈 때 예상 위치와의 차이 한도 (줄)
+/// 움직이는 화면은 커서보다 1줄쯤 늦게 따라옴
+/// 그래서 방향키 하나 빠진 건 못 가리지만 방향키는 오차를 안 키워서 끝 확인에서 고침
+const GLANCE_SLACK: usize = 3;
+/// 점프 키 뒤 이만큼 더 보내고 곁눈질, 점프하면 목록이 잠깐 안 보였다가 다시 그려짐
+const GLANCE_AFTER_JUMP: usize = 3;
+
 /// `start`에서 `keys`를 눌러 `observed`에 닿으려면 최소 몇 번 누락돼야 하는지
 /// 어떤 부분열로도 설명 안 되면 `None`
 fn explain_drops(planner: &Planner, start: usize, keys: &[Key], observed: usize) -> Option<usize> {
@@ -310,6 +323,31 @@ impl Navigator {
         }
     }
 
+    /// `pos`에서 `sent`까지 보낸 묶음을 이어 보내도 되는지, 곁눈질 결과는 이 판단에만 씀
+    /// * `max_burst`키마다: 예상 위치 둘레로 보일 때만 이어 감, 못 읽어도 멈춤
+    /// * 점프 키 뒤 [`GLANCE_AFTER_JUMP`]키: 멀리 보일 때만 멈춤, 빠진 점프를 일찍 잡음
+    ///
+    /// 확인 지점에서 이동 시간이 다 됐으면 멈춤, 그 뒤 확인에서 시간 초과로 끝남
+    fn keep_going<I: GameIo>(&self, io: &mut I, t0: u64, pos: usize, sent: &[Key]) -> Result<bool, NavError> {
+        let n = sent.len();
+        let checkpoint = n.is_multiple_of(self.cfg.max_burst.max(1));
+        let after_jump = n > GLANCE_AFTER_JUMP && sent[n - 1 - GLANCE_AFTER_JUMP].is_jump();
+        if !checkpoint && !after_jump {
+            return Ok(true);
+        }
+        let late = |io: &mut I| checkpoint && io.now_ms().saturating_sub(t0) > self.cfg.timeout_ms;
+        if late(io) {
+            return Ok(false);
+        }
+        let expected = self.planner.apply_all(pos, sent);
+        let seen = io.glance().map_err(NavError::Aborted)?;
+        if late(io) {
+            return Ok(false);
+        }
+        let near = seen.is_some_and(|p| self.planner.ring_distance(p, expected) <= GLANCE_SLACK);
+        Ok(near || (!checkpoint && seen.is_none()))
+    }
+
     /// 커서를 `target`으로 옮김
     /// 위치 읽기, 계획, 묶음 전송, 확인, 본 위치에서 재계획을 도착하거나 한도에 걸릴 때까지 반복
     /// `Abort` 뒤, 목록 밖, 위치를 모를 때는 키를 절대 안 보냄
@@ -345,19 +383,26 @@ impl Navigator {
             if plan.is_empty() {
                 return Err(NavError::Unreachable { from: pos, to: target });
             }
-            let mut burst: Vec<Key> = Vec::with_capacity(self.cfg.max_burst);
-            for key in plan.iter().take(self.cfg.max_burst.max(1)) {
+            // 계획을 끝까지 한 묶음으로 보내고 확인 지점에서만 끊을지 봄
+            let mut burst: Vec<Key> = Vec::with_capacity(plan.len());
+            for key in &plan {
                 burst.push(*key);
                 if careful && key.is_jump() {
                     break;
                 }
             }
-            let expected = self.planner.apply_all(pos, &burst);
             let (hold, gap) = (self.tuner.hold_ms(), self.tuner.gap_ms());
-            for key in &burst {
-                io.press(*key, hold, gap).map_err(NavError::Aborted)?;
+            let mut sent = 0;
+            while sent < burst.len() {
+                io.press(burst[sent], hold, gap).map_err(NavError::Aborted)?;
                 out.presses += 1;
+                sent += 1;
+                if sent < burst.len() && !self.keep_going(io, t0, pos, &burst[..sent])? {
+                    break;
+                }
             }
+            burst.truncate(sent);
+            let expected = self.planner.apply_all(pos, &burst);
             out.rounds += 1;
             let obs = self.observe(io, t0, Some(pos))?;
             if obs == expected {

@@ -30,7 +30,8 @@ pub struct ScreenInfo {
     pub slots: Option<[Rect; 4]>,
     /// 난이도 칸 상태 (목록 화면이 아니면 `None`)
     pub slot_states: Option<[SlotState; 4]>,
-    /// 목록 스크롤 애니메이션이 끝났는지 (목록이 없으면 false)
+    /// 줄 막대가 격자 간격으로 또렷함 (목록이 없으면 false)
+    /// 스크롤 중에도 참일 수 있어서 멈춤은 [`ListGeom::on_grid`]와 같이 봄
     pub at_rest: bool,
 }
 

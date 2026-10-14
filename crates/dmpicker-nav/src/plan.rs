@@ -123,6 +123,12 @@ impl Planner {
             None => pos,
         }
     }
+    /// 원형 목록에서 두 위치 사이 줄 수 (가까운 쪽)
+    pub fn ring_distance(&self, a: usize, b: usize) -> usize {
+        let d = (a + self.n - b) % self.n;
+        d.min(self.n - d)
+    }
+
     /// 키 순서 전체를 적용
     pub fn apply_all(&self, pos: usize, keys: &[Key]) -> usize {
         keys.iter().fold(pos, |p, k| self.apply(p, *k))

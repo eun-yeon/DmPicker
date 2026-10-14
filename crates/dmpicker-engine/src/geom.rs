@@ -87,6 +87,12 @@ impl ListGeom {
     pub fn grid_offset(&self) -> f32 {
         self.row0_top - ROW0_OVER_H * self.height as f32
     }
+
+    /// 줄이 멈춘 자리 격자에 붙어 있음, 허용치는 [`at_rest`]와 같음
+    /// 스크롤 중에도 줄을 하나 지날 때마다 잠깐 붙어서 연속 프레임으로 봐야 함
+    pub fn on_grid(&self) -> bool {
+        self.grid_offset().abs() <= (3.0 * self.scale()).max(1.5)
+    }
 }
 
 #[inline]
@@ -239,9 +245,9 @@ fn median_sorted(v: &[f32]) -> f32 {
     }
 }
 
-/// 목록 스크롤이 멈췄으면 true, 막대 열의 밝은 구간 시작·끝이 격자에 맞아야 함 (1440p ±3 px)
-/// `geom`은 멈춘 프레임에서 구한 것이어야 함, 한 번 보정해서 계속 쓰면 됨
-/// [`ListGeom::grid_offset`]이 0 근처면 제대로 구한 것
+/// 막대 열의 밝은 구간 시작·끝이 `geom` 격자에 맞으면 true (1440p ±3 px)
+/// 같은 프레임에서 구한 `geom`이면 줄이 고르게 밀린 스크롤 중 프레임도 통과함
+/// 멈춘 자리인지는 [`ListGeom::on_grid`]로 따로 봄
 pub fn at_rest(img: &Rgb, geom: &ListGeom) -> bool {
     rest_score(img.view(), geom).0
 }

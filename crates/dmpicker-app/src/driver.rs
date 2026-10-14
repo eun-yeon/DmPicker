@@ -354,12 +354,18 @@ impl Screen {
     }
 
     /// 목록이 멈출 때까지 기다린 뒤 그 프레임과 목록 위치를 돌려줌
+    /// 줄이 멈춘 자리 격자에 붙은 프레임이 연속 둘이어야 함
     pub fn settled(&self, cancel: &AtomicBool, timeout: Duration) -> Result<Option<(dmpicker_engine::Rgb, ListGeom)>, Abort> {
-        self.settled_timed(cancel, timeout, &mut Waits::default())
+        self.wait_rest(cancel, timeout, &mut Waits::default(), true)
     }
 
-    /// 시간이 어디에 쓰였는지 합산하는 [`Screen::settled`]
+    /// 인식 본 루프용 [`Screen::settled`], 시간이 어디에 쓰였는지 합산함
+    /// 멈춘 자리는 안 봄, 창을 내용으로 이어 붙여서 반 줄 안쪽으로 밀린 창도 그대로 씀
     pub fn settled_timed(&self, cancel: &AtomicBool, timeout: Duration, w: &mut Waits) -> Result<Option<(dmpicker_engine::Rgb, ListGeom)>, Abort> {
+        self.wait_rest(cancel, timeout, w, false)
+    }
+
+    fn wait_rest(&self, cancel: &AtomicBool, timeout: Duration, w: &mut Waits, on_grid: bool) -> Result<Option<(dmpicker_engine::Rgb, ListGeom)>, Abort> {
         let t0 = Instant::now();
         let mut ok = 0;
         let nap = |w: &mut Waits, ms: u64| {
@@ -380,7 +386,7 @@ impl Screen {
             w.judge += grabbed.elapsed();
             w.frames += 1;
             if let Some(geom) = info.list {
-                if info.at_rest {
+                if info.at_rest && (!on_grid || geom.on_grid()) {
                     ok += 1;
                     if ok >= 2 {
                         return Ok(Some((img, geom)));
@@ -546,6 +552,44 @@ pub struct LiveIo<'a> {
     pub found: Option<(usize, LEntry)>,
     /// 마지막 키를 누른 시각
     pub pressed: Option<Instant>,
+    /// 마지막으로 멈춘 프레임의 목록 위치, 곁눈질할 띠를 정함
+    pub geom: Option<ListGeom>,
+    /// 마지막으로 멈춘 프레임의 버튼 모드 표시 (4, 5, 6, 8)
+    pub mode_seen: Option<u8>,
+}
+
+impl LiveIo<'_> {
+    /// 멈춘 목록의 11줄, 줄이 멈춘 자리 격자에 붙은 연속 두 프레임이 같은 위치로 읽혀야 함
+    /// 스크롤 중에도 줄을 지날 때마다 격자에 잠깐 붙어서 한 프레임으로는 못 믿음
+    fn still_rows(&mut self) -> Result<Option<[RowRead; 11]>, Abort> {
+        let t0 = Instant::now();
+        let mut prev: Option<Option<usize>> = None;
+        std::thread::sleep(Duration::from_millis(40));
+        loop {
+            if self.cancel.load(Ordering::Relaxed) {
+                return Err(Abort::Cancelled);
+            }
+            let img = self.screen.grab()?;
+            let info = dmpicker_engine::analyze(&img);
+            match info.list.filter(|g| info.at_rest && g.on_grid()) {
+                Some(g) => {
+                    let rows = read_window(&img, &g, self.refs);
+                    let pos = locate(&match_table(&rows, self.learned)).0;
+                    if prev == Some(pos) {
+                        self.geom = Some(g);
+                        self.mode_seen = dmpicker_engine::panel::button_mode(&img, info.kind, &g);
+                        return Ok(Some(rows));
+                    }
+                    prev = Some(pos);
+                }
+                None => prev = None,
+            }
+            if t0.elapsed() > Duration::from_millis(1500) {
+                return Ok(None);
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        }
+    }
 }
 
 impl GameIo for LiveIo<'_> {
@@ -564,12 +608,10 @@ impl GameIo for LiveIo<'_> {
         }
         let rows = match self.first.take() {
             Some(rows) => rows,
-            None => {
-                let Some((img, geom)) = self.screen.settled(self.cancel, Duration::from_millis(1500))? else {
-                    return Ok(Observation::NotOnList);
-                };
-                read_window(&img, &geom, self.refs)
-            }
+            None => match self.still_rows()? {
+                Some(rows) => rows,
+                None => return Ok(Observation::NotOnList),
+            },
         };
         let m = match_table(&rows, self.learned);
         let (pos, agree) = locate(&m);
@@ -583,6 +625,40 @@ impl GameIo for LiveIo<'_> {
             Some(p) => Observation::At(p),
             None => Observation::Unknown,
         })
+    }
+
+    /// 마지막으로 멈춘 프레임의 목록 막대 둘레만 화면에서 떠서 읽음 (게임 화면 높이 그대로, 1440p에서 폭 약 120 px)
+    /// 창 전체를 찍는 것보다 훨씬 빨라 키 사이에 끼워도 연타가 안 끊김
+    /// 다른 창이 덮이면 틀리게 읽을 수 있지만 이어 보낼지만 정하고 위치는 멈춘 화면으로 확인함
+    fn glance(&mut self) -> Result<Option<usize>, Abort> {
+        if !input::is_foreground(self.screen.game) {
+            return Err(Abort::FocusLost);
+        }
+        let Some(g) = self.geom else { return Ok(None) };
+        let Some(frame) = capture::frame_rect_screen(self.screen.game) else { return Ok(None) };
+        // 창 크기가 바뀌었으면 목록 자리도 모름
+        if (frame.w, frame.h) != (g.width as i32, g.height as i32) {
+            return Ok(None);
+        }
+        let s = g.scale();
+        let right = g.bar_x + g.bar_w + (8.0 * s).ceil() as i32;
+        let left = (g.bar_x + g.bar_w - (100.0 * s).ceil() as i32).max(0);
+        let strip = dmpicker_engine::Rect::new(frame.x + left, frame.y, right - left, frame.h);
+        let Ok(img) = capture::capture_screen_rect(strip) else { return Ok(None) };
+        // 찍는 사이 창이 움직였으면 다른 자리를 찍은 것
+        if capture::frame_rect_screen(self.screen.game) != Some(frame) {
+            return Ok(None);
+        }
+        let Some(sg) = dmpicker_engine::find_list(&img).filter(|sg| sg.rows_seen >= dmpicker_engine::state::MIN_ROWS) else {
+            return Ok(None);
+        };
+        // 재킷 칸이 띠 안에 다 있어야 읽음
+        let whole = img.rect();
+        if (0..dmpicker_engine::NROWS).any(|k| whole.intersect(&sg.jacket_box(k)) != Some(sg.jacket_box(k))) {
+            return Ok(None);
+        }
+        let rows = read_window(&img, &sg, self.refs);
+        Ok(locate(&match_table(&rows, self.learned)).0)
     }
 }
 
@@ -1561,7 +1637,7 @@ fn recheck(
     for (done, &i) in which.iter().enumerate() {
         progress(done);
         hands.check()?;
-        let mut io = LiveIo { screen, refs: &ctx.refs, learned: l, cancel, first: None, found: None, pressed: None };
+        let mut io = LiveIo { screen, refs: &ctx.refs, learned: l, cancel, first: None, found: None, pressed: None, geom: None, mode_seen: None };
         match nav.navigate(&mut io, i) {
             Ok(_) => {}
             Err(NavError::Aborted(e @ (Abort::Cancelled | Abort::FocusLost))) => return Err(e.into()),
@@ -1776,10 +1852,12 @@ pub fn run_pick(ctx: &Ctx, song: u32, mode: ButtonMode, diff: usize, cancel: &At
     }
     // 목록은 제목순이라 위치를 못 찾는 화면은 다른 정렬일 수 있음
     // 한 번 잘못 읽었을 수도 있어서 먼저 프레임을 하나 더 봄
-    let mut rows = read_window(&first.0, &first.1, &ctx.refs);
+    // 프레임 하나에서 11줄, 목록 위치, 버튼 모드 표시
+    let look = |img: &dmpicker_engine::Rgb, geom: &ListGeom| (read_window(img, geom, &ctx.refs), *geom, dmpicker_engine::panel::button_mode(img, kind, geom));
+    let (mut rows, mut geom, mut mode_seen) = look(&first.0, &first.1);
     if !placed(&rows, &learned) {
         match screen.settled(cancel, Duration::from_millis(1500)) {
-            Ok(Some((img, geom))) => rows = read_window(&img, &geom, &ctx.refs),
+            Ok(Some((img, g))) => (rows, geom, mode_seen) = look(&img, &g),
             Ok(None) => {}
             Err(e) => return Stop::from(e).into(),
         }
@@ -1792,7 +1870,7 @@ pub fn run_pick(ctx: &Ctx, song: u32, mode: ButtonMode, diff: usize, cancel: &At
             return JobResult::Failed(SORT_ASK.into());
         }
         match sort_by_title(&mut LiveSort { screen: &screen, cancel }, &|| hands.check()) {
-            Ok((img, geom)) => rows = read_window(&img, &geom, &ctx.refs),
+            Ok((img, g)) => (rows, geom, mode_seen) = look(&img, &g),
             Err(stop) => return stop.into(),
         }
     }
@@ -1812,9 +1890,21 @@ pub fn run_pick(ctx: &Ctx, song: u32, mode: ButtonMode, diff: usize, cancel: &At
             eprintln!("model anomalies: {:?}", model.anomalies());
         }
         let mut nav = navigator(&model);
-        let mut io = LiveIo { screen: &screen, refs: &ctx.refs, learned: &learned, cancel, first: first_rows.take(), found: None, pressed: None };
+        let mut io = LiveIo {
+            screen: &screen,
+            refs: &ctx.refs,
+            learned: &learned,
+            cancel,
+            first: first_rows.take(),
+            found: None,
+            pressed: None,
+            geom: Some(geom),
+            mode_seen,
+        };
         let res = nav.navigate(&mut io, target);
         let found = io.found.take();
+        geom = io.geom.unwrap_or(geom);
+        mode_seen = io.mode_seen;
         match res {
             Ok(o) => {
                 eprintln!(
@@ -1822,7 +1912,7 @@ pub fn run_pick(ctx: &Ctx, song: u32, mode: ButtonMode, diff: usize, cancel: &At
                     o.presses, o.rounds, o.mismatches, o.dropped, o.elapsed_ms, o.hold_ms
                 );
                 eprintln!("job: arrived, applying mode/difficulty");
-                let diff_note = match apply_chart(&screen, mode, diff, o.hold_ms.max(30), cancel) {
+                let diff_note = match apply_chart(&screen, mode, diff, o.hold_ms.max(30), mode_seen, cancel) {
                     Ok(note) => note,
                     Err(e @ (Abort::Cancelled | Abort::FocusLost)) => return Stop::from(e).into(),
                     Err(e) => {
@@ -1875,6 +1965,32 @@ fn read_mode(screen: &Screen, cancel: &AtomicBool) -> Result<Option<u8>, Abort> 
     Ok(dmpicker_engine::panel::button_mode(&img, layout_kind(&geom), &geom))
 }
 
+/// 난이도 키를 누른 뒤, 멈춘 화면에 목표 난이도 칸만 채워진 게 연속 두 번 보이면 true
+/// 다른 모드 표시가 보이면 안 셈 (모드를 바꾸면 칸이 늦게 다시 그려짐)
+/// 600 ms 안에 안 보이면 false, 칸을 다시 읽고 다시 맞춤
+fn shows_chart(screen: &Screen, mode: ButtonMode, diff: usize, cancel: &AtomicBool) -> Result<bool, Abort> {
+    let t0 = Instant::now();
+    let mut hits = 0;
+    while t0.elapsed() < Duration::from_millis(600) {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Abort::Cancelled);
+        }
+        let img = screen.grab()?;
+        let info = dmpicker_engine::analyze(&img);
+        let shown = info.list.filter(|g| info.at_rest && g.on_grid()).is_some_and(|g| {
+            let m = dmpicker_engine::panel::button_mode(&img, info.kind, &g);
+            let d = info.slot_states.as_ref().and_then(dmpicker_engine::panel::selected_difficulty);
+            m.is_none_or(|m| m == mode.buttons()) && d == Some(dmpicker_engine::panel::Difficulty::ALL[diff])
+        });
+        hits = if shown { hits + 1 } else { 0 };
+        if hits >= 2 {
+            return Ok(true);
+        }
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    Ok(false)
+}
+
 /// 난이도 이름 뒤에 읽는 소리에 맞춰 (으)로를 붙임, NM(엔엠)은 으로, HD·MX·SC는 로
 fn label_ro(d: Diff) -> String {
     format!("{}{}", d.label(), if d == Diff::NM { "으로" } else { "로" })
@@ -1885,8 +2001,8 @@ const CHART_ASK: &str = "버튼 모드나 난이도를 맞추지 못했어요\n�
 
 /// 곡에 도착한 뒤 버튼 모드와 난이도를 맞추고 화면으로 확인, 하나라도 못 맞추면 사용자용 안내 문구를 돌려줌
 /// 모드 키는 모드를 바로 지정하니 표시가 아직 다른 모드면 다시 눌러도 됨 (최대 두 번 더)
-/// 모드 표시를 못 읽으면 확인 안 함
-fn apply_chart(screen: &Screen, mode: ButtonMode, diff: usize, t: u32, cancel: &AtomicBool) -> Result<Option<String>, Abort> {
+/// 모드 표시를 못 읽으면 확인 안 함, `mode_seen`은 도착한 멈춘 화면의 모드 표시
+fn apply_chart(screen: &Screen, mode: ButtonMode, diff: usize, t: u32, mode_seen: Option<u8>, cancel: &AtomicBool) -> Result<Option<String>, Abort> {
     use dmpicker_engine::SlotState;
     let press = |k: NKey| {
         if cancel.load(Ordering::Relaxed) {
@@ -1897,6 +2013,11 @@ fn apply_chart(screen: &Screen, mode: ButtonMode, diff: usize, t: u32, cancel: &
     let mut mode_failed = false;
     for attempt in 0..3 {
         press(NKey::Mode(mode))?;
+        // 이미 그 모드였으면 바뀌는 게 없어서 안 기다림
+        // 모드가 바뀌면 난이도 칸이 늦게 다시 그려져서 기다렸다가 확인
+        if attempt == 0 && mode_seen == Some(mode.buttons()) {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(250));
         match read_mode(screen, cancel)? {
             Some(m) if m != mode.buttons() => {
@@ -1924,7 +2045,9 @@ fn apply_chart(screen: &Screen, mode: ButtonMode, diff: usize, t: u32, cancel: &
             for k in keys {
                 press(k)?;
             }
-            std::thread::sleep(Duration::from_millis(120));
+            if shows_chart(screen, mode, diff, cancel)? {
+                return Ok(None);
+            }
         }
         Ok(Some(CHART_ASK.into()))
     };

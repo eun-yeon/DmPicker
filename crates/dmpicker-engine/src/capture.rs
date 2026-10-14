@@ -119,6 +119,14 @@ pub fn client_rect_screen(hwnd: Hwnd) -> Option<Rect> {
         .then_some(Rect::new(pt.x, pt.y, w as i32, h as i32))
 }
 
+/// 인식용 프레임([`capture`])이 화면에서 차지하는 사각형
+/// 16:9보다 세로로 길면 [`crop_game_frame`]처럼 가운데 띠만
+pub fn frame_rect_screen(hwnd: Hwnd) -> Option<Rect> {
+    let r = client_rect_screen(hwnd)?;
+    let h = ((r.w as f32 * 9.0 / 16.0).round() as i32).min(r.h);
+    Some(Rect::new(r.x, r.y + (r.h - h) / 2, r.w, h))
+}
+
 /// drop될 때 클로저 실행 (Win32 리소스 정리)
 struct Defer<F: FnMut()>(F);
 impl<F: FnMut()> Drop for Defer<F> {
