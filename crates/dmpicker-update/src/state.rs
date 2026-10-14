@@ -27,7 +27,6 @@ pub struct UpdateState {
     pub retry_after_until: Option<i64>,
     pub last_exe_check: Option<i64>,
     pub latest_version: Option<String>,
-    pub notified_version: Option<Version>,
     pub applied_tag: Option<String>,
     pub confirmed_tag: Option<String>,
     pub confirmed_active_tag: Option<String>,
@@ -113,11 +112,6 @@ impl UpdateState {
                 Ok::<_, Error>(CheckError { stage, http_status })
             })
             .transpose()?;
-        let version = |name| -> Result<Option<Version>> {
-            optional_string(object, name)?
-                .map(|value| Version::parse(&value))
-                .transpose()
-        };
         let latest_version = optional_string(object, "latestVersion")?;
         if let Some(tag) = &latest_version {
             Version::parse(tag)?;
@@ -135,7 +129,6 @@ impl UpdateState {
             retry_after_until: optional_time(object, "retryAfterUntil")?,
             last_exe_check: optional_time(object, "lastExeCheck")?,
             latest_version,
-            notified_version: version("notifiedVersion")?,
             applied_tag,
             confirmed_tag,
             confirmed_active_tag,
@@ -154,7 +147,6 @@ impl UpdateState {
             "retryAfterUntil": self.retry_after_until,
             "lastExeCheck": self.last_exe_check,
             "latestVersion": self.latest_version,
-            "notifiedVersion": self.notified_version.map(|version| version.to_string()),
             "appliedTag": self.applied_tag,
             "confirmedTag": self.confirmed_tag,
             "confirmedActiveTag": self.confirmed_active_tag,
@@ -296,18 +288,6 @@ impl UpdateState {
         Ok(())
     }
 
-    pub fn needs_exe_notice(&self, version: Version) -> bool {
-        self.notified_version
-            .is_none_or(|notified| version > notified)
-    }
-
-    /// 새 버전 알림을 실제로 보여 준 뒤 기록
-    pub fn record_exe_notice(&mut self, version: Version) {
-        if self.needs_exe_notice(version) {
-            self.notified_version = Some(version);
-        }
-    }
-
     pub fn needs_schema_notice(&self, schema: u64) -> bool {
         self.notified_schema != Some(schema)
     }
@@ -341,28 +321,28 @@ fn waiting(deadline: Option<i64>, now: i64) -> bool {
 
 /// 앱 시작은 Retry-After만 지키고 성공·실패 간격은 무시
 pub fn startup(state: &UpdateState, now: i64, jobs_busy: bool) -> CheckAction {
-    start(
-        state,
-        now,
-        jobs_busy,
-        !waiting(state.retry_after_until, now),
-    )
+    start(state, now, jobs_busy, true, true)
 }
 
 /// 검색창 열기에서 데이터와 exe 기한을 따로 확인
 /// `force_data`(받은 세대 없음)면 성공·실패 간격은 무시, Retry-After는 지킴
 pub fn due(state: &UpdateState, now: i64, jobs_busy: bool, force_data: bool) -> CheckAction {
-    let check_data = !waiting(state.retry_after_until, now)
-        && (force_data
-            || (!waiting(state.next_eligible_at, now) && !recent(state.last_success, now, HOUR)));
-    start(state, now, jobs_busy, check_data)
+    let check_data = force_data
+        || (!waiting(state.next_eligible_at, now) && !recent(state.last_success, now, HOUR));
+    let check_exe = !recent(state.last_exe_check, now, HOUR);
+    start(state, now, jobs_busy, check_data, check_exe)
 }
 
-fn start(state: &UpdateState, now: i64, jobs_busy: bool, check_data: bool) -> CheckAction {
-    if jobs_busy {
+fn start(
+    state: &UpdateState,
+    now: i64,
+    jobs_busy: bool,
+    check_data: bool,
+    check_exe: bool,
+) -> CheckAction {
+    if jobs_busy || waiting(state.retry_after_until, now) {
         return CheckAction::None;
     }
-    let check_exe = !recent(state.last_exe_check, now, DAY);
     if !check_data && !check_exe {
         return CheckAction::None;
     }

@@ -314,11 +314,7 @@ enum Command {
         previous: Option<String>,
     },
     Baseline(Snapshot),
-    /// 화면에 나간 새 버전·형식 안내
-    Noticed {
-        version: Option<Version>,
-        schema: Option<u64>,
-    },
+    SchemaNoticed(u64),
     Stop,
 }
 
@@ -351,8 +347,7 @@ pub const OUTDATED_TEXT: &str = "새 곡 데이터를 읽으려면 새 버전이
 
 /// 이번 검색창에서 표시할 새 버전 안내, 형식 안내가 있으면 그 설명
 pub struct ExeNotice {
-    version: Option<Version>,
-    schema: Option<u64>,
+    pub schema: Option<u64>,
     pub text: String,
 }
 
@@ -376,18 +371,11 @@ fn version_text(version: Version) -> String {
 }
 
 fn exe_notice(state: &UpdateState, schema: Option<u64>) -> Option<ExeNotice> {
-    let version = exe_release(state)
-        .map(|release| release.version())
-        .filter(|&version| state.needs_exe_notice(version));
     let text = match schema {
         Some(_) => OUTDATED_TEXT.to_owned(),
-        None => version_text(version?),
+        None => version_text(exe_release(state)?.version()),
     };
-    Some(ExeNotice {
-        version,
-        schema,
-        text,
-    })
+    Some(ExeNotice { schema, text })
 }
 
 fn exe_status(state: &UpdateState) -> Option<String> {
@@ -539,12 +527,11 @@ impl Updater {
     }
 
     /// 선곡 화면을 확인하고 검색창이 실제로 열렸을 때 확인 시작
-    /// 초기 로딩 중엔 새 버전 안내도 안 만듦, 뒤늦게 끝난 로딩이 알림 기록을 덮어쓰지 않게
     pub fn opened(&mut self, busy: bool, refs: Option<Arc<RefSet>>) {
+        self.exe_notice = exe_notice(&self.state, self.schema_notice);
         if self.initializing {
             return;
         }
-        self.exe_notice = exe_notice(&self.state, self.schema_notice);
         self.begin(CheckOrigin::Search, busy, refs);
     }
 
@@ -608,26 +595,22 @@ impl Updater {
         }
     }
 
-    /// 이번 열기의 안내가 화면에 나간 뒤 호출, 그 버전과 형식을 기록해 다음 열기부터 안 보이게
+    /// 형식 안내가 화면에 나간 뒤 기록해 다음 열기부터 안 보이게 함
     /// 이번 열기 동안은 안내를 그대로 둠
-    pub fn exe_notice_shown(&mut self) {
-        let Some(notice) = &self.exe_notice else {
+    pub fn schema_notice_shown(&mut self) {
+        let Some(schema) = self
+            .exe_notice
+            .as_ref()
+            .and_then(|notice| notice.schema)
+            .filter(|&schema| self.state.needs_schema_notice(schema))
+        else {
             return;
         };
-        let version = notice.version.filter(|&v| self.state.needs_exe_notice(v));
-        let schema = notice.schema.filter(|&s| self.state.needs_schema_notice(s));
-        if let Some(version) = version {
-            self.state.record_exe_notice(version);
+        self.state.record_schema_notice(schema);
+        if self.schema_notice == Some(schema) {
+            self.schema_notice = None;
         }
-        if let Some(schema) = schema {
-            self.state.record_schema_notice(schema);
-            if self.schema_notice == Some(schema) {
-                self.schema_notice = None;
-            }
-        }
-        if version.is_some() || schema.is_some() {
-            let _ = self.commands.send(Command::Noticed { version, schema });
-        }
+        let _ = self.commands.send(Command::SchemaNoticed(schema));
     }
 
     /// 새 데이터를 읽었으면 형식 문제가 풀림, 이번 열기의 형식 안내도 뺌
@@ -636,7 +619,7 @@ impl Updater {
         self.schema_notice = None;
         self.outdated = false;
         if self.exe_notice.as_ref().is_some_and(|n| n.schema.is_some()) {
-            self.exe_notice = None;
+            self.exe_notice = exe_notice(&self.state, None);
         }
     }
 
@@ -655,9 +638,11 @@ impl Updater {
 
     /// 알림 기록은 이 스레드에서만 바꿈, worker가 돌려준 상태로 되돌리지 않음
     fn accept_state(&mut self, mut state: UpdateState) {
-        state.notified_version = state.notified_version.max(self.state.notified_version);
         state.notified_schema = self.state.notified_schema;
         self.exe_status_text = exe_status(&state);
+        if self.exe_notice.as_ref().is_none_or(|notice| notice.schema.is_none()) {
+            self.exe_notice = exe_notice(&state, None);
+        }
         self.state = state;
     }
 
@@ -847,14 +832,9 @@ fn worker(
                     eprintln!("data notice: {error}");
                 }
             }
-            Command::Noticed { version, schema } => {
+            Command::SchemaNoticed(schema) => {
                 let result = UpdateState::load(&state_path).and_then(|mut state| {
-                    if let Some(version) = version {
-                        state.record_exe_notice(version);
-                    }
-                    if let Some(schema) = schema {
-                        state.record_schema_notice(schema);
-                    }
+                    state.record_schema_notice(schema);
                     state.save(&state_path)
                 });
                 if let Err(error) = result {
@@ -920,6 +900,7 @@ fn run_check(
     if wants_exe && !cancel.load(Ordering::Relaxed) {
         check_exe_version(&exe_latest_url(), &state_path, &mut state, cancel);
     }
+    let exe_retry_after_until = state.retry_after_until;
     let result = if wants_data {
         if let Err(error) = state.save(&state_path) {
             eprintln!("data state: {error}");
@@ -950,6 +931,8 @@ fn run_check(
             ),
             Err(_) => {}
         }
+        // 데이터 확인 결과가 exe 응답의 재시도 기한을 지우지 않게 함
+        state.retry_after_until = state.retry_after_until.max(exe_retry_after_until);
     }
     if let Err(error) = state.save(&state_path) {
         eprintln!("data state: {error}");
@@ -966,12 +949,13 @@ fn exe_latest_url() -> String {
     feed::EXE_LATEST_URL.into()
 }
 
-/// 실패도 하루에 한 번만 확인하고 데이터 확인 결과와 분리
+/// 실패도 확인 시각을 남겨 검색창을 열 때마다 재시도하지 않게 함
 fn check_exe_version(url: &str, state_path: &Path, state: &mut UpdateState, cancel: &AtomicBool) {
     let result = http::first_redirect(url, feed::MANIFEST_TIMEOUT_SECS, cancel);
     if result.as_ref().is_err_and(http::Failure::cancelled) {
         return;
     }
+    let checked_at = now();
     match result {
         Ok(location) => {
             if let (Ok(release), Some(current)) =
@@ -982,9 +966,14 @@ fn check_exe_version(url: &str, state_path: &Path, state: &mut UpdateState, canc
         }
         // 최신 릴리스가 없어지면 알던 새 버전 안내도 내림
         Err(error) if error.status == Some(404) => state.latest_version = None,
-        Err(_) => {}
+        Err(error) => {
+            state.retry_after_until = error
+                .retry_after
+                .as_deref()
+                .and_then(|header| feed::time::retry_after_deadline(header, checked_at));
+        }
     }
-    state.record_exe_check(now());
+    state.record_exe_check(checked_at);
     let _ = state.save(state_path);
 }
 
@@ -1314,9 +1303,11 @@ fn published_label(published: &str) -> Option<String> {
     ))
 }
 
+/// 실패 간격과 Retry-After 중 늦은 쪽까지 확인을 안 함
 fn failure_text(state: &UpdateState) -> String {
     let seconds = state
         .next_eligible_at
+        .max(state.retry_after_until)
         .unwrap_or_else(now)
         .saturating_sub(now())
         .max(0);

@@ -216,7 +216,7 @@ enum Card {
     Scan,
     /// 곡 이동 중 화면이 저장된 목록과 달랐음
     Stale,
-    /// 새 버전이 나옴, 버전마다 한 번만
+    /// 업데이트할 때까지 빈 입력마다 표시
     Update,
 }
 
@@ -680,10 +680,10 @@ pub struct Popup {
     stale: bool,
     /// 받아 둔 곡 데이터가 없을 때의 상태 (앱이 넘겨줌)
     data_notice: Option<DataNotice>,
-    /// 이번 열기의 새 버전 안내 설명, 열 때마다 앱이 정함
-    version_notice: Option<String>,
-    /// 새 버전 안내 카드를 그림, 앱이 꺼내서 기록 (`take_version_seen`)
-    version_seen: bool,
+    /// 새 버전 안내 설명, true면 한 번만 보이는 형식 안내
+    version_notice: Option<(String, bool)>,
+    /// 형식 안내 카드를 그림, 앱이 꺼내서 기록 (`take_schema_seen`)
+    schema_seen: bool,
     /// 설정 시트 머리 줄 문구, true면 새 버전 안내라 조금 밝게
     status_line: Option<(String, bool)>,
     /// 카드 시트에 그리는 카드, 시트처럼 보이거나 나타나는 중에만 바뀜
@@ -913,7 +913,7 @@ impl Popup {
             stale: false,
             data_notice: None,
             version_notice: None,
-            version_seen: false,
+            schema_seen: false,
             status_line: None,
             card_now: None,
             hotkey: Hotkey::DEFAULT,
@@ -1078,8 +1078,8 @@ impl Popup {
     }
 
     /// 업데이트 상태, 다시 그려야 하면 true
-    /// 받아 둔 곡 데이터가 없을 때의 안내, 이번 열기의 새 버전 안내 설명, 설정 머리 줄
-    pub fn set_updates(&mut self, data: Option<DataNotice>, version: Option<String>, status: Option<(String, bool)>) -> bool {
+    /// 받아 둔 곡 데이터가 없을 때의 안내, 새 버전 안내 설명, 설정 머리 줄
+    pub fn set_updates(&mut self, data: Option<DataNotice>, version: Option<(String, bool)>, status: Option<(String, bool)>) -> bool {
         if (data, &version, &status) == (self.data_notice, &self.version_notice, &self.status_line) {
             return false;
         }
@@ -1092,9 +1092,9 @@ impl Popup {
         true
     }
 
-    /// 지난번 꺼낸 뒤 새 버전 안내 카드를 그렸는지
-    pub fn take_version_seen(&mut self) -> bool {
-        std::mem::take(&mut self.version_seen)
+    /// 지난번 꺼낸 뒤 형식 안내 카드를 그렸는지
+    pub fn take_schema_seen(&mut self) -> bool {
+        std::mem::take(&mut self.schema_seen)
     }
 
     pub fn has_recognition(&self) -> bool {
@@ -1176,7 +1176,7 @@ impl Popup {
             Card::Outdated => ("앱을 업데이트해 주세요", OUTDATED_TEXT, Some("릴리즈 페이지")),
             Card::Scan => ("곡 목록을 한 번 읽어올게요", "읽는 동안 잠시 손을 쉬어 주세요", Some("목록 인식 시작")),
             Card::Stale => ("저장된 곡 목록과 화면이 달라요", "계정이나 DLC가 바뀌었다면 다시 읽어 주세요", Some("다시 인식")),
-            Card::Update => ("앱을 업데이트해 주세요", self.version_notice.as_deref().unwrap_or_default(), Some("릴리즈 페이지")),
+            Card::Update => ("앱을 업데이트해 주세요", self.version_notice.as_ref().map(|(text, _)| text.as_str()).unwrap_or_default(), Some("릴리즈 페이지")),
         }
     }
 
@@ -1190,9 +1190,10 @@ impl Popup {
         }
     }
 
-    /// 새 버전 안내 카드가 이번 프레임에 보이는지, 기록은 `presented`에서
-    fn version_card_visible(&self) -> bool {
-        self.sheet == Sheet::Card
+    /// 형식 안내 카드가 이번 프레임에 보이는지, 기록은 `presented`에서
+    fn schema_card_visible(&self) -> bool {
+        self.version_notice.as_ref().is_some_and(|(_, schema)| *schema)
+            && self.sheet == Sheet::Card
             && self.card_now == Some(Card::Update)
             && self.sheet_geom().alpha > 0.0
             && self.panel_h.value > 0.0
@@ -4558,16 +4559,16 @@ impl Popup {
         self.list_swap.last = list_drawn;
         self.sheet_swap.retire();
         self.list_swap.retire();
-        let seen = self.version_card_visible();
+        let seen = self.schema_card_visible();
         self.moving = self.animating();
         let presented = self.gfx.as_ref().unwrap().present();
         self.presented(seen, presented)
     }
 
-    /// 화면에 내보낸 프레임에서만 새 버전 안내를 본 걸로 침 (`take_version_seen`)
+    /// 화면에 내보낸 프레임만 형식 안내 표시로 기록
     fn presented(&mut self, seen: bool, result: Result<()>) -> Result<()> {
         if seen && result.is_ok() {
-            self.version_seen = true;
+            self.schema_seen = true;
         }
         result
     }

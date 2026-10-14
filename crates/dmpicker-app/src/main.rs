@@ -491,13 +491,12 @@ fn update_tick(a: &mut App) {
     sync_notices(a);
 }
 
-/// 업데이트 상태를 검색창 안내 카드와 설정 머리 줄에 넘김, 새 버전 안내는 그린 뒤에만 기록
+/// 형식 안내는 실제로 그린 뒤에만 기록
 fn sync_notices(a: &mut App) {
-    if a.popup.take_version_seen() {
-        a.updates.exe_notice_shown();
+    if a.popup.take_schema_seen() {
+        a.updates.schema_notice_shown();
     }
-    // 새 버전 안내는 열 때 정하고 그 열기 동안 유지, 형식 문제가 풀리면 빠짐
-    let version = a.updates.exe_notice.as_ref().map(|n| n.text.clone());
+    let version = a.updates.exe_notice.as_ref().map(|n| (n.text.clone(), n.schema.is_some()));
     if a.popup.set_updates(a.updates.data_notice, version, a.updates.status_line()) && a.popup.visible {
         if let Err(e) = a.popup.render() {
             eprintln!("render error: {e:?}");
@@ -516,9 +515,9 @@ fn update_opened(a: &mut App) {
     reap_jobs(a);
     a.updates.poll();
     start_update(a);
-    // 지난 열기에 보인 안내를 먼저 기록해야 이번 안내에서 빠짐
-    if a.popup.take_version_seen() {
-        a.updates.exe_notice_shown();
+    // 지난 열기에 보인 형식 안내를 먼저 기록해야 이번 안내에서 빠짐
+    if a.popup.take_schema_seen() {
+        a.updates.schema_notice_shown();
     }
     let busy = a.peeking || jobs_busy(a);
     let refs = a.refs.lock().ok().and_then(|slot| slot.clone());

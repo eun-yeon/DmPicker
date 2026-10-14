@@ -128,7 +128,7 @@ fn parse_http_date(text: &str) -> Result<i64> {
 }
 
 /// Retry-After를 기한으로 변환, 최대 24시간만 기다림
-pub(crate) fn retry_after_deadline(value: &str, now: i64) -> Option<i64> {
+pub fn retry_after_deadline(value: &str, now: i64) -> Option<i64> {
     let value = value.trim();
     let seconds = if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
         value.bytes().fold(0i64, |n, b| {
