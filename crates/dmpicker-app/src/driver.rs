@@ -621,6 +621,9 @@ enum Pair {
 
 /// 확실하지 않은 인식에서 근거로 쳐 주는 최저 후보 점수
 const READ_FLOOR: f32 = 0.5;
+/// 확실한 쪽이 상대의 1위로 뒷받침할 때만 쓰는 더 낮은 하한
+/// 갓 들어와 흐려지는 중인 줄은 맞게 읽혀도 점수가 이만큼까지 내려감
+const WEAK_FLOOR: f32 = 0.25;
 
 /// 두 창에서 본 게 같은 칸인지, 인식 결과로 먼저 보고 다음에 특징으로 봄
 /// 같은 재킷을 두 줄에서 자르면 `ALIGN_SIM` 위, 다른 재킷끼리는 한참 아래
@@ -639,8 +642,14 @@ fn pair(a: &Seen, b: &Seen) -> Pair {
         }
     }
     // 한쪽의 확실한 결과가 다른 쪽 상위 후보 안에 있음
+    // 상대도 그 곡을 1위로 꼽았으면 `WEAK_FLOOR`까지 받아 줌: 흐려지는 중인 줄은
+    // 맞게 읽혀도 `READ_FLOOR` 아래로 내려가고, 그걸 버리면 겹치는 줄이 모자라 창이 안 맞음
     let backs = |sure: &Seen, other: &Seen| {
-        sure.sure && sure.cands.first().is_some_and(|t| other.cands.iter().take(3).any(|c| c.id == t.id && c.score >= READ_FLOOR))
+        let Some(t) = sure.cands.first().filter(|_| sure.sure) else {
+            return false;
+        };
+        let floor = |c: &Candidate, top: bool| c.id == t.id && c.score >= if top { WEAK_FLOOR } else { READ_FLOOR };
+        other.cands.iter().take(3).enumerate().any(|(i, c)| floor(c, i == 0))
     };
     if backs(a, b) || backs(b, a) || features::dot(&a.feat[..], &b.feat[..]) >= ALIGN_SIM {
         return Pair::Same;
@@ -765,6 +774,11 @@ const STEP: usize = 5;
 const MIN_OVERLAP: f32 = 0.75;
 const MIN_COMMON: usize = 3;
 const MIN_LEAD: f32 = 0.2;
+/// 다른 모든 밀림이 모순이라 답이 하나뿐일 때 쓰는 느슨한 기준
+/// 안쪽 겹침이 4줄뿐이어서 흐린 줄 둘만 겹쳐도 `MIN_COMMON`에 걸리는데,
+/// 이어 붙일 자리가 애초에 하나라면 틀린 목록을 만들 수 없음
+const SOLE_OVERLAP: f32 = 0.5;
+const SOLE_COMMON: usize = 2;
 /// 안 맞는 창을 포기하기 전까지 다시 보는 횟수
 const REREADS: u32 = 2;
 /// 목록이 안 움직인 창(입력 씹힘)이 연속 이만큼이면 포기, 그때마다 누르는 시간을 늘림
@@ -921,7 +935,10 @@ fn fit_shift(prev: &[Seen], rows: &[Seen]) -> Result<(i64, f32), String> {
     let (shift, contra, m, n, score) = fits[0];
     let lead = fits.get(1).filter(|f| f.1 == 0).map_or(f32::INFINITY, |f| score - f.4);
     let share = m as f32 / n as f32;
-    if contra == 0 && m >= MIN_COMMON && share >= MIN_OVERLAP && lead >= MIN_LEAD {
+    // 다른 밀림이 전부 모순이면 (lead 가 무한) 이어 붙일 자리가 하나뿐이라 기준을 낮춤
+    let sole = fits.len() > 1 && lead.is_infinite();
+    let (need_m, need_share) = if sole { (SOLE_COMMON, SOLE_OVERLAP) } else { (MIN_COMMON, MIN_OVERLAP) };
+    if contra == 0 && m >= need_m && share >= need_share && lead >= MIN_LEAD {
         return Ok((shift as i64, share));
     }
     let read = |r: &Seen| r.cands.first().map_or("-".to_string(), |c| format!("{}:{:.2}{}", c.id, c.score, if r.sure { "!" } else { "" }));
@@ -933,7 +950,8 @@ fn fit_shift(prev: &[Seen], rows: &[Seen]) -> Result<(i64, f32), String> {
 /// 불확실한 줄이 있는 창을 첫 번 말고 더 보는 최대 횟수
 const SECOND_LOOKS: usize = 2;
 /// 키를 누른 뒤 줄이 흐려지는(커서에서 멀수록 어두워짐) 시간, 대략 이 정도
-const FADE: Duration = Duration::from_millis(320);
+/// 다시 볼 때마다 이 배수로 기다림: 느린 기기에서 한 번에 안 끝나도 다음 번에 잡음
+const FADE: Duration = Duration::from_millis(420);
 /// 누른 만큼 안 움직였을 때 마지막 키 뒤 이만큼 지나면 늦게 먹은 입력까지 목록에 반영됨
 const LATE: Duration = Duration::from_millis(400);
 
@@ -1024,11 +1042,11 @@ fn scan_timed(
         let last = rows.len().saturating_sub(1);
         let unsure = |r: &Seen| !r.sure && !r.random && r.row != 0 && r.row != last;
         let top = |r: &Seen| (r.random, r.cands.first().map(|c| c.id));
-        for _ in 0..SECOND_LOOKS {
+        for look in 0..SECOND_LOOKS {
             if !rows.iter().any(unsure) {
                 break;
             }
-            if let Some(wait) = FADE.checked_sub(moved_at.elapsed()) {
+            if let Some(wait) = (FADE * (look as u32 + 1)).checked_sub(moved_at.elapsed()) {
                 let at = Instant::now();
                 std::thread::sleep(wait);
                 t.fade += at.elapsed();
@@ -1930,4 +1948,77 @@ fn apply_chart(screen: &Screen, mode: ButtonMode, diff: usize, t: u32, cancel: &
     };
     let note = diff_note()?;
     Ok(if mode_failed { Some(CHART_ASK.into()) } else { note })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 진단 로그 표기(`108:0.48`, `107:0.96!`)대로 줄 하나 만들기
+    /// 특징은 0 으로 둬서 재킷 닮음(`ALIGN_SIM`)이 끼어들지 않게 함
+    fn row(k: usize, text: &str) -> Seen {
+        let (text, sure) = match text.strip_suffix('!') {
+            Some(t) => (t, true),
+            None => (text, false),
+        };
+        let (id, score) = text.split_once(':').expect("id:score");
+        Seen {
+            cands: vec![Candidate { id: id.parse().unwrap(), score: score.parse().unwrap() }],
+            sure,
+            random: false,
+            grey: false,
+            feat: Box::new([0.0; FEAT_LEN]),
+            row: k,
+        }
+    }
+
+    /// 11줄 창, 칸 번호를 id 로 씀 (`prev` 는 101..111, `rows` 는 106..116)
+    fn window(texts: [&str; 11]) -> Vec<Seen> {
+        texts.iter().enumerate().map(|(k, t)| row(k, t)).collect()
+    }
+
+    /// 아래로 갓 들어와 아직 흐린 줄이 둘 있어도, 다음 창의 확실한 인식이
+    /// 같은 곡을 1위로 꼽으면 이어 붙음 (`shift 5 2/4` 로 멈추던 창)
+    #[test]
+    fn faded_rows_backed_by_sure_read_fit() {
+        let prev = window([
+            "101:0.95!", "102:0.95!", "103:0.95!", "104:0.95!", "105:0.95!", "106:0.95!", "107:0.96!", "108:0.48", "109:0.34", "110:0.62",
+            "111:0.95!",
+        ]);
+        let rows = window([
+            "106:0.95!", "107:0.96!", "108:0.99!", "109:0.99!", "110:1.00!", "111:0.95!", "112:0.95!", "113:0.95!", "114:0.95!", "115:0.95!",
+            "116:0.95!",
+        ]);
+        assert_eq!(fit_shift(&prev, &rows).map(|f| f.0), Ok(5));
+    }
+
+    /// 뒷받침도 안 될 만큼 흐려서 겹친 줄이 둘뿐이어도,
+    /// 다른 모든 밀림이 모순이면 (이어 붙을 자리가 하나) 받아들임
+    #[test]
+    fn sole_shift_fits_on_thin_evidence() {
+        let prev = window([
+            "101:0.95!", "102:0.95!", "103:0.95!", "104:0.95!", "105:0.95!", "106:0.95!", "107:0.96!", "108:0.18", "109:0.12", "110:0.62",
+            "111:0.95!",
+        ]);
+        let rows = window([
+            "106:0.95!", "107:0.96!", "108:0.99!", "109:0.99!", "110:1.00!", "111:0.95!", "112:0.95!", "113:0.95!", "114:0.95!", "115:0.95!",
+            "116:0.95!",
+        ]);
+        assert_eq!(fit_shift(&prev, &rows).map(|f| f.0), Ok(5));
+    }
+
+    /// 확실한 줄이 없어 다른 밀림을 모순으로 쳐낼 수 없으면 느슨한 기준을 쓰지 않음
+    #[test]
+    fn thin_evidence_alone_does_not_fit() {
+        let prev = window([
+            "101:0.95", "102:0.95", "103:0.95", "104:0.95", "105:0.95", "106:0.95", "107:0.96", "108:0.48", "109:0.34", "110:0.62",
+            "111:0.95",
+        ]);
+        let rows = window([
+            "106:0.95", "107:0.96", "108:0.99", "109:0.99", "110:1.00", "111:0.95", "112:0.95", "113:0.95", "114:0.95", "115:0.95",
+            "116:0.95",
+        ]);
+        let why = fit_shift(&prev, &rows).expect_err("확실한 근거가 없으면 멈춰야 함");
+        assert!(why.starts_with("shift 5 2/4"), "{why}");
+    }
 }
