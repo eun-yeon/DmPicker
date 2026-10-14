@@ -23,6 +23,8 @@ const KEY_UP: u16 = 1;
 const KEY_E0: u16 = 2;
 /// 오른쪽 Shift의 스캔 코드 (Ctrl·Alt는 E0 표시로 가림)
 const RIGHT_SHIFT: u16 = 0x36;
+/// 마우스 버튼 다섯 개의 누름과 세로·가로 휠 (`RI_MOUSE_*`)
+const PRESS_OR_WHEEL: u16 = 0x0001 | 0x0004 | 0x0010 | 0x0040 | 0x0100 | 0x0400 | 0x0800;
 
 /// 단축키 수식 키와 raw input이 주는 키, 왼쪽·오른쪽 키 (`StopKey::held` 순서)
 const MOD_KEYS: [(HOT_KEY_MODIFIERS, VIRTUAL_KEY, [VIRTUAL_KEY; 2]); 3] = [
@@ -184,12 +186,14 @@ impl Hands {
             let right = if k.VKey == VK_SHIFT.0 { k.MakeCode == RIGHT_SHIFT } else { k.Flags & KEY_E0 != 0 };
             self.keys.key(k.VKey, right, up).then(|| format!("key {:#04x}{}", k.VKey, if up { " up" } else { "" }))
         } else if raw.header.dwType == RIM_TYPEMOUSE.0 {
-            // 버튼과 휠만, 움직이기만 하면 플래그 없음
+            // 버튼 누름과 휠만, 움직이기만 하면 플래그 없음
+            // 뗌은 안 셈, 검색창에서 곡을 클릭하면 누를 때 작업이 시작돼서 뗌이 감시 뒤에 옴
             let m = unsafe { raw.data.mouse };
             let buttons = unsafe { m.Anonymous.Anonymous.usButtonFlags };
             let data = unsafe { m.Anonymous.Anonymous.usButtonData } as i16;
             let device = if raw.header.hDevice.0.is_null() { "none" } else { "yes" };
-            (buttons != 0).then(|| format!("mouse buttons {buttons:#06x} data {data} flags {:#06x} move {},{} device {device}", m.usFlags.0, m.lLastX, m.lLastY))
+            (buttons & PRESS_OR_WHEEL != 0)
+                .then(|| format!("mouse buttons {buttons:#06x} data {data} flags {:#06x} move {},{} device {device}", m.usFlags.0, m.lLastX, m.lLastY))
         } else {
             None
         }

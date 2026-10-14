@@ -315,7 +315,8 @@ fn on_pick(a: &mut App, id: u32, chart: Option<(dmpicker_search::Mode, dmpicker_
             stale.store(true, Ordering::Relaxed);
             say(&format!("저장된 곡 목록과 화면이 달라요\n계정이나 DLC가 바뀌었다면 {hk} → 다시 인식"), Badge::None, Some(5.0))
         }
-        driver::JobResult::Touched(why) => say(&format!("이동하지 못했어요\n{why}"), Badge::None, Some(3.0)),
+        // 이동을 시작한 곡은 히스토리에 이미 있음
+        driver::JobResult::Touched(why) => say(&format!("{}\n히스토리에서 다시 고를 수 있어요", driver::stopped_line(why)), Badge::None, Some(3.0)),
         driver::JobResult::Cancelled => say("이동을 취소했어요", Badge::None, Some(2.0)),
         driver::JobResult::Scanned { .. } => {}
         driver::JobResult::Failed(e) => say(&format!("이동하지 못했어요\n{e}"), Badge::None, Some(5.0)),

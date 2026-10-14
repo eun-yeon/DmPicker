@@ -14,6 +14,10 @@ pub enum Abort {
     FocusLost,
     /// 사용자가 취소함 (단축키, UI)
     Cancelled,
+    /// 사용자가 키·클릭·휠로 게임을 직접 건드림
+    Touched,
+    /// 온라인 방 채팅 입력창이 열려서 키가 목록 대신 글자로 들어감
+    ChatOpen,
     /// I/O 계층이 학습한 목록을 고침 (화면에 보이는 곡이 목록에 없었음)
     /// 모델을 다시 만들고 다시 이동해야 함
     ListChanged,
@@ -62,6 +66,7 @@ pub trait GameIo {
 ///   `hitch_patience`번 넘게 연달아 실패해야 프레임이 진짜 떨어진 것, 검증 버리고 `t *= 1.5`
 /// * 검증값이 없을 때 (시작 직후, 프레임 저하 뒤): 묶음의 `timing_drop_fraction` 이상
 ///   (2번 이상) 누락되면 `t *= 1.5`, 아니면 위처럼 끊김으로 셈
+/// * 묶음이 통째로 누락되면 검증값이어도 검증 버리고 `t *= 1.5`
 ///
 /// `t`는 `ceil_ms`를 안 넘음
 /// `bad`는 성공마다 `bad_decay`씩 줄어서 가끔 더 빠른 값도 다시 시험함 (fps 제한을 올린 뒤 등)
@@ -143,6 +148,14 @@ impl TimingTuner {
                 self.hitch_streak = 0;
             }
             None if dropped >= 2 && dropped as f32 >= self.timing_drop_fraction * sent as f32 => {
+                self.t = (t * self.increase).min(self.ceil_ms);
+                self.hitch_streak = 0;
+            }
+            // 묶음이 통째로 안 먹으면 바로 느리게 함
+            // 한 키짜리 보정은 끊김으로 세다 보면 목록이 안 움직인다고 먼저 포기함 (30 fps 아래에서 25 ms 키)
+            _ if dropped >= sent => {
+                self.proven = None;
+                self.suspect = None;
                 self.t = (t * self.increase).min(self.ceil_ms);
                 self.hitch_streak = 0;
             }

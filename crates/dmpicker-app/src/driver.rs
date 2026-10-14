@@ -1,6 +1,7 @@
 //! 화면 인식(dmpicker-engine), 경로 계획·실행(dmpicker-nav), 사용자별 저장 목록을 잇는 부분
 //! 작업 스레드에서 돌고 게임 프로세스는 건드리지 않음
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -351,6 +352,8 @@ impl Learned {
 
 pub struct Screen {
     pub game: Hwnd,
+    /// 마지막으로 찍은 그림의 지문, 그 그림이 바로 전에 찍은 그림과 같았는지
+    seen: Cell<(Option<u64>, bool)>,
 }
 
 impl Screen {
@@ -358,7 +361,17 @@ impl Screen {
     /// 최소화에서 펴지는 중에 모드가 바뀌기도 해서 찍을 때마다 봄
     pub fn grab(&self) -> Result<dmpicker_engine::Rgb, Abort> {
         let method = if full_screen() { CaptureMethod::ScreenBlt } else { CaptureMethod::PrintWindow };
-        capture::capture(self.game, method).map_err(|e| Abort::Io(format!("{e:?}")))
+        let img = capture::capture(self.game, method).map_err(|e| Abort::Io(format!("{e:?}")))?;
+        let print = fingerprint(&img);
+        let (last, _) = self.seen.get();
+        self.seen.set((Some(print), last == Some(print)));
+        Ok(img)
+    }
+
+    /// 마지막으로 찍은 그림이 그 전에 찍은 그림과 똑같았는지 (어느 단계에서 찍었든)
+    /// 키를 보낸 뒤 첫 그림이 키 전 그림과 같으면 게임이 그동안 아무것도 안 그린 것
+    fn repeated(&self) -> bool {
+        self.seen.get().1
     }
 
     /// 목록이 멈출 때까지 기다린 뒤 그 프레임과 목록 위치를 돌려줌
@@ -376,6 +389,7 @@ impl Screen {
     fn wait_rest(&self, cancel: &AtomicBool, timeout: Duration, w: &mut Waits, on_grid: bool) -> Result<Option<(dmpicker_engine::Rgb, ListGeom)>, Abort> {
         let t0 = Instant::now();
         let mut ok = 0;
+        let mut freeze = Freeze::default();
         let nap = |w: &mut Waits, ms: u64| {
             let t = Instant::now();
             std::thread::sleep(Duration::from_millis(ms));
@@ -389,10 +403,18 @@ impl Screen {
             let t = Instant::now();
             let img = self.grab()?;
             let grabbed = Instant::now();
-            let info = dmpicker_engine::analyze(&img);
             w.grab += grabbed - t;
-            w.judge += grabbed.elapsed();
             w.frames += 1;
+            let info = dmpicker_engine::analyze(&img);
+            w.judge += grabbed.elapsed();
+            // 멈춘 게임이면 멈추기 직전 그림도 키 전 화면일 수 있어서 그때까지의 판단은 버림 (풀리는 그림에서도)
+            if freeze.frozen() {
+                ok = 0;
+            }
+            if freeze.same(info.list.is_some() && self.repeated()) {
+                nap(w, 15);
+                continue;
+            }
             if let Some(geom) = info.list {
                 if info.at_rest && (!on_grid || geom.on_grid()) {
                     ok += 1;
@@ -405,11 +427,79 @@ impl Screen {
             } else {
                 ok = 0;
             }
-            if t0.elapsed() > timeout {
+            if t0.elapsed().saturating_sub(freeze.waited()) > timeout {
                 return Ok(None);
             }
             nap(w, 15);
         }
+    }
+}
+
+/// 그림이 같은지 볼 지문, 8바이트씩 섞음
+fn fingerprint(img: &dmpicker_engine::Rgb) -> u64 {
+    const PRIME: u64 = 0x0000_0100_0000_01B3;
+    let mut h = 0xCBF2_9CE4_8422_2325 ^ ((img.width as u64) << 32 | img.height as u64);
+    let words = img.data.chunks_exact(8);
+    let rest = words.remainder();
+    // 곱하기만 하면 맨 위 비트 차이가 아래로 안 퍼져서 그런 차이 둘이 서로 지워짐, 돌려서 섞음
+    for w in words {
+        h = (h ^ u64::from_le_bytes(w.try_into().unwrap())).wrapping_mul(PRIME).rotate_left(29);
+    }
+    for &b in rest {
+        h = (h ^ b as u64).wrapping_mul(PRIME);
+    }
+    h
+}
+
+/// 게임이 멈추면 새 화면을 안 그려서 찍을 때마다 똑같은 그림이 나옴
+/// 살아 있는 선곡 화면은 배경이 늘 움직여서 가만히 있어도 프레임마다 그림이 다름 (곡 12개 168쌍 모두 달랐음)
+/// 똑같은 그림은 새 정보가 아니라 건너뛰고, 그동안은 시간 제한에서 뺌
+/// 건너뛰기만 해서 잘못 봐도 다음 새 그림을 기다릴 뿐임, 오래 같으면 예전처럼 그 그림을 씀
+/// 목록이 보이는 그림만, 목록 없는 화면은 멈춘 게임인지 원래 정지한 화면인지 몰라서 예전처럼 시간 제한으로 끝냄
+#[derive(Default)]
+struct Freeze {
+    /// 지금 같은 그림이 이어지기 시작한 시각
+    since: Option<Instant>,
+    waited: Duration,
+}
+
+/// 같은 그림이 이보다 오래 이어지면 게임이 멈춘 것, 그 직전 그림도 멈춘 화면일 수 있어서 안 믿음
+/// 이보다 짧으면 느린 게임(4 fps까지)의 한 프레임일 수 있음, 그때마다 판단을 버리면 그런 게임에선 위치를 못 정함
+const FROZEN_MIN: Duration = Duration::from_millis(250);
+/// 같은 그림을 이보다 오래 건너뛰진 않음, 원래 가만한 화면일 수도 있어서 그 뒤엔 예전처럼 그 그림을 씀
+/// 멈춤 판단이 틀려도 예전보다 이만큼만 늦음, 게임이 3초쯤 멈추는 PC가 있음
+const FROZEN_MAX: Duration = Duration::from_secs(5);
+
+impl Freeze {
+    /// 같은 그림이 이어진 시간 합, 이 대기에서 여러 번 멈춘 것도 다 더함
+    fn spent(&self) -> Duration {
+        self.waited + self.since.map_or(Duration::ZERO, |s| s.elapsed())
+    }
+
+    /// 방금 찍은 그림을 건너뛸지, 바로 전에 찍은 그림과 똑같으면(`repeated`) 건너뜀
+    /// 이 대기에서 건너뛴 시간이 모두 합쳐 [`FROZEN_MAX`]를 넘으면 그 뒤로는 예전처럼 씀
+    fn same(&mut self, repeated: bool) -> bool {
+        if repeated {
+            self.since.get_or_insert_with(Instant::now);
+            return self.spent() <= FROZEN_MAX;
+        }
+        if let Some(since) = self.since.take() {
+            if since.elapsed() >= FROZEN_MIN {
+                diagnostic!("frozen: the game drew nothing for {} ms", since.elapsed().as_millis());
+            }
+            self.waited += since.elapsed();
+        }
+        false
+    }
+
+    /// 지금 이어지는 같은 그림이 멈춘 게임 것인지, 건너뛰기를 그만둔 뒤엔 예전처럼 안 따짐
+    fn frozen(&self) -> bool {
+        self.since.is_some_and(|s| s.elapsed() >= FROZEN_MIN) && self.spent() <= FROZEN_MAX
+    }
+
+    /// 시간 제한에서 뺄 시간, 건너뛴 시간이지만 모두 합쳐 [`FROZEN_MAX`]까지
+    fn waited(&self) -> Duration {
+        self.spent().min(FROZEN_MAX)
     }
 }
 
@@ -553,6 +643,7 @@ pub struct LiveIo<'a> {
     pub refs: &'a RefSet,
     pub learned: &'a Learned,
     pub cancel: &'a AtomicBool,
+    hands: &'a HandsOff,
     /// 멈춘 목록에서 이미 읽은 창, 첫 확인 때 새 프레임 대신 씀
     pub first: Option<[RowRead; 11]>,
     /// 온라인 목록에 없던 LOCKED 칸 (넣을 위치, 칸)
@@ -564,6 +655,8 @@ pub struct LiveIo<'a> {
     pub geom: Option<ListGeom>,
     /// 마지막으로 멈춘 프레임의 버튼 모드 표시 (4, 5, 6, 8)
     pub mode_seen: Option<u8>,
+    /// 지난 확인 뒤로 누른 키 수와 누른 시간, 실패 기록용
+    keys: (u32, u32),
 }
 
 impl LiveIo<'_> {
@@ -572,6 +665,7 @@ impl LiveIo<'_> {
     fn still_rows(&mut self) -> Result<Option<[RowRead; 11]>, Abort> {
         let t0 = Instant::now();
         let mut prev: Option<Option<usize>> = None;
+        let mut freeze = Freeze::default();
         std::thread::sleep(Duration::from_millis(40));
         loop {
             if self.cancel.load(Ordering::Relaxed) {
@@ -579,11 +673,23 @@ impl LiveIo<'_> {
             }
             let img = self.screen.grab()?;
             let info = dmpicker_engine::analyze(&img);
+            if freeze.frozen() {
+                prev = None;
+            }
+            if freeze.same(info.list.is_some() && self.screen.repeated()) {
+                std::thread::sleep(Duration::from_millis(15));
+                continue;
+            }
             match info.list.filter(|g| info.at_rest && g.on_grid()) {
                 Some(g) => {
                     let rows = read_window(&img, &g, self.refs);
                     let pos = locate(&match_table(&rows, self.learned)).0;
                     if prev == Some(pos) {
+                        // 이동 중에 열렸으면 (감시가 못 잡은 Enter) 더 보내지 않음
+                        if room::chat_open_at(&img, &g) {
+                            diagnostic!("nav: the chat box is open");
+                            return Err(Abort::ChatOpen);
+                        }
                         self.geom = Some(g);
                         self.mode_seen = dmpicker_engine::panel::button_mode(&img, info.kind, &g);
                         return Ok(Some(rows));
@@ -592,7 +698,7 @@ impl LiveIo<'_> {
                 }
                 None => prev = None,
             }
-            if t0.elapsed() > Duration::from_millis(1500) {
+            if t0.elapsed().saturating_sub(freeze.waited()) > Duration::from_millis(1500) {
                 return Ok(None);
             }
             std::thread::sleep(Duration::from_millis(15));
@@ -605,15 +711,15 @@ impl GameIo for LiveIo<'_> {
         if self.cancel.load(Ordering::Relaxed) {
             return Err(Abort::Cancelled);
         }
+        self.hands.check_keys()?;
         press_engine(self.screen.game, key, hold_ms, gap_ms)?;
         self.pressed = Some(Instant::now());
+        self.keys = (self.keys.0 + 1, hold_ms);
         Ok(())
     }
 
     fn read_pos(&mut self) -> Result<Observation, Abort> {
-        if !input::is_foreground(self.screen.game) {
-            return Err(Abort::FocusLost);
-        }
+        self.hands.check_keys()?;
         let rows = match self.first.take() {
             Some(rows) => rows,
             None => match self.still_rows()? {
@@ -623,6 +729,8 @@ impl GameIo for LiveIo<'_> {
         };
         let m = match_table(&rows, self.learned);
         let (pos, agree) = locate(&m);
+        let (keys, hold) = std::mem::take(&mut self.keys);
+        diagnostic!("nav: {keys} keys at {hold} ms, then at {pos:?}");
         if self.learned.kind == ScreenKind::OnlineList && agree < rows.len() {
             if let Some((at, j)) = find_missing_locked(&rows, &m, self.refs) {
                 self.found = Some((at, locked_entry(&rows[j], self.learned)));
@@ -873,6 +981,8 @@ impl From<Abort> for Stop {
         match e {
             Abort::Cancelled => Stop::Cancelled,
             Abort::FocusLost => Stop::Touched(FOCUS_LEFT),
+            Abort::Touched => Stop::Touched(MOVED),
+            Abort::ChatOpen => Stop::Failed(CHAT.into()),
             Abort::ListChanged => Stop::Failed(MISREAD.into()),
             Abort::Io(e) => {
                 diagnostic!("io: {e}");
@@ -885,6 +995,8 @@ impl From<Abort> for Stop {
 const FOCUS_LEFT: &str = "다른 창으로 바뀌었어요";
 const MOVED: &str = "키보드나 마우스 입력이 있었어요";
 const NO_FRAME: &str = "게임 화면을 읽지 못했어요";
+/// 채팅 입력창이 열린 채로는 키가 글자로 들어가서 아무 키도 안 보냄, 사용자가 닫아야 해서 실패 기록엔 안 남김
+pub(crate) const CHAT: &str = "채팅 입력창을 닫고 다시 시도해 주세요";
 /// 곡 목록이 없음, 작업 시작 때부터 없거나 도중에 사라짐
 const NOT_HERE: &str = "선곡 화면에서 다시 시도해 주세요";
 const TAB_ASK: &str = "ALL TRACK 탭으로 바꾼 뒤 다시 시도해 주세요";
@@ -893,7 +1005,16 @@ const NOT_HOST: &str = "방장만 곡을 고를 수 있어요";
 /// 앞뒤가 안 맞는 인식 (오인식, 키와 다르게 움직인 목록), 저장 안 함
 const MISREAD: &str = "목록을 제대로 읽지 못했어요. 다시 인식해 주세요";
 
-/// 인식 중엔 손을 떼야 함, 키·클릭·휠은 목록을 움직이고 다른 창은 키를 가져감
+/// 곡 이동이 멈춘 이유를 알림 첫 줄로, `why`는 [`JobResult::Touched`] 값
+pub fn stopped_line(why: &str) -> &'static str {
+    if why == FOCUS_LEFT {
+        "다른 창으로 바뀌어서 멈췄어요"
+    } else {
+        "키보드나 마우스 입력으로 멈췄어요"
+    }
+}
+
+/// 인식·이동 중엔 손을 떼야 함, 키·클릭·휠은 목록을 움직이고 다른 창은 키를 가져감
 /// 마우스 이동만은 괜찮음 (게임이 안 따라감)
 struct HandsOff {
     game: Hwnd,
@@ -917,11 +1038,16 @@ impl HandsOff {
     }
 
     fn check(&self) -> Result<(), Stop> {
+        self.check_keys().map_err(Stop::from)
+    }
+
+    /// 이동기용 [`HandsOff::check`]
+    fn check_keys(&self) -> Result<(), Abort> {
         if !input::is_foreground(self.game) {
-            return Err(Stop::Touched(FOCUS_LEFT));
+            return Err(Abort::FocusLost);
         }
         if self.hands.as_ref().is_some_and(Hands::touched) {
-            return Err(Stop::Touched(MOVED));
+            return Err(Abort::Touched);
         }
         Ok(())
     }
@@ -1293,6 +1419,7 @@ fn scan_timed(
             if cancel.load(Ordering::Relaxed) {
                 return Err(Stop::Cancelled);
             }
+            hands.check()?;
             press_engine(screen.game, NKey::Down, ms, ms)?;
         }
         moved_at = Instant::now();
@@ -1406,7 +1533,7 @@ fn focused_screen() -> Result<Screen, JobResult> {
     if full_screen() {
         diagnostic!("capture: full screen, reading the screen");
     }
-    Ok(Screen { game })
+    Ok(Screen { game, seen: Cell::new((None, false)) })
 }
 
 /// 전체 화면 게임은 검색창에 포커스를 뺏기면 최소화되고 다시 펴질 때 화면 모드를 바꾸느라 2~3초 걸림
@@ -1457,7 +1584,7 @@ fn tab_frame(screen: &Screen, geom: &ListGeom, cancel: &AtomicBool) -> Result<dm
 ///
 /// 빈 탭(아무것도 없는 FAVORITE)은 잴 목록이 없어서 레이아웃상 탭 줄 자리를 읽음
 /// 거기서 ALL TRACK이 보여야만(선곡 화면이라는 증거) 키를 누름
-fn goto_all_track(screen: &Screen, cancel: &AtomicBool) -> Result<(dmpicker_engine::Rgb, ListGeom), Stop> {
+fn goto_all_track(screen: &Screen, cancel: &AtomicBool, hands: &HandsOff) -> Result<(dmpicker_engine::Rgb, ListGeom), Stop> {
     let not_here = || Stop::Failed(NOT_HERE.into());
     let settled = || screen.settled(cancel, Duration::from_secs(3))?.ok_or_else(not_here);
     let press = |key: EKey, n: usize| {
@@ -1465,6 +1592,7 @@ fn goto_all_track(screen: &Screen, cancel: &AtomicBool) -> Result<(dmpicker_engi
             if cancel.load(Ordering::Relaxed) {
                 return Err(Stop::Cancelled);
             }
+            hands.check()?;
             input::press(screen.game, key, 40, 40).map_err(|_| Stop::Touched(FOCUS_LEFT))?;
         }
         std::thread::sleep(Duration::from_millis(300));
@@ -1523,6 +1651,8 @@ fn goto_all_track(screen: &Screen, cancel: &AtomicBool) -> Result<(dmpicker_engi
 /// 정렬을 못 바꿨거나 마지막 키 뒤에도 정렬 창이 떠 있음, 사용자가 직접 바꾸게 함
 /// 게임이 아직 받을 수 있는 키 뒤엔 다른 키를 안 누름
 const SORT_ASK: &str = "정렬을 곡 제목 (A to Z)으로 맞춘 뒤 다시 시도해 주세요";
+/// 조금씩 가다가 이동 시간 제한에 걸림
+const TOO_LONG: &str = "시간이 너무 오래 걸려서 멈췄어요";
 /// 키가 다른 데로 감, 온라인 채팅 입력창이 열려 있으면 키를 가져감
 const NOT_MOVING: &str = "목록이 움직이지 않아요. 채팅 입력 중이면 닫고 다시 시도해 주세요";
 /// 정렬 창 키 간격, 탭 전환과 같음 (입력이 씹힐 수 있어서 단계마다 화면으로 확인)
@@ -1699,10 +1829,22 @@ fn recheck(
     for (done, &i) in which.iter().enumerate() {
         progress(done);
         hands.check()?;
-        let mut io = LiveIo { screen, refs: &ctx.refs, learned: l, cancel, first: None, found: None, pressed: None, geom: None, mode_seen: None };
+        let mut io = LiveIo {
+            screen,
+            refs: &ctx.refs,
+            learned: l,
+            cancel,
+            hands,
+            first: None,
+            found: None,
+            pressed: None,
+            geom: None,
+            mode_seen: None,
+            keys: (0, 0),
+        };
         match nav.navigate(&mut io, i) {
             Ok(_) => {}
-            Err(NavError::Aborted(e @ (Abort::Cancelled | Abort::FocusLost))) => return Err(e.into()),
+            Err(NavError::Aborted(e @ (Abort::Cancelled | Abort::FocusLost | Abort::Touched | Abort::ChatOpen))) => return Err(e.into()),
             Err(e) => {
                 diagnostic!("recheck {i}: not reached ({e})");
                 continue;
@@ -1800,7 +1942,11 @@ fn scan_job(ctx: &Ctx, cancel: &AtomicBool, mut progress: impl FnMut(ScanStage))
         Ok(s) => s,
         Err(r) => return r,
     };
-    let (img, geom) = match goto_all_track(&screen, cancel) {
+    let hands = HandsOff::begin(screen.game, ctx.hotkey);
+    if screen.grab().is_ok_and(|img| room::chat_open(&img)) {
+        return JobResult::Failed(CHAT.into());
+    }
+    let (img, geom) = match goto_all_track(&screen, cancel, &hands) {
         Ok(f) => f,
         Err(stop) => return stop.into(),
     };
@@ -1809,7 +1955,6 @@ fn scan_job(ctx: &Ctx, cancel: &AtomicBool, mut progress: impl FnMut(ScanStage))
     }
     let t0 = Instant::now();
     let kind = layout_kind(&geom);
-    let hands = HandsOff::begin(screen.game, ctx.hotkey);
     let saved = Learned::load(&ctx.store, kind);
     // 목록은 제목순으로 익힘, 정렬 창으로 순서를 확인하고 맞춤
     // 사용자 키를 감시 못 하면 저장 목록에서 화면 위치를 찾을 때만 진행
@@ -1909,12 +2054,18 @@ fn pick_job(ctx: &Ctx, song: u32, mode: ButtonMode, diff: usize, cancel: &Atomic
         Ok(s) => s,
         Err(r) => return r,
     };
-    // 방장이 아니면 키를 하나도 안 누름, 화면을 못 읽으면 막지 않음
-    if screen.grab().is_ok_and(|img| room::not_host(&img)) {
-        return JobResult::Failed(NOT_HOST.into());
+    let hands = HandsOff::begin(screen.game, ctx.hotkey);
+    // 방장이 아니거나 채팅 입력창이 열려 있으면 키를 하나도 안 누름, 화면을 못 읽으면 막지 않음
+    if let Ok(img) = screen.grab() {
+        if room::not_host(&img) {
+            return JobResult::Failed(NOT_HOST.into());
+        }
+        if room::chat_open(&img) {
+            return JobResult::Failed(CHAT.into());
+        }
     }
     diagnostic!("job: focused, reading screen");
-    let first = match goto_all_track(&screen, cancel) {
+    let first = match goto_all_track(&screen, cancel, &hands) {
         Ok(f) => f,
         Err(stop) => return stop.into(),
     };
@@ -1941,7 +2092,6 @@ fn pick_job(ctx: &Ctx, song: u32, mode: ButtonMode, diff: usize, cancel: &Atomic
     if !placed(&rows, &learned) {
         diagnostic!("job: the screen does not fit the list, sorting by title");
         // Enter 직전에 사용자가 키를 누르면 정렬 창이 먼저 닫힐 수 있음, 키 감시 없이는 안 바꿈
-        let hands = HandsOff::begin(screen.game, ctx.hotkey);
         if !hands.watching() {
             return JobResult::Failed(SORT_ASK.into());
         }
@@ -1971,11 +2121,13 @@ fn pick_job(ctx: &Ctx, song: u32, mode: ButtonMode, diff: usize, cancel: &Atomic
             refs: &ctx.refs,
             learned: &learned,
             cancel,
+            hands: &hands,
             first: first_rows.take(),
             found: None,
             pressed: None,
             geom: Some(geom),
             mode_seen,
+            keys: (0, 0),
         };
         let res = nav.navigate(&mut io, target);
         let found = io.found.take();
@@ -1988,9 +2140,9 @@ fn pick_job(ctx: &Ctx, song: u32, mode: ButtonMode, diff: usize, cancel: &Atomic
                     o.presses, o.rounds, o.mismatches, o.dropped, o.elapsed_ms, o.hold_ms
                 );
                 diagnostic!("job: arrived, applying mode/difficulty");
-                let diff_note = match apply_chart(&screen, mode, diff, o.hold_ms.max(30), mode_seen, cancel) {
+                let diff_note = match apply_chart(&io, mode, diff, o.hold_ms.max(30)) {
                     Ok(note) => note,
-                    Err(e @ (Abort::Cancelled | Abort::FocusLost)) => return Stop::from(e).into(),
+                    Err(e @ (Abort::Cancelled | Abort::FocusLost | Abort::Touched | Abort::ChatOpen)) => return Stop::from(e).into(),
                     Err(e) => {
                         diagnostic!("chart: {e:?}");
                         Some(CHART_ASK.into())
@@ -2021,16 +2173,24 @@ fn nav_failed(e: NavError) -> JobResult {
         NavError::Aborted(e) => Stop::from(e).into(),
         NavError::NotMoving => JobResult::Failed(NOT_MOVING.into()),
         NavError::NotOnList => JobResult::Failed(NOT_HERE.into()),
+        // 조금씩이라도 가다가 시간이 다 된 것, 게임이 자꾸 멈추는 PC에서 남 (목록은 맞음)
+        NavError::Timeout { .. } => JobResult::Failed(TOO_LONG.into()),
         _ => JobResult::ListMismatch,
     }
 }
 
-fn read_slots(screen: &Screen, cancel: &AtomicBool) -> Result<Option<[dmpicker_engine::SlotState; 4]>, Abort> {
+/// 곡을 바꾸면 난이도 칸이 키 뒤 300 ms 가까이 바뀌는 중임 (60 fps 실측 최대 295 ms)
+/// 그동안 다른 칸이 몇 프레임 연달아 선택돼 보이기도 함
+const SLOTS_AFTER_KEY: Duration = Duration::from_millis(400);
+
+/// `moved`는 곡을 바꾼 마지막 키를 누른 시각
+fn read_slots(screen: &Screen, cancel: &AtomicBool, moved: Option<Instant>) -> Result<Option<[dmpicker_engine::SlotState; 4]>, Abort> {
     // 곡이나 모드를 바꾸면 조금 뒤 난이도 칸이 다시 그려짐, 목록이 멈춘 뒤 60 ms 더 기다렸다가 새로 찍어 읽음
     if screen.settled(cancel, Duration::from_millis(1200))?.is_none() {
         return Ok(None);
     }
-    std::thread::sleep(Duration::from_millis(60));
+    let wait = moved.and_then(|t| SLOTS_AFTER_KEY.checked_sub(t.elapsed())).unwrap_or_default();
+    std::thread::sleep(wait.max(Duration::from_millis(60)));
     Ok(dmpicker_engine::analyze(&screen.grab()?).slot_states)
 }
 
@@ -2072,41 +2232,50 @@ fn label_ro(d: Diff) -> String {
 }
 
 /// 버튼 모드나 난이도를 못 맞췄거나 확인 못 함, 사용자가 직접 확인
-const CHART_ASK: &str = "버튼 모드나 난이도를 맞추지 못했어요\n게임에서 직접 확인해 주세요";
+pub(crate) const CHART_ASK: &str = "버튼 모드나 난이도를 맞추지 못했어요\n게임에서 직접 확인해 주세요";
 
 /// 곡에 도착한 뒤 버튼 모드와 난이도를 맞추고 화면으로 확인, 하나라도 못 맞추면 사용자용 안내 문구를 돌려줌
 /// 모드 키는 모드를 바로 지정하니 표시가 아직 다른 모드면 다시 눌러도 됨 (최대 두 번 더)
-/// 모드 표시를 못 읽으면 확인 안 함, `mode_seen`은 도착한 멈춘 화면의 모드 표시
-fn apply_chart(screen: &Screen, mode: ButtonMode, diff: usize, t: u32, mode_seen: Option<u8>, cancel: &AtomicBool) -> Result<Option<String>, Abort> {
+/// 모드 표시를 못 읽으면 확인 안 함, `io`는 도착한 이동 (마지막 멈춘 화면의 모드 표시와 마지막 키 시각을 씀)
+fn apply_chart(io: &LiveIo, mode: ButtonMode, diff: usize, t: u32) -> Result<Option<String>, Abort> {
     use dmpicker_engine::SlotState;
+    let (screen, cancel) = (io.screen, io.cancel);
     let press = |k: NKey| {
         if cancel.load(Ordering::Relaxed) {
             return Err(Abort::Cancelled);
         }
+        io.hands.check_keys()?;
         press_engine(screen.game, k, t, t)
     };
     let mut mode_failed = false;
     for attempt in 0..3 {
-        press(NKey::Mode(mode))?;
-        // 이미 그 모드였으면 바뀌는 게 없어서 안 기다림
-        // 모드가 바뀌면 난이도 칸이 늦게 다시 그려져서 기다렸다가 확인
-        if attempt == 0 && mode_seen == Some(mode.buttons()) {
+        // 모드는 곡을 바꿔도 그대로라 도착한 화면이 이미 그 모드면 안 누름
+        if attempt == 0 && io.mode_seen == Some(mode.buttons()) {
             break;
         }
+        press(NKey::Mode(mode))?;
+        // 모드가 바뀌면 난이도 칸이 늦게 다시 그려져서 기다렸다가 확인
         std::thread::sleep(Duration::from_millis(250));
         match read_mode(screen, cancel)? {
             Some(m) if m != mode.buttons() => {
                 diagnostic!("chart: {m}B on screen after the {}B key", mode.buttons());
                 mode_failed = attempt == 2;
             }
-            _ => break,
+            Some(_) => break,
+            None => {
+                diagnostic!("chart: mode not read after the {}B key", mode.buttons());
+                break;
+            }
         }
     }
     let diff_note = || -> Result<Option<String>, Abort> {
         for _attempt in 0..3 {
-            let Some(states) = read_slots(screen, cancel)? else { return Ok(Some(CHART_ASK.into())) };
+            let Some(states) = read_slots(screen, cancel, io.pressed)? else { return Ok(Some(CHART_ASK.into())) };
+            diagnostic!("chart: slots {states:?}");
             let avail: [bool; 4] = states.map(|s| s != SlotState::Missing);
-            let Some(cur) = states.iter().position(|s| *s == SlotState::Selected) else {
+            // 칸이 바뀌는 중엔 여러 칸이 채워져 보이기도 해서 딱 하나일 때만 믿음
+            let mut selected = (0..4).filter(|&i| states[i] == SlotState::Selected);
+            let (Some(cur), None) = (selected.next(), selected.next()) else {
                 std::thread::sleep(Duration::from_millis(120));
                 continue;
             };

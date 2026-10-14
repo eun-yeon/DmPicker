@@ -88,9 +88,13 @@ pub fn line(args: Arguments<'_>) {
 pub fn finish(store: &Path, kind: Kind, result: &JobResult) {
     let lines = LINES.take().unwrap_or_default();
     let what = match (kind, result) {
+        // 열린 채팅 입력창은 사용자가 닫으면 되는 상태라 고칠 문제가 아님
+        (_, JobResult::Failed(e)) if e == crate::driver::CHAT => return,
         (_, JobResult::Failed(e)) => e.as_str(),
         // 알림 문구는 다시 인식하라는 안내라 기록엔 뜻만 적음
         (Kind::Pick, JobResult::ListMismatch) => "저장된 곡 목록과 화면이 맞지 않음",
+        // 없는 채보 안내는 정상, 확인 못 한 것만
+        (Kind::Pick, JobResult::Arrived { diff_note: Some(note), .. }) if note == crate::driver::CHART_ASK => "곡엔 도착했지만 버튼 모드나 난이도를 맞추지 못함",
         // 성공, 취소, 사용자가 건드림, 목록에 없는 곡, 인식 전은 고칠 문제가 아님
         _ => return,
     };
