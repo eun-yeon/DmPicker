@@ -67,10 +67,8 @@ const CLOSE_TEXT_GONE: f32 = 0.5;
 const SHEET_RISE: f32 = 6.0;
 const SHEET_IN_SECS: f32 = 0.22;
 const SHEET_OUT_SECS: f32 = 0.16;
-/// 보기·탭·카드를 바꿀 때 옛 내용이 흐려지는 시간과 새 내용이 같은 자리에서 나타나는 시간 (`Crossfade`)
-/// 둘이 같이 시작해서 빈 판이 안 보임
-const SWAP_OUT_SECS: f32 = 0.18;
-const SWAP_IN_SECS: f32 = 0.25;
+/// 보기·탭·카드를 바꿀 때 옛 내용에서 새 내용으로 섞이는 시간 (`Crossfade`)
+const SWAP_SECS: f32 = 0.25;
 /// 즐겨찾기 별 (`StarMotion`): 색과 채움은 켤 때도 끌 때도 이 시간에 바뀜, 눌림과 점 튀기는 켤 때만
 const STAR_FILL_SECS: f32 = 0.15;
 /// 눌림: 앞 30 %에 이 배율까지 줄었다 나머지에 돌아옴, 구간마다 넘쳤다 돌아옴
@@ -416,62 +414,94 @@ impl StarMotion {
     }
 }
 
-/// 겹쳐 바꾸기: 지난 프레임에 그린 내용이 흐려지는 동안 새 내용이 같은 자리에서 나타남
+/// 섞을 내용들과 비율 (합 1, 다 편 시트 자리, 변환 없음)
+type Parts = Vec<(ID2D1CommandList, f32)>;
+
+/// 겹쳐 바꾸기: 지난 프레임에 보인 그림과 새 내용을 같은 자리에서 섞음
+/// 비율대로 더해서 양쪽에 같은 글자는 섞는 동안에도 진하기 그대로
+/// 보통 겹치기로 덮어 그리면 같은 글자가 50 ms쯤 69 %까지 옅어짐
 struct Crossfade {
-    /// 지금 내용 보임 0 .. 1
+    /// 새 내용 비율 0 .. 1, 옛 그림은 나머지
     shown: Tween,
-    /// 지난 프레임에 그린 내용 (다 편 시트 자리, 변환 없음)
-    last: Option<ID2D1CommandList>,
-    /// 흐려지는 옛 내용과 불투명도, 연달아 바꿔도 하나씩 마저 사라짐
-    old: Vec<(ID2D1CommandList, Tween)>,
+    /// 지난 프레임에 보인 내용들과 비율
+    last: Parts,
+    /// 옛 그림: 바꿀 때 보이던 내용들과 비율
+    old: Parts,
 }
 
 impl Crossfade {
     fn new() -> Self {
-        Self { shown: Tween::new(1.0), last: None, old: Vec::new() }
+        Self { shown: Tween::new(1.0), last: Vec::new(), old: Vec::new() }
     }
 
-    /// 지난 프레임 내용은 보이던 만큼에서 흐려 보내고 새 내용은 0부터 나타냄
+    /// 지난 프레임에 보인 그대로를 옛 그림으로 두고 새 내용은 0부터 섞어 넣음
+    /// 한 프레임에 두 번 바뀌면 지난 그림은 이미 옛 그림이라 그대로 둠
+    /// 옅은 내용부터 버린 합이 1/64 안일 때까지 버림
+    /// 섞는 중에 연달아 바꿔도 몇 장만 남고, 남은 비율을 다시 나눠도 튐이 안 보임
     fn swap(&mut self) {
-        if let Some(list) = self.last.take() {
-            let mut fade = Tween::new(self.shown.value());
-            fade.go(0.0, SWAP_OUT_SECS, Ease::DECEL);
-            self.old.push((list, fade));
+        if !self.last.is_empty() {
+            let mut old = std::mem::take(&mut self.last);
+            old.sort_by(|a, b| a.1.total_cmp(&b.1));
+            let mut cut = 0.0;
+            let faint = old.iter().take_while(|&&(_, a)| {
+                cut += a;
+                cut < 1.0 / 64.0
+            });
+            old.drain(..faint.count());
+            let sum: f32 = old.iter().map(|&(_, a)| a).sum();
+            old.iter_mut().for_each(|(_, a)| *a /= sum);
+            self.old = old;
         }
         self.shown.snap(0.0);
-        self.shown.go(1.0, SWAP_IN_SECS, Ease::DECEL);
+        self.shown.go(1.0, SWAP_SECS, Ease::DECEL);
     }
 
     /// 겹치지 않고 지금 내용만 바로 다 보임
     fn reset(&mut self) {
         self.shown.snap(1.0);
-        self.last = None;
+        self.last.clear();
         self.old.clear();
     }
 
     fn animating(&self) -> bool {
-        !self.shown.done() || !self.old.is_empty()
+        !self.shown.done()
     }
 
     fn retire(&mut self) {
-        self.old.retain(|(_, fade)| !fade.done());
+        if self.shown.done() {
+            self.old.clear();
+        }
     }
 
-    /// 옛 내용들 위에 지금 내용 `now`를 그림, 다 보이는 내용은 레이어 없이
-    unsafe fn draw(&self, dc: &ID2D1DeviceContext, now: &ID2D1CommandList) {
-        for (list, a) in self.old.iter().map(|(list, fade)| (list, fade.value())).chain([(now, self.shown.value())]) {
-            let a = alpha_step(a);
-            if a <= 0.0 {
-                continue;
-            }
-            if a < 1.0 {
-                dc.PushLayer(&gfx::layer(a, None), None);
-            }
-            dc.DrawImage(list, None, None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
-            if a < 1.0 {
-                dc.PopLayer();
-            }
+    /// 이번 프레임에 보일 그림과 그 구성 (다음 `last`), 섞는 중이면 옛 내용들과 `now`를 비율대로 섞음
+    /// 옛 그림이 없으면 빈 그림에서 나타남
+    /// 섞는 효과는 프레임마다 새로 만듦, 섞은 줄 목록은 시트 옛 그림 안에 참조로 남아서 고쳐 쓰면 그것까지 바뀜
+    unsafe fn compose(&self, g: &Gfx, now: ID2D1CommandList) -> Result<(ID2D1Image, Parts)> {
+        let w = alpha_step(self.shown.value());
+        if w >= 1.0 {
+            return Ok((now.cast()?, vec![(now, 1.0)]));
         }
+        let mut parts = Vec::new();
+        if w > 0.0 {
+            parts.push((now, w));
+        }
+        if self.old.is_empty() {
+            parts.push((record(&g.dc, || Ok(()))?, 1.0 - w));
+        } else {
+            parts.extend(self.old.iter().map(|(l, a)| (l.clone(), a * (1.0 - w))));
+        }
+        // 지금까지 섞은 것에 다음 장을 (그 장 비율 / 누적 비율)로 섞어 감
+        let (mut out, mut sum): (ID2D1Image, f32) = (parts[0].0.cast()?, parts[0].1);
+        for (l, a) in &parts[1..] {
+            sum += a;
+            let mix = g.effect(&CLSID_D2D1CrossFade)?;
+            // 무게 x 입력 0 + (1 - 무게) x 입력 1
+            gfx::set_input_image(&mix, 0, &l.cast()?);
+            gfx::set_input_image(&mix, 1, &out);
+            gfx::set_f32(&mix, D2D1_CROSSFADE_PROP_WEIGHT.0 as u32, a / sum)?;
+            out = mix.GetOutput()?;
+        }
+        Ok((out, parts))
     }
 }
 
@@ -1554,7 +1584,7 @@ impl Popup {
             } else {
                 self.sheet_swap.reset();
             }
-            // 탭을 바꾸며 흐려지던 줄 목록은 옛 시트 내용에 같이 들어 있음
+            // 탭을 바꾸며 섞이던 줄 목록은 옛 시트 그림에 같이 들어 있음
             self.list_swap.reset();
         }
         self.card_now = card;
@@ -4235,7 +4265,7 @@ impl Popup {
                 Ok(())
             };
             // 시트 내용 (다 편 시트 자리), 히스토리는 제자리 탭 아래에 겹쳐 바꾸는 줄 목록 `list`
-            let draw_sheet = |list: Option<&ID2D1CommandList>| -> Result<()> {
+            let draw_sheet = |list: Option<&ID2D1Image>| -> Result<()> {
                 if self.sheet == Sheet::Settings {
                     let sl = self.settings_layout();
                     let t = g.layout("검색 설정", &f.head, self.px(200.0), self.px(22.0))?;
@@ -4369,7 +4399,7 @@ impl Popup {
                     let at = self.seg[2].value();
                     draw_segments(g, f, self.tabs_rect(), &["최근", "즐겨찾기"], (at, at + 1.0), lay::PANEL_R - lay::PAD, s)?;
                     if let Some(list) = list {
-                        self.list_swap.draw(dc, list);
+                        dc.DrawImage(list, None, None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
                     }
                 } else if self.sheet == Sheet::Card {
                     draw_card()?;
@@ -4379,11 +4409,11 @@ impl Popup {
                 Ok(())
             };
 
-            // 3) 패널 내용 기록: 7)에서 이걸 그리고, 다음 프레임에 보기·카드·탭이 바뀌면 흐려 보냄 (`Crossfade`)
-            // 히스토리 줄 목록은 탭만 바뀔 때 혼자 흐려 보내려고 먼저 따로 기록
+            // 3) 패널 내용 기록: 바꾸는 중이면 옛 그림과 섞어서 7)에서 그리고, 다음 프레임에 보기·카드·탭이 바뀌면 이게 옛 그림이 됨 (`Crossfade`)
+            // 히스토리 줄 목록은 탭만 바뀔 때 혼자 섞으려고 먼저 따로 기록
             if has_panel {
-                let list = if self.sheet == Sheet::History { Some(record(dc, draw_list)?) } else { None };
-                sheet_drawn = Some(record(dc, || draw_sheet(list.as_ref()))?);
+                let list = if self.sheet == Sheet::History { Some(self.list_swap.compose(g, record(dc, draw_list)?)?) } else { None };
+                sheet_drawn = Some(self.sheet_swap.compose(g, record(dc, || draw_sheet(list.as_ref().map(|(l, _)| l)))?)?);
                 list_drawn = list;
             }
 
@@ -4520,13 +4550,13 @@ impl Popup {
             }
 
             // 7) 패널 내용 (움직이는 패널 모양으로 자름, 보기·카드·탭을 바꾸면 겹쳐 바꿈)
-            if let Some(drawn) = &sheet_drawn {
+            if let Some((drawn, _)) = &sheet_drawn {
                 // 마스크는 PopLayer 뒤 이 블록이 끝날 때 해제
                 let mask: ID2D1Geometry = g.factory.CreateRoundedRectangleGeometry(&rounded(panel, pr))?.cast()?;
                 dc.PushLayer(&D2D1_LAYER_PARAMETERS1 { contentBounds: panel, ..gfx::layer(panel_a, Some(&mask)) }, None);
                 // 내용은 다 편 시트 자리에서 시트와 같이 비켜남
                 dc.SetTransform(&windows_numerics::Matrix3x2 { M32: shrink.M32 + k * sg.dy, ..shrink });
-                self.sheet_swap.draw(dc, drawn);
+                dc.DrawImage(drawn, None, None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
                 dc.SetTransform(&shrink);
                 dc.PopLayer();
             }
@@ -4555,8 +4585,8 @@ impl Popup {
                 eprintln!("beams: {e:?}");
             }
         }
-        self.sheet_swap.last = sheet_drawn;
-        self.list_swap.last = list_drawn;
+        self.sheet_swap.last = sheet_drawn.map(|(_, parts)| parts).unwrap_or_default();
+        self.list_swap.last = list_drawn.map(|(_, parts)| parts).unwrap_or_default();
         self.sheet_swap.retire();
         self.list_swap.retire();
         let seen = self.schema_card_visible();
