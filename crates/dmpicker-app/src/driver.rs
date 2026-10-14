@@ -18,6 +18,11 @@ use crate::hands::Hands;
 use crate::hotkey::Hotkey;
 use crate::pace::{Pace, SAFE_MS};
 
+/// `eprintln!` 대신 씀, 작업 중이면 실패 기록에 넣을 진단으로도 모임
+macro_rules! diagnostic {
+    ($($arg:tt)*) => { crate::fail_log::line(format_args!($($arg)*)) };
+}
+
 const ALIGN_SIM: f32 = 0.85;
 /// 저장된 게임 내 특징이 계산 방식과 안 맞게 되면 `dmpicker_engine::features::FEATURE_VERSION`과 같이 올림
 const LEARN_MAGIC: &[u8; 8] = b"PICKLST3";
@@ -145,7 +150,7 @@ impl Learned {
             }
         }
         d.save(store).map_err(|e| e.to_string())?;
-        eprintln!("derived {} list: {} entries", kind_name(d.kind), d.entries.len());
+        diagnostic!("derived {} list: {} entries", kind_name(d.kind), d.entries.len());
         Ok(())
     }
 
@@ -197,7 +202,7 @@ impl PendingLearned {
                 self.learned.entries[*i].id = alt.map(|c| c.id);
                 changed.insert(*i);
             }
-            eprintln!("repair round {round}: {} anomalies", anomalies.len());
+            diagnostic!("repair round {round}: {} anomalies", anomalies.len());
         }
         // 중복 id는 가장 잘 읽힌 칸만 남기고 나머지는 모름으로
         let mut best: HashMap<u32, (usize, f32)> = HashMap::new();
@@ -306,7 +311,7 @@ impl Learned {
     /// 나머지는 [`Learned::confirm`]이 정함, 반영했는지를 돌려줌
     fn reread(&mut self, i: usize, row: &RowRead, titles: &HashMap<u32, String>) -> bool {
         if row.is_random && !self.entries.iter().any(|e| e.random) {
-            eprintln!("recheck {i}: RANDOM");
+            diagnostic!("recheck {i}: RANDOM");
             let e = &mut self.entries[i];
             (e.random, e.id, e.locked) = (true, None, false);
             return true;
@@ -316,7 +321,7 @@ impl Learned {
             _ => self.confirm(i, row, titles),
         };
         let Some(id) = id else { return false };
-        eprintln!("recheck {i}: {}", titles.get(&id).map_or("?", String::as_str));
+        diagnostic!("recheck {i}: {}", titles.get(&id).map_or("?", String::as_str));
         self.entries[i].id = Some(id);
         self.entries[i].feat = quant(&row.feature);
         true
@@ -796,7 +801,7 @@ impl ScanTimes {
         let looks = self.fade + self.look_frame + self.look_read;
         let compute = self.fit + self.merge + self.wrap;
         let known = self.keys + w.grab + w.judge + w.sleep + self.read + looks + compute;
-        eprintln!(
+        diagnostic!(
             "scan time {:.1}s: keys {:.1}s, settle {:.1}s (capture {:.1}s, rest check {:.1}s, sleep {:.1}s, {} frames), read {:.1}s, second looks {:.1}s (fade wait {:.1}s, frame {:.1}s, read {:.1}s), compute {:.2}s (fit {:.2}s, merge {:.2}s, wrap {:.2}s), other {:.1}s",
             s(total),
             s(self.keys),
@@ -816,7 +821,7 @@ impl ScanTimes {
             s(self.wrap),
             s(total.saturating_sub(known)),
         );
-        eprintln!(
+        diagnostic!(
             "scan windows: {} read, {} second looks (best candidate changed in {} looks / {} rows, unsure made sure in {} rows), last key to first read avg {} ms max {} ms",
             self.windows,
             self.looks,
@@ -828,7 +833,7 @@ impl ScanTimes {
         );
         let Some(&fastest) = self.paces.keys().next() else { return };
         let paces: Vec<String> = self.paces.iter().map(|(ms, [n, short, late])| format!("{ms} ms {n} moves ({short} short, {late} late)")).collect();
-        eprintln!("scan pace: final {} ms, fastest {fastest} ms; {}", self.pace_end, paces.join(", "));
+        diagnostic!("scan pace: final {} ms, fastest {fastest} ms; {}", self.pace_end, paces.join(", "));
     }
 }
 
@@ -867,7 +872,7 @@ impl From<Abort> for Stop {
             Abort::FocusLost => Stop::Touched(FOCUS_LEFT),
             Abort::ListChanged => Stop::Failed(MISREAD.into()),
             Abort::Io(e) => {
-                eprintln!("io: {e}");
+                diagnostic!("io: {e}");
                 Stop::Failed(NO_FRAME.into())
             }
         }
@@ -898,7 +903,7 @@ impl HandsOff {
     fn begin(game: Hwnd, stop: Hotkey) -> Self {
         let hands = Hands::watch(stop);
         if hands.is_none() {
-            eprintln!("hands: no raw input, watching the focus only");
+            diagnostic!("hands: no raw input, watching the focus only");
         }
         HandsOff { game, hands }
     }
@@ -1149,7 +1154,7 @@ fn scan_timed(
                 // 확실히 안 맞으면 다시 봄 (인식이 조금씩 달라짐)
                 // 그래도 안 되면 틀린 목록을 잇느니 멈춤
                 Err(why) => {
-                    eprintln!("scan: window does not fit ({why}){}", if rereads >= REREADS { ", stopping" } else { "" });
+                    diagnostic!("scan: window does not fit ({why}){}", if rereads >= REREADS { ", stopping" } else { "" });
                     if rereads >= REREADS {
                         return Err(Stop::Failed(MISREAD.into()));
                     }
@@ -1185,7 +1190,7 @@ fn scan_timed(
                 counts[1] += 1;
                 counts[2] += u32::from(shift > fitted);
                 let again = if look { format!(", {shift} when looked at again") } else { String::new() };
-                eprintln!("scan: moved {fitted} of {STEP} at {ms} ms{again}; now {} ms", pace.ms());
+                diagnostic!("scan: moved {fitted} of {STEP} at {ms} ms{again}; now {} ms", pace.ms());
             }
             t.pace_end = pace.ms();
             if shift == 0 {
@@ -1243,7 +1248,7 @@ fn scan_timed(
                 })
                 .collect();
             agrees.sort_by(f32::total_cmp);
-            eprintln!(
+            diagnostic!(
                 "scan: {l} entries in {:.1}s, window overlap agreement min {:.2} / 5th pct {:.2}, {} read two ways, {} second looks",
                 started.elapsed().as_secs_f32(),
                 agrees.first().copied().unwrap_or(1.0),
@@ -1330,7 +1335,7 @@ pub fn ensure_both(store: &Path, title_of: &dyn Fn(u32) -> String) {
         }
         let Some(src) = Learned::load(store, other_kind(k)) else { continue };
         if let Err(e) = src.save_derived(store, title_of) {
-            eprintln!("derive {}: {e}", kind_name(k));
+            diagnostic!("derive {}: {e}", kind_name(k));
         }
     }
 }
@@ -1411,7 +1416,7 @@ fn goto_all_track(screen: &Screen, cancel: &AtomicBool) -> Result<(dmpicker_engi
     let nominal = |img: &dmpicker_engine::Rgb| {
         let k = tabs::empty_tab(img).map(|(_, k)| k);
         if let Some(k) = k {
-            eprintln!("tabs: no list, ALL TRACK {k} to the right");
+            diagnostic!("tabs: no list, ALL TRACK {k} to the right");
         }
         k
     };
@@ -1552,25 +1557,25 @@ impl SortIo for LiveSort<'_> {
 fn sort_by_title<S: SortIo>(io: &mut S, check: &dyn Fn() -> Result<(), Stop>) -> Result<S::Frame, Stop> {
     let fail = |why: &str| Stop::Failed(why.into());
     if io.list(Duration::from_millis(1500), check)?.is_none() {
-        eprintln!("sort: no list at rest");
+        diagnostic!("sort: no list at rest");
         return Err(fail(SORT_ASK));
     }
     check()?;
     io.key(EKey::F4)?;
     let Some(mut at) = io.popup(Duration::from_millis(600))? else {
-        eprintln!("sort: no popup after F4");
+        diagnostic!("sort: no popup after F4");
         return Err(fail(SORT_ASK));
     };
-    eprintln!("sort: popup open on {at:?}");
+    diagnostic!("sort: popup open on {at:?}");
     if at == sort::TITLE_ASC {
         // 이미 제목 A to Z면 아무것도 적용하지 않고 닫음
         check()?;
         io.popup_key(PopupKey::Esc)?;
         if let Some(frame) = io.list(Duration::from_secs(3), check)? {
-            eprintln!("sort: already title A to Z");
+            diagnostic!("sort: already title A to Z");
             return Ok(frame);
         }
-        eprintln!("sort: no list after Esc");
+        diagnostic!("sort: no list after Esc");
         return Err(fail(SORT_ASK));
     }
     // 위·왼쪽으로만 감, 칸 끝에서 멈추니 늦게 먹은 입력이 강조를 구석에서 다시 빼낼 수 없음
@@ -1580,7 +1585,7 @@ fn sort_by_title<S: SortIo>(io: &mut S, check: &dyn Fn() -> Result<(), Stop>) ->
             io.key(k)?;
         }
         let Some(now) = io.popup(Duration::from_millis(600))? else {
-            eprintln!("sort: popup gone while moving");
+            diagnostic!("sort: popup gone while moving");
             return Err(fail(SORT_ASK));
         };
         at = now;
@@ -1589,7 +1594,7 @@ fn sort_by_title<S: SortIo>(io: &mut S, check: &dyn Fn() -> Result<(), Stop>) ->
         }
     }
     if at != sort::TITLE_ASC {
-        eprintln!("sort: highlight stays on {at:?}");
+        diagnostic!("sort: highlight stays on {at:?}");
         if io.popup(Duration::from_millis(300))?.is_some() {
             check()?;
             io.popup_key(PopupKey::Esc)?;
@@ -1599,10 +1604,10 @@ fn sort_by_title<S: SortIo>(io: &mut S, check: &dyn Fn() -> Result<(), Stop>) ->
     check()?;
     io.popup_key(PopupKey::Enter)?;
     if let Some(frame) = io.list(Duration::from_secs(3), check)? {
-        eprintln!("sort: title A to Z");
+        diagnostic!("sort: title A to Z");
         return Ok(frame);
     }
-    eprintln!("sort: no list after Enter");
+    diagnostic!("sort: no list after Enter");
     Err(fail(SORT_ASK))
 }
 
@@ -1629,7 +1634,7 @@ fn recheck(
     let model = match l.model(&|id| ctx.title(id)) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("recheck: no model ({e}), {} entries not looked at", which.len());
+            diagnostic!("recheck: no model ({e}), {} entries not looked at", which.len());
             return Ok(());
         }
     };
@@ -1642,7 +1647,7 @@ fn recheck(
             Ok(_) => {}
             Err(NavError::Aborted(e @ (Abort::Cancelled | Abort::FocusLost))) => return Err(e.into()),
             Err(e) => {
-                eprintln!("recheck {i}: not reached ({e})");
+                diagnostic!("recheck {i}: not reached ({e})");
                 continue;
             }
         }
@@ -1650,11 +1655,11 @@ fn recheck(
         let (img, geom) = match screen.settled(cancel, Duration::from_millis(1500)) {
             Ok(Some(frame)) => frame,
             Ok(None) => {
-                eprintln!("recheck {i}: the list did not come to rest");
+                diagnostic!("recheck {i}: the list did not come to rest");
                 continue;
             }
             Err(e) => {
-                eprintln!("recheck {i}: no frame ({e:?})");
+                diagnostic!("recheck {i}: no frame ({e:?})");
                 continue;
             }
         };
@@ -1664,18 +1669,18 @@ fn recheck(
             continue;
         }
         // 커서가 막 도착했을 땐 줄이 아직 바뀌는 중일 수 있음, 흐려짐이 끝나면 한 번 더
-        eprintln!("recheck {i}: not confirmed, {}; reading again", l.unconfirmed(i, &row, &ctx.titles));
+        diagnostic!("recheck {i}: not confirmed, {}; reading again", l.unconfirmed(i, &row, &ctx.titles));
         if let Some(wait) = pressed.and_then(|t| FADE.checked_sub(t.elapsed())) {
             std::thread::sleep(wait);
         }
         let Ok(Some((img, geom))) = screen.settled(cancel, Duration::from_millis(1500)) else {
-            eprintln!("recheck {i}: no frame at rest to read again");
+            diagnostic!("recheck {i}: no frame at rest to read again");
             continue;
         };
         hands.check()?;
         let row = dmpicker_engine::read::read_row(&img, &geom, &ctx.refs, dmpicker_engine::SEL_ROW);
         if !l.reread(i, &row, &ctx.titles) {
-            eprintln!("recheck {i}: not confirmed when read again, {}", l.unconfirmed(i, &row, &ctx.titles));
+            diagnostic!("recheck {i}: not confirmed when read again, {}", l.unconfirmed(i, &row, &ctx.titles));
         }
     }
     if !which.is_empty() {
@@ -1719,14 +1724,21 @@ fn out_of_order(l: &Learned, titles: &HashMap<u32, String>) -> bool {
     let songs = l.entries.iter().filter_map(|e| e.id).collect::<HashSet<_>>().len();
     let allowed = (songs / 100).max(5);
     if back > allowed {
-        eprintln!("scan: the list goes back {back} times in title order besides its end (at most {allowed})");
+        diagnostic!("scan: the list goes back {back} times in title order besides its end (at most {allowed})");
         return true;
     }
     false
 }
 
 /// ALL TRACK 전체 인식 (사용자가 직접 실행할 때만)
-pub fn run_scan(ctx: &Ctx, cancel: &AtomicBool, mut progress: impl FnMut(ScanStage)) -> JobResult {
+pub fn run_scan(ctx: &Ctx, cancel: &AtomicBool, progress: impl FnMut(ScanStage)) -> JobResult {
+    crate::fail_log::begin();
+    let result = scan_job(ctx, cancel, progress);
+    crate::fail_log::finish(&ctx.store, crate::fail_log::Kind::Scan, &result);
+    result
+}
+
+fn scan_job(ctx: &Ctx, cancel: &AtomicBool, mut progress: impl FnMut(ScanStage)) -> JobResult {
     let screen = match focused_screen() {
         Ok(s) => s,
         Err(r) => return r,
@@ -1751,7 +1763,7 @@ pub fn run_scan(ctx: &Ctx, cancel: &AtomicBool, mut progress: impl FnMut(ScanSta
         }
         progress(ScanStage::Reading(0.0));
     } else if !saved.as_ref().is_some_and(|l| placed(&read_window(&img, &geom, &ctx.refs), l)) {
-        eprintln!("scan: the sort is unknown and the keys are not watched");
+        diagnostic!("scan: the sort is unknown and the keys are not watched");
         return JobResult::Failed(SORT_ASK.into());
     }
     // 저장된 목록 길이, 처음이면 곡 데이터의 모든 곡과 RANDOM (ALL TRACK엔 가진 곡만 있어서 더 길게 잡힘)
@@ -1773,7 +1785,7 @@ pub fn run_scan(ctx: &Ctx, cancel: &AtomicBool, mut progress: impl FnMut(ScanSta
             if let Err(stop) = recheck(&screen, ctx, &mut l, &doubtful, cancel, &hands, |done| progress(ScanStage::Rechecking(done, doubtful.len()))) {
                 return stop.into();
             }
-            eprintln!("recheck: {} entries in {:.1}s", doubtful.len(), at.elapsed().as_secs_f32());
+            diagnostic!("recheck: {} entries in {:.1}s", doubtful.len(), at.elapsed().as_secs_f32());
             if cancel.load(Ordering::Relaxed) {
                 return JobResult::Cancelled;
             }
@@ -1782,31 +1794,31 @@ pub fn run_scan(ctx: &Ctx, cancel: &AtomicBool, mut progress: impl FnMut(ScanSta
             }
             l.unlock_grey_art(&ctx.refs);
             let unknown = l.entries.iter().filter(|e| e.id.is_none() && !e.random && !e.locked).count();
-            eprintln!("learned: {} entries, {} unknown after repair", l.entries.len(), unknown);
+            diagnostic!("learned: {} entries, {} unknown after repair", l.entries.len(), unknown);
             // 방해받은 인식은 빈칸이 많음, 이번 것보다 기존 목록을 유지
             if unknown > (l.entries.len() / 100).max(5) {
                 return JobResult::Failed(MISREAD.into());
             }
             if let Err(e) = l.model(&|id| ctx.title(id)) {
-                eprintln!("scan: no model ({e})");
+                diagnostic!("scan: no model ({e})");
                 return JobResult::Failed(MISREAD.into());
             }
             // 저장 전 마지막 확인, 목록 전체를 곡마다 제목 순서로 봄
             // 그래도 거꾸로 가는 곳은 로그에 남김 (오인식, 또는 게임이 `order_key`와 다르게 정렬하는 제목)
             for (i, j) in steps_back_at(&l, &ctx.titles) {
                 let title = |k: usize| l.entries[k].id.map(|id| ctx.title(id)).unwrap_or_default();
-                eprintln!("scan: title order goes back from {:?} ({i}) to {:?} ({j})", title(i), title(j));
+                diagnostic!("scan: title order goes back from {:?} ({i}) to {:?} ({j})", title(i), title(j));
             }
             if out_of_order(&l, &ctx.titles) {
                 return JobResult::Failed(MISREAD.into());
             }
             if let Err(e) = l.save(&ctx.store) {
-                eprintln!("save: {e}");
+                diagnostic!("save: {e}");
                 return JobResult::Failed("목록을 저장하지 못했어요".into());
             }
             // 다른 모드 목록도 새 인식에 맞춤
             if let Err(e) = l.save_derived(&ctx.store, &|id| ctx.title(id)) {
-                eprintln!("derive {}: {e}", kind_name(other_kind(l.kind)));
+                diagnostic!("derive {}: {e}", kind_name(other_kind(l.kind)));
             }
             JobResult::Scanned { entries: l.entries.len(), unknown, secs: t0.elapsed().as_secs_f32() }
         }
@@ -1829,6 +1841,13 @@ impl Ctx {
 }
 
 pub fn run_pick(ctx: &Ctx, song: u32, mode: ButtonMode, diff: usize, cancel: &AtomicBool) -> JobResult {
+    crate::fail_log::begin();
+    let result = pick_job(ctx, song, mode, diff, cancel);
+    crate::fail_log::finish(&ctx.store, crate::fail_log::Kind::Pick, &result);
+    result
+}
+
+fn pick_job(ctx: &Ctx, song: u32, mode: ButtonMode, diff: usize, cancel: &AtomicBool) -> JobResult {
     let screen = match focused_screen() {
         Ok(s) => s,
         Err(r) => return r,
@@ -1837,13 +1856,13 @@ pub fn run_pick(ctx: &Ctx, song: u32, mode: ButtonMode, diff: usize, cancel: &At
     if screen.grab().is_ok_and(|img| room::not_host(&img)) {
         return JobResult::Failed(NOT_HOST.into());
     }
-    eprintln!("job: focused, reading screen");
+    diagnostic!("job: focused, reading screen");
     let first = match goto_all_track(&screen, cancel) {
         Ok(f) => f,
         Err(stop) => return stop.into(),
     };
     let kind = layout_kind(&first.1);
-    eprintln!("screen: {}", kind_name(kind));
+    diagnostic!("screen: {}", kind_name(kind));
 
     ensure_both(&ctx.store, &|id| ctx.title(id));
     let Some(mut learned) = Learned::load(&ctx.store, kind) else { return JobResult::NeedScan };
@@ -1863,7 +1882,7 @@ pub fn run_pick(ctx: &Ctx, song: u32, mode: ButtonMode, diff: usize, cancel: &At
         }
     }
     if !placed(&rows, &learned) {
-        eprintln!("job: the screen does not fit the list, sorting by title");
+        diagnostic!("job: the screen does not fit the list, sorting by title");
         // Enter 직전에 사용자가 키를 누르면 정렬 창이 먼저 닫힐 수 있음, 키 감시 없이는 안 바꿈
         let hands = HandsOff::begin(screen.game, ctx.hotkey);
         if !hands.watching() {
@@ -1878,16 +1897,16 @@ pub fn run_pick(ctx: &Ctx, song: u32, mode: ButtonMode, diff: usize, cancel: &At
     // 온라인엔 목록에 없는 LOCKED 곡이 보일 수 있음, 하나씩 익히고 다시 이동
     for _ in 0..4 {
         let Some(target) = learned.index_of(song) else { return JobResult::NotFound };
-        eprintln!("job: target index {target}");
+        diagnostic!("job: target index {target}");
         let model = match learned.model(&|id| ctx.title(id)) {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("model: {e}");
+                diagnostic!("model: {e}");
                 return JobResult::ListMismatch;
             }
         };
         if !model.anomalies().is_empty() {
-            eprintln!("model anomalies: {:?}", model.anomalies());
+            diagnostic!("model anomalies: {:?}", model.anomalies());
         }
         let mut nav = navigator(&model);
         let mut io = LiveIo {
@@ -1907,27 +1926,28 @@ pub fn run_pick(ctx: &Ctx, song: u32, mode: ButtonMode, diff: usize, cancel: &At
         mode_seen = io.mode_seen;
         match res {
             Ok(o) => {
-                eprintln!(
+                diagnostic!(
                     "nav ok: presses {} rounds {} mismatches {} dropped {} {}ms hold {}",
                     o.presses, o.rounds, o.mismatches, o.dropped, o.elapsed_ms, o.hold_ms
                 );
-                eprintln!("job: arrived, applying mode/difficulty");
+                diagnostic!("job: arrived, applying mode/difficulty");
                 let diff_note = match apply_chart(&screen, mode, diff, o.hold_ms.max(30), mode_seen, cancel) {
                     Ok(note) => note,
                     Err(e @ (Abort::Cancelled | Abort::FocusLost)) => return Stop::from(e).into(),
                     Err(e) => {
-                        eprintln!("chart: {e:?}");
+                        diagnostic!("chart: {e:?}");
                         Some(CHART_ASK.into())
                     }
                 };
                 return JobResult::Arrived { presses: o.presses, ms: o.elapsed_ms, diff_note };
             }
             Err(NavError::Aborted(Abort::ListChanged)) => {
+                diagnostic!("nav: the screen differs from the saved list");
                 let Some((at, e)) = found else { break };
-                eprintln!("learned LOCKED entry at {at}: {}", e.id.map(|id| ctx.title(id)).unwrap_or_else(|| "?".into()));
+                diagnostic!("learned LOCKED entry at {at}: {}", e.id.map(|id| ctx.title(id)).unwrap_or_else(|| "?".into()));
                 learned.entries.insert(at, e);
                 if let Err(e) = learned.save(&ctx.store) {
-                    eprintln!("save: {e}");
+                    diagnostic!("save: {e}");
                 }
             }
             Err(e) => return nav_failed(e),
@@ -1938,15 +1958,13 @@ pub fn run_pick(ctx: &Ctx, song: u32, mode: ButtonMode, diff: usize, cancel: &At
 
 /// 도착 못 한 이동을 사용자에게 알릴 결과, 저장 목록으로 못 가면 목록이 어긋난 걸로 봄
 fn nav_failed(e: NavError) -> JobResult {
+    diagnostic!("nav: {e}");
     match e {
         NavError::Aborted(Abort::ListChanged) | NavError::PositionUnknown => JobResult::ListMismatch,
         NavError::Aborted(e) => Stop::from(e).into(),
         NavError::NotMoving => JobResult::Failed(NOT_MOVING.into()),
         NavError::NotOnList => JobResult::Failed(NOT_HERE.into()),
-        e => {
-            eprintln!("nav: {e}");
-            JobResult::ListMismatch
-        }
+        _ => JobResult::ListMismatch,
     }
 }
 
@@ -2021,7 +2039,7 @@ fn apply_chart(screen: &Screen, mode: ButtonMode, diff: usize, t: u32, mode_seen
         std::thread::sleep(Duration::from_millis(250));
         match read_mode(screen, cancel)? {
             Some(m) if m != mode.buttons() => {
-                eprintln!("chart: {m}B on screen after the {}B key", mode.buttons());
+                diagnostic!("chart: {m}B on screen after the {}B key", mode.buttons());
                 mode_failed = attempt == 2;
             }
             _ => break,

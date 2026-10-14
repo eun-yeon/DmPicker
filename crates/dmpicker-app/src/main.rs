@@ -8,6 +8,7 @@ mod beam;
 mod catalog;
 mod driver;
 mod edit;
+mod fail_log;
 mod gfx;
 mod hands;
 mod hotkey;
