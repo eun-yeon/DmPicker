@@ -8,7 +8,7 @@
 [![GitHub downloads](https://img.shields.io/github/downloads/eun-yeon/DmPicker/total?logo=github)](https://github.com/eun-yeon/DmPicker/releases/latest)
 [![GitHub license](https://img.shields.io/github/license/eun-yeon/DmPicker?logo=github)](LICENSE)
 
-<img src=".github/assets/preview.png" alt="Screenshot" width="560">
+<img src=".github/assets/preview.png" alt="Screenshot" width="820">
 
 ## 개요
 
