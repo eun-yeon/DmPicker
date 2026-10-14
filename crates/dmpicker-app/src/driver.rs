@@ -1026,10 +1026,16 @@ fn fit_shift(prev: &[Seen], rows: &[Seen]) -> Result<(i64, f32), String> {
     Err(format!("shift {shift} {m}/{n} lead {lead:.2} contradictions {contra}, contradicted {contradicted:?}, rows {}", evidence.join(" ")))
 }
 
-/// 불확실한 줄이 있는 창을 첫 번 말고 더 보는 최대 횟수
-const SECOND_LOOKS: usize = 2;
 /// 키를 누른 뒤 줄이 흐려지는(커서에서 멀수록 어두워짐) 시간, 대략 이 정도
+/// 불확실한 줄이 있으면 이때 처음 다시 봄
 const FADE: Duration = Duration::from_millis(320);
+/// 흐려짐이 끝나는 시간은 PC마다 달라서 점수가 오르는 동안은 이 간격으로 더 봄
+/// 느린 PC에선 320 ms에 다시 봐도 1순위만 맞고 점수가 낮았음
+const LOOK_GAP: Duration = Duration::from_millis(100);
+/// 마지막 키 뒤 이때까지만 다시 봄, 끝내 확실해지지 않는 닮은 재킷에서 오래 안 머묾
+const LOOK_UNTIL: Duration = Duration::from_millis(1500);
+/// 다시 본 인식이 이만큼 나아져야 흐려지는 중으로 봄, 멈춘 화면끼리도 점수가 0.01쯤 흔들림
+const LOOK_GAIN: f32 = 0.03;
 /// 누른 만큼 안 움직였을 때 마지막 키 뒤 이만큼 지나면 늦게 먹은 입력까지 목록에 반영됨
 const LATE: Duration = Duration::from_millis(400);
 
@@ -1037,7 +1043,7 @@ const LATE: Duration = Duration::from_millis(400);
 /// `prev`에 다시 맞춤, 그 밀림을 돌려주고 못 맞추면 `rows`를 되돌리고 None
 fn look_late(prev: &[Seen], rows: &mut Vec<Seen>, again: Vec<Seen>) -> Option<i64> {
     let before = rows.clone();
-    merge_look(rows, again, |_| false);
+    merge_look(rows, &mut before.clone(), again, |_| false);
     let fit = fit_shift(prev, rows).map(|f| f.0).ok();
     if fit.is_none() {
         *rows = before;
@@ -1045,20 +1051,24 @@ fn look_late(prev: &[Seen], rows: &mut Vec<Seen>, again: Vec<Seen>) -> Option<i6
     fit
 }
 
-/// 창을 나중에 다시 본 결과, 목록이 확실히 제자리면(밀림 0으로 맞으면) 줄마다 더 나은 인식을 남김
+/// 창을 나중에 다시 본 결과, 목록이 확실히 제자리면(밀림 0으로 맞으면) 줄마다 더 나은 인식을 `rows`에 남김
 /// 아니면 새로 본 걸로 바꿈
-/// 불확실했던 인식이 유지됐는지(제자리에 같은 곡) 돌려줌
-fn merge_look(rows: &mut Vec<Seen>, again: Vec<Seen>, unsure: impl Fn(&Seen) -> bool) -> bool {
+/// 아직 불확실한 줄이 바로 전에 본 것(`last`)과 같은 곡이고 점수도 안 올랐는지 돌려줌
+/// 가장 나은 인식과 비교하면 1순위가 한 번 바뀐 줄은 계속 바뀐 걸로 보여서 직전 것과 비교함
+fn merge_look(rows: &mut Vec<Seen>, last: &mut Vec<Seen>, again: Vec<Seen>, unsure: impl Fn(&Seen) -> bool) -> bool {
     if again.len() != rows.len() || !matches!(fit_shift(rows, &again), Ok((0, _))) {
-        *rows = again;
+        *rows = again.clone();
+        *last = again;
         return false;
     }
-    let held = rows.iter().zip(&again).all(|(a, b)| !unsure(a) || a.cands.first().map(|c| c.id) == b.cands.first().map(|c| c.id));
-    for (a, b) in rows.iter_mut().zip(again) {
+    let top = |r: &Seen| r.cands.first().map(|c| c.id);
+    let held = (0..rows.len()).all(|k| !unsure(&rows[k]) || (top(&last[k]) == top(&again[k]) && again[k].quality() < last[k].quality() + LOOK_GAIN));
+    for (a, b) in rows.iter_mut().zip(&again) {
         if b.quality() > a.quality() {
-            *a = b;
+            *a = b.clone();
         }
     }
+    *last = again;
     held
 }
 
@@ -1116,15 +1126,14 @@ fn scan_timed(
         t.read += at.elapsed();
         // 목록이 멈춘 뒤에도 잠깐 줄이 흐려짐 (줄이 어두워지고 뒤에 곡 배경이 깔림)
         // 안쪽 줄이 불확실하면 흐려짐이 끝난 뒤 다시 보고 줄마다 더 나은 인식을 남김
-        // 불확실한 인식이 그대로 유지될 때까지 반복
+        // 불확실한 인식이 1순위도 점수도 그대로일 때까지 반복
         let last = rows.len().saturating_sub(1);
         let unsure = |r: &Seen| !r.sure && !r.random && r.row != 0 && r.row != last;
         let top = |r: &Seen| (r.random, r.cands.first().map(|c| c.id));
-        for _ in 0..SECOND_LOOKS {
-            if !rows.iter().any(unsure) {
-                break;
-            }
-            if let Some(wait) = FADE.checked_sub(moved_at.elapsed()) {
+        let mut next = FADE;
+        let mut last = rows.clone();
+        while rows.iter().any(unsure) && moved_at.elapsed() < LOOK_UNTIL {
+            if let Some(wait) = next.checked_sub(moved_at.elapsed()) {
                 let at = Instant::now();
                 std::thread::sleep(wait);
                 t.fade += at.elapsed();
@@ -1149,7 +1158,7 @@ fn scan_timed(
             t.look_read += at.elapsed();
             let before: Vec<_> = rows.iter().map(|r| (top(r), r.sure)).collect();
             let at = Instant::now();
-            let held = merge_look(&mut rows, again, unsure);
+            let held = merge_look(&mut rows, &mut last, again, unsure);
             t.merge += at.elapsed();
             let changed = rows.iter().zip(&before).filter(|(r, b)| top(r) != b.0).count() as u32;
             if changed > 0 {
@@ -1160,6 +1169,7 @@ fn scan_timed(
             if held {
                 break;
             }
+            next = moved_at.elapsed() + LOOK_GAP;
         }
         if let Some(p) = &prev {
             let at = Instant::now();
