@@ -4,7 +4,7 @@ members = ["crates/dmpicker-search", "crates/dmpicker-engine", "crates/dmpicker-
 
 [workspace.package]
 edition = "2021"
-version = "1.1.1"
+version = "1.1.2"
 
 [profile.release]
 opt-level = 3
