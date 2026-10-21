@@ -276,15 +276,15 @@ fn tint(c: [f32; 3], bright: f32, sat: f32) -> [f32; 3] {
 }
 
 /// 효과에 넘기는 속성 값
-enum Prop {
+pub(crate) enum Prop {
     F32(f32),
     U32(u32),
 }
 
-/// 합성기가 프레임마다 적용하는 Direct2D 효과 (흐림, 색 회전)
+/// 합성기가 프레임마다 적용하는 Direct2D 효과 (흐림, 색 회전, 채도)
 /// 이름 붙인 속성 (`named`)은 합성기 애니메이션으로 움직임
 #[implement(IGraphicsEffect, IGraphicsEffectSource, IGraphicsEffectD2D1Interop)]
-struct Fx {
+pub(crate) struct Fx {
     name: RefCell<HSTRING>,
     id: GUID,
     props: Vec<Prop>,
@@ -293,7 +293,7 @@ struct Fx {
 }
 
 impl Fx {
-    fn make(name: &str, id: GUID, props: Vec<Prop>, named: Vec<(&'static str, u32)>, sources: Vec<IGraphicsEffectSource>) -> IGraphicsEffect {
+    pub(crate) fn make(name: &str, id: GUID, props: Vec<Prop>, named: Vec<(&'static str, u32)>, sources: Vec<IGraphicsEffectSource>) -> IGraphicsEffect {
         Fx { name: RefCell::new(HSTRING::from(name)), id, props, named, sources }.into()
     }
 }

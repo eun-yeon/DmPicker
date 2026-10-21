@@ -2,13 +2,67 @@
 //! 창 수준 API만 씀, 안티치트 때문에 게임 프로세스엔 접근 안 함
 
 use std::path::Path;
+use std::sync::OnceLock;
 
-use windows::core::{Result, HSTRING, PCWSTR};
+use windows::core::{s, w, Result, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::Graphics::Gdi::*;
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+use windows::Win32::System::SystemInformation::OSVERSIONINFOW;
+use windows::Win32::UI::Accessibility::{HIGHCONTRASTW, HCF_HIGHCONTRASTON};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::*;
+
+/// 유리 효과를 켤 수 있는 윈도우 11 (빌드 22000 이상), 처음 한 번만 확인함
+pub fn glass_supported() -> bool {
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(|| unsafe {
+        // 매니페스트에 따라 달라지지 않는 실제 빌드 번호가 필요함
+        type Version = unsafe extern "system" fn(*mut OSVERSIONINFOW) -> i32;
+        let Ok(lib) = GetModuleHandleW(w!("ntdll.dll")) else { return false };
+        let Some(found) = GetProcAddress(lib, s!("RtlGetVersion")) else { return false };
+        let version: Version = std::mem::transmute(found);
+        let mut info = OSVERSIONINFOW {
+            dwOSVersionInfoSize: std::mem::size_of::<OSVERSIONINFOW>() as u32,
+            ..Default::default()
+        };
+        version(&mut info) >= 0 && info.dwBuildNumber >= 22000
+    })
+}
+
+/// 윈도우가 투명 효과를 끄는 상황이라 유리 효과도 잠시 끔 (원격 세션, 투명 효과 끔, 절전 모드, 고대비)
+pub fn glass_paused() -> bool {
+    unsafe {
+        if GetSystemMetrics(SM_REMOTESESSION) != 0 {
+            return true;
+        }
+        let mut transparency = 1u32;
+        let mut size = std::mem::size_of::<u32>() as u32;
+        if RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+            w!("EnableTransparency"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut transparency as *mut _ as *mut _),
+            Some(&mut size),
+        ).is_ok() && transparency == 0 {
+            return true;
+        }
+        let mut power = SYSTEM_POWER_STATUS::default();
+        if GetSystemPowerStatus(&mut power).is_ok() && power.SystemStatusFlag == 1 {
+            return true;
+        }
+        let mut contrast = HIGHCONTRASTW {
+            cbSize: std::mem::size_of::<HIGHCONTRASTW>() as u32,
+            ..Default::default()
+        };
+        SystemParametersInfoW(SPI_GETHIGHCONTRAST, contrast.cbSize, Some(&mut contrast as *mut _ as *mut _), Default::default()).is_ok()
+            && contrast.dwFlags.contains(HCF_HIGHCONTRASTON)
+    }
+}
 
 pub fn find_game() -> Option<HWND> {
     dmpicker_engine::capture::find_game_window().map(|h| h.raw())

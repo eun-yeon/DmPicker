@@ -246,6 +246,9 @@ fn apply_settings(p: &mut Popup, v: &serde_json::Value) {
     if let Some(b) = v["show_dlc"].as_bool() {
         p.show_dlc = b;
     }
+    if let Some(b) = v["glass"].as_bool() {
+        p.glass = b;
+    }
     if let Some(codes) = v["hidden_dlc"].as_array() {
         p.set_hidden_dlc(codes.iter().filter_map(|code| code.as_str().map(str::to_owned)).collect());
     }
@@ -259,7 +262,7 @@ fn settings_json(p: &Popup) -> serde_json::Value {
     hidden_dlc.sort();
     let mut hidden_songs: Vec<_> = p.hidden_songs().iter().collect();
     hidden_songs.sort();
-    serde_json::json!({ "mode": p.mode_choice.label(), "diff": p.diff_choice.label(), "hotkey": p.hotkey.label(), "keep_query": p.keep_query, "show_dlc": p.show_dlc, "hidden_dlc": hidden_dlc, "hidden_songs": hidden_songs })
+    serde_json::json!({ "mode": p.mode_choice.label(), "diff": p.diff_choice.label(), "hotkey": p.hotkey.label(), "keep_query": p.keep_query, "show_dlc": p.show_dlc, "glass": p.glass, "hidden_dlc": hidden_dlc, "hidden_songs": hidden_songs })
 }
 
 /// 저장하지 못하면 알림 (다시 켜면 예전 값으로 돌아감)
@@ -385,6 +388,7 @@ fn on_action(a: &mut App, act: Action) {
         }
         Action::Hide => a.popup.hide(),
         Action::Choice => {
+            a.toast.set_glass(a.popup.glass);
             save_settings(a);
             let _ = a.popup.render();
         }
@@ -734,6 +738,7 @@ fn main() -> Result<()> {
             playlists: playlist::Loader::default(),
         });
         load_settings(&mut app_box.popup);
+        app_box.toast.set_glass(app_box.popup.glass);
         app_box.popup.load_history(store_dir());
         app_box.popup.warm_up();
         APP = Box::into_raw(app_box);

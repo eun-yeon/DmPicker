@@ -15,9 +15,10 @@ use windows::Foundation::{IReference, PropertyValue};
 use windows::UI::Composition::{CompositionEllipseGeometry, CompositionPropertySet, CompositionStrokeCap, Compositor, ContainerVisual, ShapeVisual};
 use windows_numerics::{Vector2, Vector3};
 
-use crate::anim::{open_scale, Ease, Spring, OPEN, OPEN_FADE, OPEN_KICK};
+use crate::anim::{open_scale, Ease, Spring, Tween, OPEN, OPEN_FADE, OPEN_KICK};
 use crate::beam::{self, Beam, Kind};
-use crate::gfx::{self, alpha_step, circle, color, rect, rrect, white, with_alpha, Gfx, BEARING, MARGIN, PLATE_ALPHA, SUB, TEXT, TINT};
+use crate::gfx::{self, alpha_step, circle, rect, rrect, white, with_alpha, Gfx, BEARING, MARGIN, SUB, TEXT, TINT};
+use crate::popup::{glass_level, QUICK_EASE, QUICK_SECS};
 use crate::scene::Scene;
 use crate::sys;
 
@@ -39,6 +40,11 @@ impl Badge {
 
 pub struct Toast {
     hwnd: HWND,
+    glass: bool,        // 검색창의 유리 효과 설정 (`set_glass`)
+    glass_ok: bool,     // 윈도우 11이라 켤 수 있음
+    glass_paused: bool, // 띄울 때 읽은 `sys::glass_paused`
+    glass_fade: Tween,  // 유리 효과가 보이는 정도, 떠 있을 때 설정을 바꾸면 검색창 토글 색과 같이 바뀜
+    drawn_glass: f32,   // 마지막으로 그린 유리 효과 정도, 다르면 다시 그림
     gfx: Option<Gfx>,
     fonts: Option<[IDWriteTextFormat; 2]>, // 윗줄·아랫줄 글자, gfx와 같이 만들고 버림
     shadow: Option<gfx::Shadow>,           // 캡슐 그림자, gfx와 같이 만들고 버림
@@ -249,6 +255,11 @@ impl Toast {
         }
         Ok(Self {
             hwnd,
+            glass: true,
+            glass_ok: sys::glass_supported(),
+            glass_paused: false,
+            glass_fade: Tween::new(0.0),
+            drawn_glass: 0.0,
             gfx: None,
             fonts: None,
             shadow: None,
@@ -268,9 +279,39 @@ impl Toast {
         })
     }
 
+    fn glass_now(&self) -> bool {
+        self.glass_ok && self.glass && !self.glass_paused
+    }
+
+    /// 유리 효과 설정 (앱이 검색창 설정을 넘김)
+    pub fn set_glass(&mut self, on: bool) {
+        self.glass = on;
+        self.follow_glass();
+    }
+
+    /// 숨어 있으면 바로, 떠 있으면 검색창 토글 색과 같은 시간에 바뀜
+    fn follow_glass(&mut self) {
+        let to = self.glass_now() as u8 as f32;
+        if self.shown {
+            self.glass_fade.go(to, QUICK_SECS, QUICK_EASE);
+        } else {
+            self.glass_fade.snap(to);
+        }
+    }
+
+    /// 판 뒤 흐림이 보이는 정도 (0..1), 흐림 층을 못 만들었으면 0
+    fn glass_mix(&self) -> f32 {
+        if self.gfx.as_ref().is_some_and(Gfx::has_glass) { glass_level(&self.glass_fade) } else { 0.0 }
+    }
+
     /// `badge` 뒤에 `text` 표시, `secs` 뒤 자동으로 숨김 (None이면 계속 표시)
     pub fn show(&mut self, text: &str, badge: Badge, secs: Option<f32>) {
         let opening = !self.shown || self.open.target < 1.0;
+        // 쉬는 상태 (투명 효과 끔 등)는 검색창처럼 띄울 때만 읽음, 진행률이 바뀔 때마다 읽지 않음
+        if opening {
+            self.glass_paused = sys::glass_paused();
+        }
+        self.follow_glass();
         let bump = !opening && badge == Badge::None && text != self.text;
         let snap = opening || !matches!(self.badge, Badge::Progress(_));
         match badge {
@@ -351,6 +392,8 @@ impl Toast {
         self.gfx = None;
         self.fonts = None;
         self.shadow = None;
+        // 자원이 없으면 `glass_mix`가 0, 옛 값이 남으면 `needs_draw`가 끝없이 참
+        self.drawn_glass = 0.0;
     }
 
     /// 다 사라진 빛의 움직임을 멈춤 (주기 타이머에서 부름)
@@ -370,7 +413,8 @@ impl Toast {
         let morphing = self.end_at.is_some_and(|t| t.elapsed().as_secs_f32() * 1000.0 < MORPH_MS);
         let filling = self.badge == Badge::Done && self.end_at.is_none();
         let fading = self.opened_at.elapsed().as_secs_f32() < OPEN_FADE;
-        !self.open.settled() || fading || morphing || (!self.arc_live() && (!self.ring.settled() || filling))
+        let glass = self.glass_mix() != self.drawn_glass;
+        !self.open.settled() || fading || morphing || glass || (!self.arc_live() && (!self.ring.settled() || filling))
     }
 
     /// 다시 줄어들며 닫히기 시작
@@ -393,6 +437,7 @@ impl Toast {
     pub fn frame(&mut self) {
         let now = Instant::now();
         let dt = (now - self.last).as_secs_f32();
+        let was_moving = !self.open.settled();
         self.open.step(dt);
         self.ring.step(dt);
         if self.badge == Badge::Done && self.end_at.is_none() && self.ring.value >= FULL {
@@ -410,7 +455,8 @@ impl Toast {
             return;
         }
         // 링만 차오르는 동안엔 합성기가 그려서 앱은 안 그림
-        if self.needs_draw() {
+        // 멈춘 순간도 한 번 그림, 정수 px에 맞춘 캡슐로 끝나야 테두리가 선명함
+        if self.needs_draw() || (was_moving && self.open.settled()) {
             self.render();
         }
     }
@@ -438,13 +484,21 @@ impl Toast {
     fn draw_frame(&mut self) -> Result<()> {
         let arc_live = self.arc_live();
         let (Some(g), Some([f1, f2]), Some(shadow)) = (&self.gfx, &self.fonts, &self.shadow) else { return Ok(()) };
+        let glass = self.glass_mix();
         let s = self.scale;
         let o = self.open.value;
         // 검색창처럼 가운데 기준으로 커지며 (`open_scale`) 빠르게 페이드 인
         let (sx, sy) = open_scale(o);
         let (cx, cy) = ((W / 2.0 + MARGIN) * s, (H / 2.0 + MARGIN) * s);
         let (w, h) = (W * s * sx, H * s * sy);
-        let shape = rrect(cx - w / 2.0 + 0.5, cy - h / 2.0 + 0.5, cx + w / 2.0 - 0.5, cy + h / 2.0 - 0.5, (h - 1.0) / 2.0);
+        let mut edge = [cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0];
+        // 멈춰 있으면 정수 px에 맞춤, 1 px 테두리가 두 줄로 나뉘어 흐려지지 않음
+        // 움직이는 동안엔 안 맞춤, 맞추면 1 px씩 계단처럼 튐
+        if self.open.settled() && self.open.target > 0.0 {
+            edge = edge.map(f32::round);
+        }
+        let [l, t, r, b] = edge;
+        let shape = rrect(l + 0.5, t + 0.5, r - 0.5, b - 0.5, (b - t - 1.0) / 2.0);
         let alpha = if self.open.target > 0.0 {
             let t = Ease::OUT.apply((self.opened_at.elapsed().as_secs_f32() / OPEN_FADE).min(1.0));
             self.fade_from + (1.0 - self.fade_from) * t
@@ -473,11 +527,11 @@ impl Toast {
 
             dc.SetTarget(&target);
             let d = gfx::Drawing::begin(dc, &windows_numerics::Matrix3x2::identity());
-            dc.Clear(Some(&color(0.0, 0.0, 0.0, 0.0)));
+            g.begin_content();
             // 그림자도 판과 같은 레이어 안이라 같이 페이드
             dc.PushLayer(&gfx::layer(alpha, None), None);
-            dc.DrawImage(&shadow.output()?, None, None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
-            dc.FillRoundedRectangle(&shape, &g.brush(with_alpha(TINT, PLATE_ALPHA))?);
+            dc.DrawImage(&shadow.output(glass)?, None, None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
+            dc.FillRoundedRectangle(&shape, &g.brush(with_alpha(TINT, gfx::plate_alpha(glass)))?);
             // 테두리 선, 위쪽이 더 밝음
             dc.DrawRoundedRectangle(&shape, &g.rim_gradient(shape.rect.top, shape.rect.bottom, 1.0)?, 1.0, None);
 
@@ -510,7 +564,21 @@ impl Toast {
                 dc.PopLayer();
             }
             dc.PopLayer();
+            g.end_content();
+            // 유리 효과 마스크: 판과 같은 캡슐, 같은 페이드
+            if glass > 0.0 {
+                g.paint_mask(&[l, t, r, b, alpha], || {
+                    dc.PushLayer(&gfx::layer(alpha, None), None);
+                    dc.FillRoundedRectangle(&shape, &g.brush(white(1.0))?);
+                    dc.PopLayer();
+                    Ok(())
+                })?;
+            }
             d.end()?;
+        }
+        self.drawn_glass = glass;
+        if let Some(Err(e)) = g.scene().map(|sc| sc.set_glass(glass)) {
+            eprintln!("toast glass: {e:?}");
         }
         // 빛이 안 돼도 알림은 띄움
         if let Some(l) = &self.lights {

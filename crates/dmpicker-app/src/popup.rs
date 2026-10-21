@@ -22,7 +22,7 @@ use crate::catalog::{Catalog, DlcPack, Song};
 use crate::edit::{clean_paste, Editor};
 use crate::gfx::{
     self, alpha_step, circle, color, rect, rounded, rrect, white, with_alpha, Drawing, Gfx, Retarget, BEARING, CARET, DISABLED,
-    FAINT, FAVORITE, FILL_HOVER, FILL_SELECTED, FILL_STRONG, FILL_TRACK, PLATE_ALPHA, SUB, TEXT, TINT,
+    FAINT, FAVORITE, FILL_HOVER, FILL_SELECTED, FILL_STRONG, FILL_TRACK, SUB, TEXT, TINT,
 };
 use crate::hotkey::Hotkey;
 use crate::icons::Icon;
@@ -55,8 +55,9 @@ const SEG_SECS: f32 = 0.25;
 const KNOB_SECS: f32 = 0.24;
 const KNOB_EASE: Ease = Ease(0.34, 1.56, 0.64, 1.0);
 /// 토글 색은 노브보다 짧게 따로, 눌렸던 노브도 이걸로 돌아옴
-const QUICK_SECS: f32 = 0.18;
-const QUICK_EASE: Ease = Ease(0.16, 1.0, 0.3, 1.0);
+/// 유리 효과 전환도 토글 색과 같이 이걸로 (알림 포함)
+pub(crate) const QUICK_SECS: f32 = 0.18;
+pub(crate) const QUICK_EASE: Ease = Ease(0.16, 1.0, 0.3, 1.0);
 /// 토글을 누르는 동안 노브가 천천히 세로로 눌려 캡슐이 됨 (가로는 그대로)
 const PRESS_Y: f32 = 10.0 / 12.0;
 const PRESS_SECS: f32 = 0.42;
@@ -101,7 +102,9 @@ mod lay {
     pub const ROWS: usize = 6;
     pub const LEVEL_W: f32 = 60.0; // 줄 오른쪽 끝의 레벨 칸
     pub const PLAYLIST_LEVEL_W: f32 = 72.0; // 플레이리스트 결과·뽑은 기록은 모드까지, 가장 긴 "8B · MX 15"가 약 66
-    pub const SETTINGS_H: f32 = 402.0; // 맨 아래 줄(버튼 높이 30) 아래 16 (= 오른쪽 여백)
+    pub const SETTINGS_H: f32 = 456.0; // 맨 아래 줄(410..440) 아래 16 (= 오른쪽 여백)
+    /// 키워드 칩·결과 줄 수 한도 기준 높이 (설정 시트만 한 줄 더 김)
+    pub const CONTENT_H: f32 = 402.0;
     /// 제목·요약·탭 아래부터 목록
     pub const EXCLUDE_TOP: f32 = 108.0;
     pub const DLC_ROW_H: f32 = 40.0;
@@ -129,7 +132,7 @@ mod lay {
     /// 첫 줄이 키워드 칩처럼 패널 위 88에서 시작 (6줄이면 384, 설정 시트보다 낮음)
     pub const ROLLS_HEAD_H: f32 = PAD + ROW_H + 8.0 + 16.0;
     /// 키워드 칩 줄 한도: 칩 위 88, 아래 안내 문구·여백 44를 빼고 창 높이에 드는 줄 (칩 28 + 간격 6)
-    pub const CHIP_LINES: usize = ((PANEL_MAX.max(SETTINGS_H) - 88.0 - 44.0 + 6.0) / 34.0) as usize; // 8
+    pub const CHIP_LINES: usize = ((PANEL_MAX.max(CONTENT_H) - 88.0 - 44.0 + 6.0) / 34.0) as usize; // 8
     /// 플레이리스트 결과 아래 칸의 글 줄 높이와 줄 수 한도, 넘는 코멘트는 말줄임
     pub const NOTE_LINE: f32 = 19.0;
     pub const NOTE_LINES: usize = 5;
@@ -154,6 +157,8 @@ struct Effects {
     sheets: ID2D1Effect, // 합성: 끈적하게 붙는 바+두 버튼 (입력 0) + 선명한 패널 (입력 1)
     shadow: gfx::Shadow, // 모양 아래 그림자
     plate: ID2D1Effect,  // 모양 안을 칠한 판
+    flood: ID2D1Effect,  // 판 색, 진하기는 유리 효과를 따라감
+    flood_glass: std::cell::Cell<f32>, // 판 색에 넣은 유리 효과 정도
     rim_light: ID2D1Effect,
     _keep: Vec<ID2D1Effect>,
 }
@@ -667,6 +672,7 @@ enum Hit {
 enum Toggle {
     KeepQuery,
     ShowDlc,
+    Glass,
 }
 
 /// 토글 하나의 노브·색·눌림, 서로 다른 속도로 움직임
@@ -729,6 +735,9 @@ struct SettingsLayout {
     dlc_title: f32,
     dlc: D2D_RECT_F, // 토글
     dlc_note: f32,
+    glass_title: f32,
+    glass: D2D_RECT_F, // 토글
+    glass_note: f32,
 }
 
 /// 물리 px 기준 키워드 시트: 클릭 영역과 각 글줄의 위쪽
@@ -809,6 +818,12 @@ pub struct Popup {
     pub keep_query: bool,
     /// 결과 아랫줄에 DLC도 표시 (앱이 불러오고 저장함)
     pub show_dlc: bool,
+    /// 판 뒤로 흐린 게임 화면을 비침 (앱이 불러오고 저장함), 못 쓰는 PC에서도 값은 그대로 둠
+    pub glass: bool,
+    /// 윈도우 11이라 켤 수 있음 (`sys::glass_supported`)
+    glass_ok: bool,
+    /// 열 때 읽은 `sys::glass_paused`, 그동안은 설정이 켜져 있어도 판만 그림
+    glass_paused: bool,
     /// 결과 보기에서 닫을 때 고른 줄과 스크롤, 다음 열기에서만 씀
     kept_row: Option<(Row, usize)>,
     /// 입력한 글, 캐럿과 선택 (조합 중인 글자는 `preedit`에 따로, 캐럿 자리에 그림)
@@ -847,7 +862,7 @@ pub struct Popup {
     wheel_acc: i32, // 아직 줄로 안 바꾼 휠 값 (정밀 휠, 터치패드)
     view: View,
     sheet: Sheet,
-    kb_focus: Option<usize>, // 설정 키보드 포커스: 0 모드, 1 난이도, 2 검색 제외, 3 다시 인식, 4 단축키, 5 검색어 유지, 6 DLC 표시
+    kb_focus: Option<usize>, // 설정 키보드 포커스: 0 모드, 1 난이도, 2 검색 제외, 3 다시 인식, 4 단축키, 5 검색어 유지, 6 DLC 표시, 7 유리 효과
     toggle_down: Option<Toggle>, // 누른 토글 (떼면 바뀜)
     exclude_rows: Vec<ExcludeRow>,
     exclude_tab: ExcludeTab,
@@ -877,7 +892,8 @@ pub struct Popup {
     sheet_swap: Crossfade,  // 시트 내용, 보기나 카드가 바뀌면 겹쳐 바꿈
     list_swap: Crossfade,   // 히스토리·검색 제외 줄 목록, 탭이 바뀌면 겹쳐 바꿈 (탭은 제자리)
     star: Option<StarMotion>, // 키워드 시트 별 버튼 모션, 시트를 닫으면 버림
-    toggles: [ToggleMotion; 2], // 검색어 유지, DLC 표시
+    toggles: [ToggleMotion; 3], // 검색어 유지, DLC 표시, 유리 효과
+    glass_fade: Tween, // 유리 효과가 보이는 정도, 설정에서 바꾸면 토글 색과 같이 바뀜
     hover_since: Option<Instant>,
     leave_since: Option<Instant>,
     in_zone: bool, // 커서가 두 버튼을 드러내는 영역에 있음
@@ -944,7 +960,7 @@ impl Foot {
 /// 코멘트가 5줄에서 잘려서 효과 줄이 있어도 5줄은 남음
 fn page_above(foot: Option<&Foot>) -> usize {
     let Some(foot) = foot else { return lay::ROWS };
-    let room = lay::PANEL_MAX.max(lay::SETTINGS_H) - lay::PAD - foot.height();
+    let room = lay::PANEL_MAX.max(lay::CONTENT_H) - lay::PAD - foot.height();
     ((room / lay::ROW_H) as usize).min(lay::ROWS)
 }
 
@@ -1039,6 +1055,9 @@ impl Popup {
             playlist_request: None,
             keep_query: true,
             show_dlc: false,
+            glass: true,
+            glass_ok: sys::glass_supported(),
+            glass_paused: false,
             kept_row: None,
             edit: Editor::default(),
             preedit: String::new(),
@@ -1088,7 +1107,8 @@ impl Popup {
             sheet_swap: Crossfade::new(),
             list_swap: Crossfade::new(),
             star: None,
-            toggles: [ToggleMotion::new(), ToggleMotion::new()],
+            toggles: [ToggleMotion::new(), ToggleMotion::new(), ToggleMotion::new()],
+            glass_fade: Tween::new(0.0),
             hover_since: None,
             leave_since: None,
             in_zone: false,
@@ -1259,6 +1279,7 @@ impl Popup {
                 || self.list_swap.animating()
                 || self.star.as_ref().is_some_and(|m| !m.done(m.elapsed()))
                 || self.toggles.iter().any(|t| !t.done())
+                || !self.glass_fade.done()
                 || !self.exclude_scroll_s.settled()
                 || self.exclude_rows.iter().any(|r| !r.motion.done())
                 || self.hover_since.is_some()
@@ -1323,6 +1344,25 @@ impl Popup {
 
     // ---------------------------------------------------------------- 열기 / 닫기
 
+    fn glass_now(&self) -> bool {
+        self.glass_ok && self.glass && !self.glass_paused
+    }
+
+    /// 멈춘 스프링은 목표 값 그대로, 판 가장자리가 정수 px에 와야 1 px 테두리가 한 줄로 선명함
+    /// 움직이는 동안엔 안 맞춤, 맞추면 1 px씩 계단처럼 튐
+    fn rest_on_pixels(&mut self) {
+        for sp in self.reveal.iter_mut().chain([&mut self.open_s, &mut self.panel_h]) {
+            if sp.settled() {
+                sp.snap(sp.target);
+            }
+        }
+    }
+
+    /// 판 뒤 흐림이 보이는 정도 (0..1), 흐림 층을 못 만들었으면 0
+    fn glass_mix(&self) -> f32 {
+        if self.gfx.as_ref().is_some_and(Gfx::has_glass) { glass_level(&self.glass_fade) } else { 0.0 }
+    }
+
     /// (숨긴) 창을 게임 위에 크기 맞춰 놓고 그 모니터용 그리기 리소스를 만듦
     /// 못 만들면 false
     fn prepare(&mut self) -> bool {
@@ -1378,6 +1418,7 @@ impl Popup {
     /// 검색창을 띄움, `owned`는 보이는 목록에서 고를 수 있는 곡 (첫 인식 전엔 None)
     /// `stale`이면 곡 이동 중 화면이 저장된 목록과 달랐음
     pub fn show(&mut self, owned: Option<HashSet<u32>>, stale: bool) {
+        self.glass_paused = sys::glass_paused();
         self.restore_queries();
         if !self.prepare() {
             return;
@@ -1408,8 +1449,10 @@ impl Popup {
         self.retarget_panel();
         self.snap_segments();
         self.toggle_down = None;
-        self.toggles[Toggle::KeepQuery as usize].snap(self.keep_query);
-        self.toggles[Toggle::ShowDlc as usize].snap(self.show_dlc);
+        for toggle in [Toggle::KeepQuery, Toggle::ShowDlc, Toggle::Glass] {
+            self.toggles[toggle as usize].snap(self.toggle_value(toggle));
+        }
+        self.glass_fade.snap(self.glass_now() as u8 as f32);
         self.hover_since = None;
         self.leave_since = None;
         self.in_zone = false;
@@ -1530,9 +1573,8 @@ impl Popup {
         shadow.set_input_effect(&sheets)?;
 
         // 판: 모양 안을 알림과 같은 색으로 칠함, 뒤의 게임은 창 합성으로 비침
-        // Flood 색은 premultiplied라 알파를 미리 곱함
         let flood = g.effect(&CLSID_D2D1Flood)?;
-        gfx::set_floats(&flood, D2D1_FLOOD_PROP_COLOR.0 as u32, &[TINT.r, TINT.g, TINT.b, 1.0].map(|c| c * PLATE_ALPHA))?;
+        set_plate(&flood, 0.0)?;
         let plate = g.effect(&CLSID_D2D1AlphaMask)?;
         gfx::set_input_effect(&plate, 0, &flood)?;
         gfx::set_input_effect(&plate, 1, &sheets)?;
@@ -1550,7 +1592,7 @@ impl Popup {
         let rim_light = g.effect(&CLSID_D2D1AlphaMask)?;
         gfx::set_input_effect(&rim_light, 1, &ring)?;
 
-        self.fx = Some(Effects { goo_blur, sheets, shadow, plate, rim_light, _keep: vec![flood, thresh, erode, ring] });
+        self.fx = Some(Effects { goo_blur, sheets, shadow, plate, flood, flood_glass: std::cell::Cell::new(0.0), rim_light, _keep: vec![thresh, erode, ring] });
 
         // 빛을 못 만들면 빛 없이 그대로
         let beams = g.scene().map(|sc| -> Result<Beams> {
@@ -1753,6 +1795,10 @@ impl Popup {
             dlc_title: y(354.0),
             dlc: rect(r - self.px(lay::TOGGLE_W), y(371.0 - lay::TOGGLE_H / 2.0), r, y(371.0 + lay::TOGGLE_H / 2.0)),
             dlc_note: y(374.0),
+            // 유리 효과도 같은 묶음 (DLC 표시에서 24), 토글은 버튼 줄(410..440) 가운데
+            glass_title: y(408.0),
+            glass: rect(r - self.px(lay::TOGGLE_W), y(425.0 - lay::TOGGLE_H / 2.0), r, y(425.0 + lay::TOGGLE_H / 2.0)),
+            glass_note: y(428.0),
         }
     }
 
@@ -2081,7 +2127,10 @@ impl Popup {
                 return Hit::Hotkey;
             }
             // 토글은 작아서 둘레를 조금 더, 위아래는 버튼 줄만큼
-            for (k, toggle) in [(sl.keep, Toggle::KeepQuery), (sl.dlc, Toggle::ShowDlc)] {
+            for (k, toggle) in [(sl.keep, Toggle::KeepQuery), (sl.dlc, Toggle::ShowDlc), (sl.glass, Toggle::Glass)] {
+                if toggle == Toggle::Glass && !self.glass_ok {
+                    continue;
+                }
                 if inside(&rect(k.left - self.px(6.0), k.top - self.px(3.0), k.right, k.bottom + self.px(3.0)), x, y) {
                     return Hit::Toggle(toggle);
                 }
@@ -2821,10 +2870,14 @@ impl Popup {
     }
 
     /// 설정 포커스 이동, 처음 누른 화살표는 첫 컨트롤로, 첫 인식 전엔 검색 제외 버튼을 건너뜀
+    /// 유리 효과를 못 쓰면 그 토글엔 안 감
     fn move_settings(&mut self, d: i32) {
-        let mut next = self.kb_focus.map_or(0, |i| (i as i32 + d).clamp(0, 6) as usize);
+        let mut next = self.kb_focus.map_or(0, |i| (i as i32 + d).clamp(0, 7) as usize);
         if next == 2 && self.owned.is_none() {
             next = if d > 0 { 3 } else { 1 };
+        }
+        if next == 7 && !self.glass_ok {
+            next = 6;
         }
         self.kb_focus = Some(next);
     }
@@ -3750,6 +3803,7 @@ impl Popup {
         match toggle {
             Toggle::KeepQuery => self.keep_query,
             Toggle::ShowDlc => self.show_dlc,
+            Toggle::Glass => self.glass_ok && self.glass,
         }
     }
 
@@ -3758,8 +3812,11 @@ impl Popup {
         match toggle {
             Toggle::KeepQuery => self.keep_query = on,
             Toggle::ShowDlc => self.show_dlc = on,
+            Toggle::Glass if self.glass_ok => self.glass = on,
+            Toggle::Glass => return,
         }
         self.toggles[toggle as usize].go(on);
+        self.glass_fade.go(self.glass_now() as u8 as f32, QUICK_SECS, QUICK_EASE);
     }
 
     /// 토글에서 손을 뗌, 노브가 원으로 돌아옴
@@ -4099,6 +4156,10 @@ impl Popup {
                                     self.set_toggle(Toggle::ShowDlc, d > 0);
                                     Action::Choice
                                 }
+                                7 if self.glass_ok && (d > 0) != self.glass => {
+                                    self.set_toggle(Toggle::Glass, d > 0);
+                                    Action::Choice
+                                }
                                 _ => Action::None,
                             }
                         }
@@ -4117,6 +4178,10 @@ impl Popup {
                         }
                         VK_RETURN if f == 6 => {
                             self.set_toggle(Toggle::ShowDlc, !self.show_dlc);
+                            Action::Choice
+                        }
+                        VK_RETURN if f == 7 && self.glass_ok => {
+                            self.set_toggle(Toggle::Glass, !self.glass);
                             Action::Choice
                         }
                         VK_BACK => {
@@ -4681,6 +4746,7 @@ impl Popup {
         self.open_s.step(dt);
         self.reveal.iter_mut().for_each(|r| r.step(dt));
         self.panel_h.step(dt);
+        self.rest_on_pixels();
         if self.shown.target() <= 0.0 && self.shown.done() {
             self.panel_h.snap(0.0); // 다 사라짐, 다음엔 새 높이에서 바로 나타남
         }
@@ -4721,6 +4787,7 @@ impl Popup {
         };
         let exclude_shown: Vec<_> = exclude_ids.into_iter().map(|(i, id)| (i, id.and_then(|id| self.jacket(id)))).collect();
 
+        let glass = self.glass_mix();
         let g = self.gfx.as_ref().unwrap();
         let f = self.fonts.as_ref().unwrap();
         let fx = self.fx.as_ref().unwrap();
@@ -4988,13 +5055,18 @@ impl Popup {
                     for (title, note, title_y, note_y, r, toggle, focus) in [
                         ("검색어 유지", "다시 열면 마지막 검색어가 남아 있어요", sl.keep_title, sl.keep_note, sl.keep, Toggle::KeepQuery, 5),
                         ("DLC 표시", "작곡가 옆에 DLC 이름을 표시해요", sl.dlc_title, sl.dlc_note, sl.dlc, Toggle::ShowDlc, 6),
+                        ("유리 효과", if self.glass_ok { "검색창 뒤로 게임 화면이 은은하게 비쳐요" } else { "Windows 11에서 쓸 수 있어요" }, sl.glass_title, sl.glass_note, sl.glass, Toggle::Glass, 7),
                     ] {
                         let tl = g.layout(title, &f.item_bold, self.px(200.0), self.px(20.0))?;
                         dc.DrawTextLayout(gfx::pt(l0t, title_y), &tl, &text_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
                         let nl = g.layout(note, &f.sub, r.left - self.px(12.0) - l0, self.px(18.0))?;
                         dc.DrawTextLayout(gfx::pt(l0t, note_y), &nl, &note_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
                         let m = &self.toggles[toggle as usize];
-                        draw_toggle(g, r, (m.knob.value(), m.tint.value(), m.press.value()), self.hover == Hit::Toggle(toggle) || self.kb_focus == Some(focus), s)?;
+                        if toggle == Toggle::Glass && !self.glass_ok {
+                            draw_toggle_off(g, r, s)?;
+                        } else {
+                            draw_toggle(g, r, (m.knob.value(), m.tint.value(), m.press.value()), self.hover == Hit::Toggle(toggle) || self.kb_focus == Some(focus), s)?;
+                        }
                     }
                 } else if self.sheet == Sheet::Exclude {
                     self.draw_exclude_head()?;
@@ -5095,11 +5167,15 @@ impl Popup {
             }
 
             // 4) 합성: 그림자, 판, 테두리 빛 순 (효과 출력은 이미 제자리라 변환 없이 그림)
+            if fx.flood_glass.get() != glass {
+                fx.flood_glass.set(glass);
+                set_plate(&fx.flood, glass)?;
+            }
             dc.SetTarget(&target);
             let d = Drawing::begin(dc, &IDENTITY);
-            dc.Clear(Some(&color(0.0, 0.0, 0.0, 0.0)));
+            g.begin_content();
             dc.PushLayer(&gfx::layer(open_t, None), None);
-            for img in [fx.shadow.output()?, fx.plate.GetOutput()?, fx.rim_light.GetOutput()?] {
+            for img in [fx.shadow.output(glass)?, fx.plate.GetOutput()?, fx.rim_light.GetOutput()?] {
                 dc.DrawImage(&img, None, None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
             }
             dc.SetTransform(&shrink);
@@ -5243,7 +5319,26 @@ impl Popup {
                 dc.PopLayer();
             }
             dc.PopLayer();
+            g.end_content();
+
+            // 8) 유리 효과 마스크: 판과 같은 모양·불투명도, 모양 마스크는 닫을 때 줄어드는 변환까지 들어간 창 좌표
+            if glass > 0.0 {
+                // 키는 1)의 모양 마스크를 정하는 값만, 안 그린 버튼은 반지름 0
+                let bead = |i: usize| if self.reveal[i].value > 0.02 { beads[i].2 } else { 0.0 };
+                let panel_key = if has_panel { [panel.left, panel.top, panel.right, panel.bottom, panel_a] } else { [0.0; 5] };
+                let mut key = vec![bar.left, bar.top, bar.right, bar.bottom, beads[0].0, bead(0), beads[1].0, bead(1), open_t, k];
+                key.extend(panel_key);
+                g.paint_mask(&key, || {
+                    dc.PushLayer(&gfx::layer(open_t, None), None);
+                    dc.DrawImage(&fx.sheets.GetOutput()?, None, None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
+                    dc.PopLayer();
+                    Ok(())
+                })?;
+            }
             d.end()?;
+        }
+        if let Some(Err(e)) = g.scene().map(|sc| sc.set_glass(glass)) {
+            eprintln!("glass: {e:?}");
         }
         if let Some(b) = &self.beams {
             // 목록 인식 카드 (첫 인식·다시 인식), 결과에서 선택된 무작위로 고르기 줄 (시트 내용과 같이 비켜나고 바뀌면 새 내용과 같이 나타남)
@@ -5316,6 +5411,16 @@ fn draw_button(g: &Gfx, font: &IDWriteTextFormat, r: D2D_RECT_F, label: &str, li
     Ok(())
 }
 
+/// 유리 효과 전환의 지금 값, 끝나면 목표 값 그대로 (곡선 끝값은 1에 아주 조금 못 미침)
+pub(crate) fn glass_level(fade: &Tween) -> f32 {
+    if fade.done() { fade.target() } else { fade.value() }
+}
+
+/// 판 색 (Flood), premultiplied라 진하기를 미리 곱함
+fn set_plate(flood: &ID2D1Effect, glass: f32) -> Result<()> {
+    gfx::set_floats(flood, D2D1_FLOOD_PROP_COLOR.0 as u32, &[TINT.r, TINT.g, TINT.b, 1.0].map(|c| c * gfx::plate_alpha(glass)))
+}
+
 /// 누를 수 없는 패널 버튼: 세그먼트 트랙만큼 옅은 채움에 고를 수 없는 줄 글자색, 호버 없음
 fn draw_button_off(g: &Gfx, font: &IDWriteTextFormat, r: D2D_RECT_F, label: &str, s: f32) -> Result<()> {
     unsafe {
@@ -5351,6 +5456,18 @@ fn draw_toggle(g: &Gfx, r: D2D_RECT_F, (at, tint, press): (f32, f32, f32), lit: 
         let (cx, cy) = (r.left + pad + d / 2.0 + travel * at, (r.top + r.bottom) / 2.0);
         let (rx, ry) = (d / 2.0, d / 2.0 * press);
         g.dc.FillRoundedRectangle(&rrect(cx - rx, cy - ry, cx + rx, cy + ry, ry), &g.brush(knob)?);
+    }
+    Ok(())
+}
+
+/// 쓸 수 없는 토글: 누를 수 없는 버튼과 같은 색, 노브는 꺼진 자리
+fn draw_toggle_off(g: &Gfx, r: D2D_RECT_F, s: f32) -> Result<()> {
+    unsafe {
+        let h = r.bottom - r.top;
+        let d = (lay::KNOB * s).round();
+        let pad = (h - d) / 2.0;
+        g.dc.FillRoundedRectangle(&rounded(r, h / 2.0), &g.brush(white(FILL_TRACK))?);
+        g.dc.FillEllipse(&circle(r.left + pad + d / 2.0, (r.top + r.bottom) / 2.0, d / 2.0), &g.brush(DISABLED)?);
     }
     Ok(())
 }

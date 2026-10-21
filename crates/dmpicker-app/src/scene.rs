@@ -1,20 +1,31 @@
 //! 창을 윈도우 합성기 (Windows.UI.Composition)에 올림
 //! 그린 화면 (swapchain) 한 장 아래위로 빛 비주얼을 겹침, 빛의 움직임은 합성기가 화면 주사율로 그림
+//! 윈도우 11에선 맨 아래에 판 모양으로 자른 흐린 뒤 화면을 깖 (유리 효과)
 //! 합성기를 못 만들면 `Gfx`가 DirectComposition으로 그린 화면만 올림 (빛 없음)
 
-use std::cell::OnceCell;
+use std::cell::{Cell, OnceCell};
 
-use windows::core::{s, w, Interface, Result, HRESULT};
+use windows::core::{s, w, Interface, Result, BOOL, HRESULT, HSTRING};
+use windows::Graphics::Effects::IGraphicsEffectSource;
 use windows::System::DispatcherQueueController;
 use windows::UI::Composition::Desktop::DesktopWindowTarget;
-use windows::UI::Composition::{CompositionGraphicsDevice, Compositor, ContainerVisual};
+use windows::UI::Composition::{
+    CompositionEffectSourceParameter, CompositionGraphicsDevice, CompositionStretch, CompositionSurfaceBrush, Compositor, ContainerVisual,
+    ICompositionSurface, SpriteVisual, VisualCollection,
+};
 use windows::Win32::Foundation::{E_FAIL, HWND};
-use windows::Win32::Graphics::Direct2D::ID2D1Device;
+use windows::Win32::Graphics::Direct2D::{ID2D1Device, CLSID_D2D1Saturation};
+use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_HOSTBACKDROPBRUSH};
 use windows::Win32::Graphics::Dxgi::IDXGISwapChain1;
 use windows::Win32::System::WinRT::Composition::{ICompositorDesktopInterop, ICompositorInterop};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32};
 use windows::Win32::System::WinRT::{DispatcherQueueOptions, DQTAT_COM_NONE, DQTYPE_THREAD_CURRENT};
 use windows_numerics::{Matrix3x2, Matrix4x4, Vector2};
+
+use crate::beam::{Fx, Prop};
+
+/// 흐린 뒤 화면에 올리는 채도, 흐리면 색이 바래 보임
+const SATURATION: f32 = 1.25;
 
 thread_local! {
     // UI 스레드에 하나, 검색창과 알림이 같이 씀 (못 만들면 None)
@@ -61,21 +72,64 @@ pub struct Scene {
     pub over: ContainerVisual,
     /// 한 번 그려 두는 빛 모양을 Direct2D로 그릴 장치
     pub graphics: CompositionGraphicsDevice,
+    /// 맨 아래 흐림 층, 윈도우 11이 아니거나 못 만들면 None (판만 그림)
+    glass: Option<Glass>,
+}
+
+/// 판 뒤에 비치는 흐린 화면: 윈도우가 흐린 창 뒤 화면에 채도를 올리고 판 모양 마스크로 자름
+/// 마스크는 그린 화면 아래 칸, 앱이 판과 같은 모양·불투명도로 그려 넣음 (`Gfx::paint_mask`)
+struct Glass {
+    visual: SpriteVisual,
+    shown: Cell<f32>, // 마지막으로 넣은 불투명도, 같으면 합성기를 안 건드림
+}
+
+impl Glass {
+    /// 창 크기 `w`×`h` (px) 층을 `layers` 맨 아래에 숨긴 채로 붙임, `surface`는 높이 2`h`인 그린 화면
+    fn new(compositor: &Compositor, layers: &VisualCollection, surface: &ICompositionSurface, hwnd: HWND, w: f32, h: f32) -> Result<Self> {
+        // 이 창 속성이 없으면 뒤 화면 대신 단색이 나옴
+        let on = BOOL(1);
+        unsafe { DwmSetWindowAttribute(hwnd, DWMWA_USE_HOSTBACKDROPBRUSH, &on as *const BOOL as _, std::mem::size_of::<BOOL>() as u32)? };
+        let param = HSTRING::from("backdrop");
+        let source: IGraphicsEffectSource = CompositionEffectSourceParameter::Create(&param)?.cast()?;
+        let saturate = Fx::make("Saturation", CLSID_D2D1Saturation, vec![Prop::F32(SATURATION)], vec![], vec![source]);
+        let backdrop = compositor.CreateEffectFactory(&saturate)?.CreateBrush()?;
+        backdrop.SetSourceParameter(&param, &compositor.CreateHostBackdropBrush()?)?;
+        let masked = compositor.CreateMaskBrush()?;
+        masked.SetSource(&backdrop)?;
+        masked.SetMask(&unstretched(compositor, surface, 1.0)?)?;
+        let visual = compositor.CreateSpriteVisual()?;
+        visual.SetSize(Vector2 { X: w, Y: h })?;
+        visual.SetBrush(&masked)?;
+        visual.SetIsVisible(false)?;
+        layers.InsertAtBottom(&visual)?;
+        Ok(Self { visual, shown: Cell::new(0.0) })
+    }
+}
+
+/// 늘이지 않은 swapchain 붓, 높이가 창의 2배면 `align_y` 0은 위 칸 (그린 화면), 1은 아래 칸 (마스크)만 보임
+fn unstretched(compositor: &Compositor, surface: &ICompositionSurface, align_y: f32) -> Result<CompositionSurfaceBrush> {
+    let brush = compositor.CreateSurfaceBrushWithSurface(surface)?;
+    brush.SetStretch(CompositionStretch::None)?;
+    brush.SetHorizontalAlignmentRatio(0.0)?;
+    brush.SetVerticalAlignmentRatio(align_y)?;
+    Ok(brush)
 }
 
 impl Scene {
     /// 그린 화면을 가운데 층으로 쌓고 맨 마지막에 창에 붙임
     /// 중간에 실패하면 창은 그대로라 DirectComposition으로 올릴 수 있음
-    pub fn new(hwnd: HWND, swapchain: &IDXGISwapChain1, device: &ID2D1Device, w: f32, h: f32) -> Result<Self> {
+    /// `glass`면 swapchain 아래 칸이 유리 효과 마스크
+    pub fn new(hwnd: HWND, swapchain: &IDXGISwapChain1, device: &ID2D1Device, w: f32, h: f32, glass: bool) -> Result<Self> {
         let compositor = compositor().ok_or_else(|| windows::core::Error::from(E_FAIL))?;
         let size = Vector2 { X: w, Y: h };
         unsafe {
             let root = compositor.CreateContainerVisual()?;
             root.SetSize(size)?;
             let interop: ICompositorInterop = compositor.cast()?;
+            let surface = interop.CreateCompositionSurfaceForSwapChain(swapchain)?;
             let content = compositor.CreateSpriteVisual()?;
             content.SetSize(size)?;
-            content.SetBrush(&compositor.CreateSurfaceBrushWithSurface(&interop.CreateCompositionSurfaceForSwapChain(swapchain)?)?)?;
+            content.SetBrush(&unstretched(&compositor, &surface, 0.0)?)?;
             let under = compositor.CreateContainerVisual()?;
             let over = compositor.CreateContainerVisual()?;
             for v in [&under, &over] {
@@ -86,9 +140,11 @@ impl Scene {
             layers.InsertAtTop(&content)?;
             layers.InsertAtTop(&over)?;
             let graphics = interop.CreateGraphicsDevice(device)?;
+            // 흐림 층을 못 만들어도 빛과 그린 화면은 그대로 올림
+            let glass = if glass { Glass::new(&compositor, &layers, &surface, hwnd, w, h).inspect_err(|e| eprintln!("glass: {e:?}")).ok() } else { None };
             let target = compositor.cast::<ICompositorDesktopInterop>()?.CreateDesktopWindowTarget(hwnd, true)?;
             target.SetRoot(&root)?;
-            Ok(Self { compositor, target, _root: root, under, over, graphics })
+            Ok(Self { compositor, target, _root: root, under, over, graphics, glass })
         }
     }
 
@@ -97,6 +153,21 @@ impl Scene {
         let m = matrix4(xf);
         self.under.SetTransformMatrix(m)?;
         self.over.SetTransformMatrix(m)
+    }
+
+    pub fn has_glass(&self) -> bool {
+        self.glass.is_some()
+    }
+
+    /// 판 뒤 흐린 화면을 `glass` (0..1)만큼 보임, 0이면 숨김, 흐림 층이 없으면 아무것도 안 함
+    pub fn set_glass(&self, glass: f32) -> Result<()> {
+        let Some(gl) = &self.glass else { return Ok(()) };
+        if gl.shown.get() != glass {
+            gl.shown.set(glass);
+            gl.visual.SetOpacity(glass)?;
+            gl.visual.SetIsVisible(glass > 0.0)?;
+        }
+        Ok(())
     }
 }
 

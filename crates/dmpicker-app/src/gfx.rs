@@ -3,7 +3,7 @@
 //! 서피스는 합성기 (Windows.UI.Composition)에 올리고, 못 쓰면 DirectComposition으로 올림
 
 use windows::core::{Error, Interface, Result, HSTRING};
-use windows::Win32::Foundation::{D2DERR_RECREATE_TARGET, HWND};
+use windows::Win32::Foundation::{D2DERR_RECREATE_TARGET, HWND, S_OK};
 use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::Direct3D::*;
@@ -38,9 +38,18 @@ pub const FILL_TRACK: f32 = 0.06;
 pub const FILL_HOVER: f32 = 0.10;
 pub const FILL_SELECTED: f32 = 0.14;
 pub const FILL_STRONG: f32 = 0.20;
-/// 판: 검색창과 알림 바탕, 이 색을 `PLATE_ALPHA`로 칠해 뒤의 게임이 살짝 비침
+/// 판: 검색창과 알림 바탕, 이 색을 [`plate_alpha`]로 칠해 뒤의 게임이 살짝 비침
 pub const TINT: D2D1_COLOR_F = D2D1_COLOR_F { r: 0.090, g: 0.098, b: 0.114, a: 1.0 }; // #17191D
+/// 유리 효과가 꺼졌을 때 판 진하기
 pub const PLATE_ALPHA: f32 = 0.92;
+/// 유리 효과일 때 판 진하기, 판 뒤는 흐린 게임 화면이라 더 비쳐도 글자가 읽힘
+pub const GLASS_ALPHA: f32 = 0.71;
+
+/// 판 진하기, `glass`는 유리 효과가 보이는 정도 (0 끔 .. 1 켬)
+pub fn plate_alpha(glass: f32) -> f32 {
+    PLATE_ALPHA + (GLASS_ALPHA - PLATE_ALPHA) * glass
+}
+
 /// 즐겨찾기: 켜진 별의 테두리·채움과 켤 때 튀는 점
 pub const FAVORITE: D2D1_COLOR_F = D2D1_COLOR_F { r: 1.0, g: 0.788, b: 0.290, a: 1.0 }; // #FFC94A
 
@@ -74,6 +83,14 @@ pub struct Gfx {
     /// 못 읽었으면 None, 설치된 글꼴로 대신 그림
     ui_fonts: Option<IDWriteFontCollection>,
     swapchain: IDXGISwapChain1,
+    /// 창 크기 (px), 유리 효과를 쓸 수 있으면 swapchain은 그 아래에 같은 크기 마스크 자리가 더 있음
+    size: (f32, f32),
+    /// 버퍼마다 마스크 자리에 그린 모양, 같으면 다시 안 그림
+    mask_keys: std::cell::RefCell<[Vec<f32>; 2]>,
+    /// 이번 프레임에 마스크를 다시 그린 버퍼와 모양, EndDraw가 성공해야 Present 때 `mask_keys`에 넣음
+    mask_drawn: std::cell::RefCell<Option<(usize, Vec<f32>)>>,
+    /// 지금 그리는 버퍼 번호 (0, 1), D3D11 swapchain은 늘 0번 이름으로 버퍼를 돌려 써서 직접 셈
+    back: std::cell::Cell<usize>,
     /// 창에 올린 방식: 합성기 (빛을 겹칠 수 있음) 또는 그걸 못 쓸 때 DirectComposition
     stage: Stage,
     /// 프레임당 vblank 수, 모니터 주사율을 나눠 `max_fps` 이하로 맞춤
@@ -119,9 +136,11 @@ impl Gfx {
             let dc = d2d_device.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)?;
 
             let dxgi_factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            // 유리 효과 마스크를 같은 버퍼 아래 칸에 그림, 판과 같은 Present로 나가서 한 프레임도 안 어긋남
+            let glass = crate::sys::glass_supported();
             let desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
-                Height: height,
+                Height: if glass { height * 2 } else { height },
                 Format: DXGI_FORMAT_B8G8R8A8_UNORM,
                 SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
@@ -132,17 +151,24 @@ impl Gfx {
             };
             let swapchain = dxgi_factory.CreateSwapChainForComposition(&dxgi_device, &desc, None)?;
 
-            let scene = Scene::new(hwnd, &swapchain, &d2d_device, width as f32, height as f32).inspect_err(|e| eprintln!("scene: {e:?}"));
-            let stage = match scene {
-                Ok(s) => Stage::Scene(s),
+            let scene = Scene::new(hwnd, &swapchain, &d2d_device, width as f32, height as f32, glass).inspect_err(|e| eprintln!("scene: {e:?}"));
+            let (stage, swapchain) = match scene {
+                Ok(s) => (Stage::Scene(s), swapchain),
                 Err(_) => {
+                    // 흐림 층이 없으니 마스크 칸 없이 창 크기로 다시 만듦
+                    let swapchain = if glass {
+                        drop(swapchain);
+                        dxgi_factory.CreateSwapChainForComposition(&dxgi_device, &DXGI_SWAP_CHAIN_DESC1 { Height: height, ..desc }, None)?
+                    } else {
+                        swapchain
+                    };
                     let dcomp: IDCompositionDevice = DCompositionCreateDevice(&dxgi_device)?;
                     let target = dcomp.CreateTargetForHwnd(hwnd, true)?;
                     let visual = dcomp.CreateVisual()?;
                     visual.SetContent(&swapchain)?;
                     target.SetRoot(&visual)?;
                     dcomp.Commit()?;
-                    Stage::Plain { _dcomp: dcomp, _target: target, _visual: visual }
+                    (Stage::Plain { _dcomp: dcomp, _target: target, _visual: visual }, swapchain)
                 }
             };
 
@@ -156,6 +182,10 @@ impl Gfx {
                 dc,
                 ui_fonts,
                 swapchain,
+                size: (width as f32, height as f32),
+                mask_keys: Default::default(),
+                mask_drawn: Default::default(),
+                back: std::cell::Cell::new(0),
                 stage,
                 sync: std::cell::Cell::new(1),
                 max_fps,
@@ -177,6 +207,53 @@ impl Gfx {
         }
     }
 
+    /// 판 뒤 흐림 층이 있음, 없으면 마스크를 안 그리고 판은 늘 `PLATE_ALPHA`
+    pub fn has_glass(&self) -> bool {
+        self.scene().is_some_and(Scene::has_glass)
+    }
+
+    /// 창에 보이는 자리만 지우고 그 안으로 자름, 그림자가 아래 마스크 자리로 번지지 않게
+    /// 그리는 중 (BeginDraw 안)에 부르고 [`Gfx::end_content`]로 닫음
+    pub fn begin_content(&self) {
+        // 지난 프레임이 EndDraw에서 실패했으면 그때 그린 마스크는 버림
+        self.mask_drawn.take();
+        unsafe {
+            self.dc.PushAxisAlignedClip(&rect(0.0, 0.0, self.size.0, self.size.1), D2D1_ANTIALIAS_MODE_ALIASED);
+            self.dc.Clear(Some(&color(0.0, 0.0, 0.0, 0.0)));
+        }
+    }
+
+    pub fn end_content(&self) {
+        unsafe { self.dc.PopAxisAlignedClip() };
+    }
+
+    /// 그리는 중에 마스크 자리를 `paint`로 다시 그림, `paint`는 창 좌표 px로 판 모양을 흰색으로 칠함
+    /// 지금 버퍼에 같은 `key`로 그려 둔 적이 있으면 그대로 둠 (버퍼 내용은 다음 차례까지 남음)
+    pub fn paint_mask(&self, key: &[f32], paint: impl FnOnce() -> Result<()>) -> Result<()> {
+        if !self.has_glass() {
+            return Ok(());
+        }
+        let i = self.back.get();
+        if self.mask_keys.borrow()[i] == key {
+            return Ok(());
+        }
+        // 다 그려지기 전엔 이 버퍼 마스크를 못 믿음, 실패하면 다음 차례에 다시 그림
+        self.mask_keys.borrow_mut()[i].clear();
+        unsafe {
+            let mut xf = windows_numerics::Matrix3x2::identity();
+            self.dc.GetTransform(&mut xf);
+            self.dc.SetTransform(&windows_numerics::Matrix3x2::translation(0.0, self.size.1));
+            self.dc.PushAxisAlignedClip(&rect(0.0, 0.0, self.size.0, self.size.1), D2D1_ANTIALIAS_MODE_ALIASED);
+            self.dc.Clear(Some(&color(0.0, 0.0, 0.0, 0.0)));
+            let r = paint();
+            self.dc.PopAxisAlignedClip();
+            self.dc.SetTransform(&xf);
+            r?;
+        }
+        *self.mask_drawn.borrow_mut() = Some((i, key.to_vec()));
+        Ok(())
+    }
+
     /// 창이 있는 모니터의 주사율을 다시 읽음 (창을 띄울 때 호출)
     pub fn retune(&self, hwnd: HWND) {
         // Present는 1..=4만 받음 (주사율이 상한의 4배를 넘으면 상한보다 조금 빨라짐)
@@ -193,8 +270,21 @@ impl Gfx {
         Ok(())
     }
 
+    /// EndDraw가 성공한 뒤에 부름
     pub fn present(&self) -> Result<()> {
-        unsafe { self.swapchain.Present(self.sync.get(), DXGI_PRESENT(0)).ok() }
+        let drawn = self.mask_drawn.take();
+        let hr = unsafe { self.swapchain.Present(self.sync.get(), DXGI_PRESENT(0)) };
+        // 화면에 넘겼을 때만 다음 버퍼로 바뀜
+        // 그 밖의 결과 (가려짐 등)면 버퍼마다 뭐가 남았는지 몰라서 다음부터 다시 그림
+        if hr == S_OK {
+            if let Some((i, key)) = drawn {
+                self.mask_keys.borrow_mut()[i] = key;
+            }
+            self.back.set(1 - self.back.get());
+        } else {
+            *self.mask_keys.borrow_mut() = Default::default();
+        }
+        hr.ok()
     }
 
     /// straight RGBA 픽셀로 premultiplied BGRA 비트맵을 만듦
@@ -327,6 +417,10 @@ pub const MARGIN: f32 = 32.0;
 pub struct Shadow {
     shadow: ID2D1Effect,
     xf: ID2D1Effect,
+    /// 판 안쪽을 뺀 그림자, 유리 효과일 때 판 뒤 흐린 화면이 그림자에 탁해지지 않게
+    cut: ID2D1Effect,
+    /// 유리 효과가 켜지고 꺼지는 동안 두 그림자를 섞음
+    blend: ID2D1Effect,
 }
 
 impl Shadow {
@@ -337,21 +431,39 @@ impl Shadow {
         let xf = g.effect(&CLSID_D2D12DAffineTransform)?;
         set_floats(&xf, D2D1_2DAFFINETRANSFORM_PROP_TRANSFORM_MATRIX.0 as u32, &[1.0, 0.0, 0.0, 1.0, 0.0, SHADOW_DROP * scale])?;
         set_input_effect(&xf, 0, &shadow)?;
-        Ok(Self { shadow, xf })
+        let cut = g.effect(&CLSID_D2D1Composite)?;
+        set_u32(&cut, D2D1_COMPOSITE_PROP_MODE.0 as u32, D2D1_COMPOSITE_MODE_DESTINATION_OUT.0 as u32)?;
+        set_input_effect(&cut, 0, &xf)?;
+        let blend = g.effect(&CLSID_D2D1CrossFade)?;
+        set_input_effect(&blend, 0, &cut)?;
+        set_input_effect(&blend, 1, &xf)?;
+        Ok(Self { shadow, xf, cut, blend })
     }
 
     /// 모양을 효과 출력으로 받음 (검색창의 모양 마스크)
     pub fn set_input_effect(&self, shape: &ID2D1Effect) -> Result<()> {
-        set_input_effect(&self.shadow, 0, shape)
+        set_input_effect(&self.shadow, 0, shape)?;
+        set_input_effect(&self.cut, 1, shape)
     }
 
     /// 모양을 이미지로 받음 (알림 캡슐을 채운 커맨드 리스트)
     pub fn set_input_image(&self, shape: &ID2D1Image) {
-        set_input_image(&self.shadow, 0, shape)
+        set_input_image(&self.shadow, 0, shape);
+        set_input_image(&self.cut, 1, shape);
     }
 
-    pub fn output(&self) -> Result<ID2D1Image> {
-        unsafe { self.xf.GetOutput() }
+    /// 판 안쪽을 `glass` (0 끔 .. 1 켬)만큼 뺀 그림자
+    pub fn output(&self, glass: f32) -> Result<ID2D1Image> {
+        unsafe {
+            if glass <= 0.0 {
+                return self.xf.GetOutput();
+            }
+            if glass >= 1.0 {
+                return self.cut.GetOutput();
+            }
+            set_f32(&self.blend, D2D1_CROSSFADE_PROP_WEIGHT.0 as u32, glass)?;
+            self.blend.GetOutput()
+        }
     }
 }
 
