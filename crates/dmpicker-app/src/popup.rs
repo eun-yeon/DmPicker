@@ -18,10 +18,11 @@ use dmpicker_search::{Diff, Filter, Mode};
 
 use crate::anim::{open_scale, Ease, Spring, Tween, OPEN, OPEN_FADE, OPEN_KICK};
 use crate::beam::{Beam, Kind, SPIN_SECS};
+use crate::blob;
 use crate::catalog::{Catalog, DlcPack, Song};
 use crate::edit::{clean_paste, Editor};
 use crate::gfx::{
-    self, alpha_step, circle, color, rect, rounded, rrect, white, with_alpha, Drawing, Gfx, Retarget, BEARING, CARET, DISABLED,
+    self, alpha_step, circle, color, ellipse, rect, rounded, rrect, white, with_alpha, Drawing, Gfx, Retarget, BEARING, CARET, DISABLED,
     FAINT, FAVORITE, FILL_HOVER, FILL_SELECTED, FILL_STRONG, FILL_TRACK, SUB, TEXT, TINT,
 };
 use crate::hotkey::Hotkey;
@@ -49,8 +50,10 @@ const CLOSE_SCALE: f32 = 0.95;
 const CLOSE_SECS: f32 = 0.16;
 /// 단축키를 못 받은 이유를 보여 주는 시간
 const HOTKEY_NOTE_SECS: f32 = 2.0;
-/// 세그먼트 컨트롤 손잡이가 새 선택으로 미끄러지는 시간
-const SEG_SECS: f32 = 0.25;
+/// 세그먼트 손잡이 양 끝 스프링 (`SegThumb`), 가는 쪽 앞 끝은 0.3초·튐 0.2, 뒤 끝은 0.42초·튐 0.3
+/// 뒤 끝이 늦게 따라와서 가는 동안 늘어났다 내려앉음
+const SEG_LEAD: (f32, f32) = (439.0, 33.5);
+const SEG_TRAIL: (f32, f32) = (224.0, 20.9);
 /// 토글: 노브는 끝을 살짝 지나쳤다 돌아오고 (커브가 넘침을 만듦, 연타해도 뒤로 안 튐)
 const KNOB_SECS: f32 = 0.24;
 const KNOB_EASE: Ease = Ease(0.34, 1.56, 0.64, 1.0);
@@ -64,10 +67,12 @@ const PRESS_SECS: f32 = 0.42;
 const PRESS_EASE: Ease = Ease(0.33, 1.0, 0.68, 1.0);
 /// 닫기: 판이 이 불투명도까지 흐려질 때쯤 글과 줄은 이미 사라짐
 const CLOSE_TEXT_GONE: f32 = 0.5;
-/// 패널이 나타날 땐 이만큼 (DIP) 위에서 내려앉고, 사라질 땐 그만큼 올라가며 흐려짐
-const SHEET_RISE: f32 = 6.0;
+/// 패널 페이드, 높이는 그동안 바 아래에서 펼쳐지고 접힘 (`panel_h`)
 const SHEET_IN_SECS: f32 = 0.22;
 const SHEET_OUT_SECS: f32 = 0.16;
+/// 판 높이가 멈췄다고 보는 차 (px), 0에서 펼 때 0.56초에 멈춤
+/// 스프링 기준 0.01이면 0.85초까지 그리고 끝 0.35초는 0.25 px도 안 남은 움직임
+const PANEL_REST: f32 = 0.1;
 /// 보기·탭·카드를 바꿀 때 옛 내용에서 새 내용으로 섞이는 시간 (`Crossfade`)
 const SWAP_SECS: f32 = 0.25;
 /// 즐겨찾기 별 (`StarMotion`): 색과 채움은 켤 때도 끌 때도 이 시간에 바뀜, 눌림과 점 튀기는 켤 때만
@@ -84,6 +89,23 @@ const BEAD_HISTORY: usize = 0;
 const BEAD_GEAR: usize = 1;
 /// 두 버튼 시차: 나올 땐 히스토리 다음 톱니, 들어갈 땐 톱니 다음 히스토리
 const BEAD_STAGGER: Duration = Duration::from_millis(70);
+/// 버튼 나오기 스프링, 누른 버튼도 이걸로 돌아옴
+const BEAD_SPRING: (f32, f32) = (300.0, 17.0);
+/// 마우스로 누르는 동안 버튼 배율
+const BEAD_PRESS: f32 = 1.08;
+/// 누를 때 부푸는 스프링 (0.2초·튐 0.2)
+const BEAD_PRESS_IN: (f32, f32) = (987.0, 50.3);
+/// 짧게 눌렀다 떼도 이만큼은 부푼 뒤 돌아옴 (누름 진행 75 %)
+const BEAD_PRESS_SHOWN: f32 = 1.0 + (BEAD_PRESS - 1.0) * 0.75;
+/// 나오고 들어가는 동안 가로 속도 (DIP/초)만큼 가로로 늘어남, 0.16 x tanh(속도 / 600)
+const BEAD_STRETCH_SPEED: f32 = 600.0;
+const BEAD_STRETCH_MAX: f32 = 0.16;
+/// 늘어남이 목표를 따라가는 스프링 (0.2초·튐 0.25), 멈추면 한 번 출렁이며 원으로 돌아옴
+const BEAD_STRETCH: (f32, f32) = (987.0, 47.1);
+/// 누름·늘어남이 멈췄다고 보는 차, 스프링 기준 0.01이면 반지름이 0.2 DIP라 멈출 때 맞추면 튐
+const BEAD_REST: f32 = 1e-3;
+/// 바와 두 버튼을 녹여 붙이는 폭 (DIP, `blob`), 쉬는 간격과 같아서 쉴 땐 원래 모양 그대로
+const BLOB_K: f32 = lay::BTN_GAP;
 
 /// 설정 시트 키보드 포커스 (`kb_focus`), 화살표로 오가는 위에서 아래 순서
 const FOCUS_MODE: usize = 0;
@@ -170,8 +192,7 @@ struct Fonts {
 }
 
 struct Effects {
-    goo_blur: ID2D1Effect,
-    sheets: ID2D1Effect, // 합성: 끈적하게 붙는 바+두 버튼 (입력 0) + 선명한 패널 (입력 1)
+    sheets: ID2D1Effect, // 합성: 녹아 붙는 바+두 버튼 (입력 0) + 선명한 패널 (입력 1)
     shadow: gfx::Shadow, // 모양 아래 그림자
     plate: ID2D1Effect,  // 모양 안을 칠한 판
     flood: ID2D1Effect,  // 판 색, 진하기는 유리 효과를 따라감
@@ -718,6 +739,57 @@ impl ToggleMotion {
     }
 }
 
+/// 세그먼트 손잡이 양 끝 (칸 단위), 끝마다 따로 움직여 가는 쪽 끝이 먼저 감
+/// 도중에 목표가 바뀌어도 지금 속도에서 이어감
+#[derive(Clone, Copy)]
+struct SegThumb {
+    left: Spring,
+    right: Spring,
+}
+
+impl SegThumb {
+    fn new() -> Self {
+        Self { left: Spring::new(0.0, SEG_LEAD.0, SEG_LEAD.1), right: Spring::new(1.0, SEG_LEAD.0, SEG_LEAD.1) }
+    }
+
+    fn snap(&mut self, at: f32) {
+        self.left.snap(at);
+        self.right.snap(at + 1.0);
+    }
+
+    /// 손잡이가 향하는 칸
+    fn target(&self) -> f32 {
+        self.left.target
+    }
+
+    /// 오른쪽으로 가면 오른쪽 끝이 앞
+    fn go(&mut self, to: f32) {
+        let (lead, trail) = if to > self.left.value { (&mut self.right, &mut self.left) } else { (&mut self.left, &mut self.right) };
+        lead.tune(SEG_LEAD);
+        trail.tune(SEG_TRAIL);
+        self.left.target = to;
+        self.right.target = to + 1.0;
+    }
+
+    /// 멈추면 목표 칸 그대로
+    fn step(&mut self, dt: f32) {
+        self.left.step(dt);
+        self.right.step(dt);
+        if self.settled() {
+            self.snap(self.left.target);
+        }
+    }
+
+    /// 넓은 탭은 한 칸이 400 px 가까이라 0.001칸까지 봄
+    fn settled(&self) -> bool {
+        self.left.settled_to(1e-3) && self.right.settled_to(1e-3)
+    }
+
+    fn ends(&self) -> (f32, f32) {
+        (self.left.value, self.right.value)
+    }
+}
+
 /// 글이 바뀐 이유, `requery`에서 씀
 #[derive(Clone, Copy)]
 enum Edit {
@@ -941,13 +1013,19 @@ pub struct Popup {
     reveal: [Spring; 2], // 버튼별 0 숨김 .. 1 표시 (하나당 바가 54 줄어듦), 튐
     beads_out: bool,     // 두 버튼을 내보내는 중 (스프링은 시차를 두고 따라감)
     reveal_follow: Option<(Instant, usize, f32)>, // 시차 뒤에 움직일 버튼과 목표
+    bead_press: [Spring; 2], // 버튼별 배율, 마우스로 누르는 동안 부풂
+    bead_down: Option<(usize, View)>, // 마우스로 누르고 있는 버튼과 그때 보기, 보기가 바뀌면 놓음
+    bead_letgo: [bool; 2], // 짧게 눌렀다 뗀 버튼, 누름이 75 %까지 보인 뒤 돌아감
+    bead_at: Option<(f32, f32)>, // 버튼을 누른 채인 커서 자리 (클라이언트 px), 버튼이 움직여도 원 안인지 다시 봄
+    bead_stretch: [Spring; 2], // 버튼별 가로로 늘어난 정도, 가로 속도를 따라감
     icon_alpha: Tween,      // 두 버튼 아이콘
     panel_h: Spring,        // 보이는 패널의 높이, 내용이 바뀔 때만 움직임
+    unfolding: bool,        // 사라졌거나 사라지던 판이 다시 펼쳐지는 중, 다 펼 때까지 아래 빈 곳도 판 자리
     shown: Tween,           // 패널 보임 0 .. 1, 나타나고 사라질 때의 페이드
     close: Tween,           // 닫는 동안 0에서 1로
     sel_y: Spring,          // 선택 강조 위쪽, 패널 px (높이는 한 줄)
     scroll_s: Spring,       // 목록 오프셋 px, scroll x 줄 간격을 따라감
-    seg: [Tween; 4],        // 세그먼트 손잡이 [모드, 난이도, 히스토리 탭, 검색 제외 탭]: 왼쪽 끝, 칸 단위
+    seg: [SegThumb; 4],     // 세그먼트 손잡이 [모드, 난이도, 히스토리 탭, 검색 제외 탭]
     sheet_swap: Crossfade,  // 시트 내용, 보기나 카드가 바뀌면 겹쳐 바꿈
     list_swap: Crossfade,   // 히스토리·검색 제외 줄 목록, 탭이 바뀌면 겹쳐 바꿈 (탭은 제자리)
     star: Option<StarMotion>, // 키워드 시트 별 버튼 모션, 시트를 닫으면 버림
@@ -969,6 +1047,7 @@ pub struct Popup {
     jackets: HashMap<u32, Option<ID2D1Bitmap1>>,
     fonts: Option<Fonts>,
     fx: Option<Effects>,
+    blob_path: Option<((Vec<blob::Shape>, Vec<blob::Shape>), ID2D1PathGeometry1)>, // 녹여 붙인 바+두 버튼 경로와 그 모양들, 같으면 다시 안 만듦
     beams: Option<Beams>,
 }
 
@@ -991,8 +1070,6 @@ struct SheetGeom {
     rect: D2D_RECT_F,
     /// 시트와 내용의 불투명도
     alpha: f32,
-    /// 다 편 자리에서 비켜난 거리 (px, 위가 음수), 내용도 같이 움직임
-    dy: f32,
 }
 
 /// 플레이리스트 결과 줄 목록 아래 칸 (`foot_of`), 높이·줄 수 계산과 그리기가 같이 씀
@@ -1156,16 +1233,22 @@ impl Popup {
             roll_edit: None,
             hover: Hit::None,
             open_s: OPEN_SPRING,
-            reveal: [Spring::new(0.0, 300.0, 17.0); 2],
+            reveal: [Spring::new(0.0, BEAD_SPRING.0, BEAD_SPRING.1); 2],
             beads_out: false,
             reveal_follow: None,
+            bead_press: [Spring::new(1.0, BEAD_SPRING.0, BEAD_SPRING.1); 2],
+            bead_down: None,
+            bead_letgo: [false; 2],
+            bead_at: None,
+            bead_stretch: [Spring::new(0.0, BEAD_STRETCH.0, BEAD_STRETCH.1); 2],
             icon_alpha: Tween::new(0.0),
             panel_h: Spring::new(0.0, 330.0, 29.0),
+            unfolding: false,
             shown: Tween::new(0.0),
             close: Tween::new(0.0),
             sel_y: SEL_SPRING,
             scroll_s: Spring::new(0.0, 600.0, 46.0),
-            seg: [Tween::new(0.0); 4],
+            seg: [SegThumb::new(); 4],
             sheet_swap: Crossfade::new(),
             list_swap: Crossfade::new(),
             star: None,
@@ -1186,6 +1269,7 @@ impl Popup {
             jackets: HashMap::new(),
             fonts: None,
             fx: None,
+            blob_path: None,
             beams: None,
         }
     }
@@ -1329,14 +1413,15 @@ impl Popup {
                 || self.shown_at.elapsed().as_secs_f32() < OPEN_FADE
                 || self.reveal.iter().any(|r| !r.settled())
                 || self.reveal_follow.is_some()
+                || self.bead_press.iter().chain(&self.bead_stretch).any(|s| !s.settled_to(BEAD_REST))
                 || !self.icon_alpha.done()
-                || !self.panel_h.settled()
+                || !self.panel_h.settled_to(PANEL_REST)
                 || !self.shown.done()
                 || (self.shown.target() <= 0.0 && self.panel_h.value != 0.0) // 다 사라진 뒤 높이 정리 (`render`)
                 || self.closing
                 || !self.sel_y.settled()
                 || !self.scroll_s.settled()
-                || self.seg.iter().any(|t| !t.done())
+                || self.seg.iter().any(|t| !t.settled())
                 || self.sheet_swap.animating()
                 || self.list_swap.animating()
                 || self.star.as_ref().is_some_and(|m| !m.done(m.elapsed()))
@@ -1429,9 +1514,18 @@ impl Popup {
 
     /// 멈춘 스프링은 목표 값 그대로, 판 가장자리가 정수 px에 와야 1 px 테두리가 한 줄로 선명함
     /// 움직이는 동안엔 안 맞춤, 맞추면 1 px씩 계단처럼 튐
+    /// 버튼 배율·늘어남도 멈추면 정확히 1배·0이라 쉬는 버튼은 정확한 원
     fn rest_on_pixels(&mut self) {
-        for sp in self.reveal.iter_mut().chain([&mut self.open_s, &mut self.panel_h]) {
+        for sp in self.reveal.iter_mut().chain([&mut self.open_s]) {
             if sp.settled() {
+                sp.snap(sp.target);
+            }
+        }
+        if self.panel_h.settled_to(PANEL_REST) {
+            self.panel_h.snap(self.panel_h.target);
+        }
+        for sp in self.bead_press.iter_mut().chain(self.bead_stretch.iter_mut()) {
+            if sp.settled_to(BEAD_REST) {
                 sp.snap(sp.target);
             }
         }
@@ -1485,6 +1579,7 @@ impl Popup {
         self.gfx = None;
         self.fonts = None;
         self.fx = None;
+        self.blob_path = None;
         self.jackets.clear();
         self.sheet_swap.reset();
         self.list_swap.reset();
@@ -1523,6 +1618,11 @@ impl Popup {
         self.reveal.iter_mut().for_each(|r| r.snap(0.0));
         self.beads_out = false;
         self.reveal_follow = None;
+        self.bead_press.iter_mut().for_each(|s| s.snap(1.0));
+        self.bead_down = None;
+        self.bead_at = None;
+        self.bead_letgo = [false; 2];
+        self.bead_stretch.iter_mut().for_each(|s| s.snap(0.0));
         self.icon_alpha.snap(0.0);
         self.panel_h.snap(0.0);
         self.shown.snap(0.0);
@@ -1590,6 +1690,7 @@ impl Popup {
         self.end_hotkey_wait();
         self.end_drag();
         self.release_toggle();
+        self.release_bead();
         self.notify_composition(CPS_CANCEL); // 조합 중이던 글자는 숨겨질 때까지 그려 둠
         unsafe {
             let _ = KillTimer(Some(self.hwnd), TIMER_CARET);
@@ -1632,21 +1733,8 @@ impl Popup {
             small: g.ui_format(11.0 * s, DWRITE_FONT_WEIGHT_SEMI_BOLD)?,
         });
 
-        // 모양 마스크: 작은 블러 + 알파 임계값, 거의 닿을 때만 모양이 녹아 붙음
-        let goo_blur = g.effect(&CLSID_D2D1GaussianBlur)?;
-        // 늘어나는 목이 보일 만큼 강하게, 쉴 땐 8 px 거리의 버튼이 분리될 만큼 약하게
-        gfx::set_f32(&goo_blur, D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION.0 as u32, 5.0 * s)?;
-        gfx::set_u32(&goo_blur, D2D1_GAUSSIANBLUR_PROP_BORDER_MODE.0 as u32, D2D1_BORDER_MODE_SOFT.0 as u32)?;
-        let thresh = g.effect(&CLSID_D2D1ColorMatrix)?;
-        gfx::set_floats(
-            &thresh,
-            D2D1_COLORMATRIX_PROP_COLOR_MATRIX.0 as u32,
-            &[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 22.0, 22.0, 22.0, 22.0, -10.5, -10.5, -10.5, -10.5],
-        )?;
-        gfx::set_bool(&thresh, D2D1_COLORMATRIX_PROP_CLAMP_OUTPUT.0 as u32, true)?;
-        gfx::set_input_effect(&thresh, 0, &goo_blur)?;
+        // 모양 마스크: 바+두 버튼은 프레임마다 녹여 붙인 경로 (`blob_path`), 패널은 따로 선명하게
         let sheets = g.effect(&CLSID_D2D1Composite)?;
-        gfx::set_input_effect(&sheets, 0, &thresh)?;
 
         // 그림자: 모양 마스크를 알림과 같은 그림자로 (`gfx::Shadow`)
         let shadow = gfx::Shadow::new(g, s)?;
@@ -1672,7 +1760,7 @@ impl Popup {
         let rim_light = g.effect(&CLSID_D2D1AlphaMask)?;
         gfx::set_input_effect(&rim_light, 1, &ring)?;
 
-        self.fx = Some(Effects { goo_blur, sheets, shadow, plate, flood, flood_glass: std::cell::Cell::new(0.0), rim_light, _keep: vec![thresh, erode, ring] });
+        self.fx = Some(Effects { sheets, shadow, plate, flood, flood_glass: std::cell::Cell::new(0.0), rim_light, _keep: vec![erode, ring] });
 
         // 빛을 못 만들면 빛 없이 그대로
         let beams = g.scene().map(|sc| -> Result<Beams> {
@@ -1739,6 +1827,87 @@ impl Popup {
         ((self.reveal[k].value - 0.6) / 0.3).clamp(0.0, 1.0)
     }
 
+    /// 버튼 `k`를 그리는 타원 (x, y, 가로 반지름, 세로 반지름), 움직이는 동안 가로로 늘어남 (넓이 그대로)
+    /// `full`이면 누름 배율을 다 넣음, 아니면 1배까지만 (녹여 붙이는 모양, 부푼 만큼은 녹이지 않고 합쳐서 이웃과 안 이어짐)
+    fn bead_shape(&self, k: usize, full: bool) -> (f32, f32, f32, f32) {
+        let (x, y, r) = self.bead_now(k);
+        let p = self.bead_press[k].value;
+        let r = r * if full { p } else { p.min(1.0) };
+        let s = 1.0 + self.bead_stretch[k].value.max(0.0);
+        (x, y, r * s, r / s)
+    }
+
+    /// 버튼 모양 한 걸음: 누름 배율, 가로 속도를 따라가는 늘어남
+    /// 속도는 위치 차 대신 나오기 스프링 속도로 바로 셈, 프레임 간격이 흔들려도 잡음 없음
+    fn step_beads(&mut self, dt: f32) {
+        // 누른 채 키보드 등으로 보기가 바뀌면 놓음
+        if self.bead_down.is_some_and(|(_, view)| view != self.view) {
+            self.release_bead();
+        }
+        // 커서가 가만히 있어도 버튼이 움직여 누른 자리가 원 밖이 될 수 있음
+        self.follow_press();
+        let [rh, rg] = self.reveal;
+        // `bead_now`의 x를 시간으로 미분 (DIP/초), 히스토리는 톱니가 나오는 만큼 왼쪽으로 비켜남
+        let gear = 0.65 * lay::BTN_D * rh.velocity;
+        let slide = if (-0.15..=1.15).contains(&rg.value) { (lay::BTN_D + lay::BTN_GAP) * rg.velocity } else { 0.0 };
+        for (k, v) in [(BEAD_HISTORY, gear - slide), (BEAD_GEAR, gear)] {
+            // 끝이 꺾이지 않게 tanh로 포화
+            self.bead_stretch[k].target = BEAD_STRETCH_MAX * (v.abs() / BEAD_STRETCH_SPEED).tanh();
+            self.bead_stretch[k].step(dt);
+            if self.bead_letgo[k] && self.bead_press[k].value >= BEAD_PRESS_SHOWN {
+                self.bead_letgo[k] = false;
+                self.swell_bead(k, false);
+            }
+            self.bead_press[k].step(dt);
+        }
+    }
+
+    /// 모양 마스크에 녹여 붙일 바와 지금 그리는 버튼들, 1배 넘게 부푼 버튼은 녹이지 않고 그대로 합침 (px)
+    /// 부푼 원을 경로 위에 따로 칠하면 가장자리 반투명 픽셀이 두 번 겹쳐 1배를 지날 때 테두리가 밝아짐
+    fn blob_shapes(&self) -> (Vec<blob::Shape>, Vec<blob::Shape>) {
+        let bar = self.bar_rect();
+        let (hw, hh) = ((bar.right - bar.left) / 2.0, (bar.bottom - bar.top) / 2.0);
+        let r = (bar.bottom - bar.top).min(self.px(lay::BAR_R) * 2.0) / 2.0;
+        let bar = blob::Shape::Bar { cx: (bar.left + hw) as f64, hw: hw as f64, hh: hh as f64, r: r.min(hw) as f64 };
+        let drawn = || [BEAD_HISTORY, BEAD_GEAR].into_iter().filter(|&k| self.reveal[k].value > 0.02);
+        let bead_ellipse = |k: usize, full: bool| {
+            let (cx, _, rx, ry) = self.bead_shape(k, full);
+            blob::Shape::Ellipse { cx: cx as f64, rx: rx as f64, ry: ry as f64 }
+        };
+        let melted = std::iter::once(bar).chain(drawn().map(|k| bead_ellipse(k, false))).collect();
+        let swollen = drawn().filter(|&k| self.bead_press[k].value > 1.0).map(|k| bead_ellipse(k, true)).collect();
+        (melted, swollen)
+    }
+
+    /// 녹여 붙인 바+두 버튼 경로, 모양이 지난 프레임과 같으면 그대로 씀
+    fn blob_geometry(&mut self) -> Result<ID2D1PathGeometry1> {
+        let shapes = self.blob_shapes();
+        if let Some((last, path)) = &self.blob_path {
+            if *last == shapes {
+                return Ok(path.clone());
+            }
+        }
+        let cy = self.px(lay::MARGIN) + self.px(lay::BAR_H) / 2.0;
+        let parts = blob::outline(&shapes.0, &shapes.1, (BLOB_K * self.scale) as f64, self.scale as f64);
+        let g = self.gfx.as_ref().unwrap();
+        let path = unsafe { g.factory.CreatePathGeometry()? };
+        unsafe {
+            let sink = path.Open()?;
+            for part in &parts {
+                // 위쪽은 왼쪽에서 오른쪽으로, 아래쪽은 거꾸로 돌아와 닫음
+                let top = part.iter().map(|&(x, t)| gfx::pt(x as f32, cy - t as f32));
+                let bottom = part[1..part.len() - 1].iter().rev().map(|&(x, t)| gfx::pt(x as f32, cy + t as f32));
+                let pts: Vec<_> = top.chain(bottom).collect();
+                sink.BeginFigure(pts[0], D2D1_FIGURE_BEGIN_FILLED);
+                sink.AddLines(&pts[1..]);
+                sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+            }
+            sink.Close()?;
+        }
+        self.blob_path = Some((shapes, path.clone()));
+        Ok(path)
+    }
+
     /// 버튼 `k`의 최종 (고정) 위치, 톱니가 오른쪽 끝이고 히스토리가 그 왼쪽
     fn bead_circle(&self, k: usize) -> (f32, f32, f32) {
         let r = self.px(lay::BTN_D) / 2.0;
@@ -1750,27 +1919,33 @@ impl Popup {
         self.px(lay::MARGIN + lay::BAR_H + lay::GAP)
     }
 
-    /// 그릴 시트: 지금 높이에서, 나타나고 사라질 땐 시트와 내용이 같이 흐려지며 위로 비켜남
+    /// 그릴 시트: 바 아래 제자리에서 지금 높이까지, 나타나고 사라질 땐 시트와 내용이 같이 흐려짐
     /// 불투명도는 1/64 단위 (`alpha_step`)
     fn sheet_geom(&self) -> SheetGeom {
-        let alpha = alpha_step(self.shown.value());
-        let dy = -SHEET_RISE * self.scale * (1.0 - alpha);
-        let top = self.panel_top() + dy;
-        SheetGeom { rect: rect(self.px(lay::MARGIN), top, self.px(lay::MARGIN + lay::W), top + self.panel_h.value.max(0.0)), alpha, dy }
+        let top = self.panel_top();
+        SheetGeom { rect: rect(self.px(lay::MARGIN), top, self.px(lay::MARGIN + lay::W), top + self.panel_h.value.max(0.0)), alpha: alpha_step(self.shown.value()) }
     }
 
-    /// 보여 줄 게 있으면 그 높이로 나타나고 (다 사라져 있었으면 그 높이에서 바로) 시트 내용을 바꿈
-    /// 없으면 높이와 내용을 그대로 둔 채 사라짐, 다 사라지면 높이 0 (`render`)
-    /// 나타나다 사라지거나 그 반대로 바뀌어도 지금 불투명도·자리에서 이어짐
+    /// 보여 줄 게 있으면 그 높이로 나타나고 (다 사라져 있었으면 높이 0에서 펼쳐짐) 시트 내용을 바꿈
+    /// 없으면 내용을 그대로 둔 채 접히며 사라짐, 다 사라지면 높이 0 (`render`)
+    /// 나타나다 사라지거나 그 반대로 바뀌어도 지금 불투명도·높이·속도에서 이어짐
     /// 보기나 카드가 바뀌면 반 넘게 보이던 시트는 겹쳐 바꾸고 (`Crossfade`) 반도 안 보였으면 한 프레임에 바꿈, 높이는 같이 움직임
     fn retarget_panel(&mut self) {
         let to = self.panel_target();
         if to <= 0.0 {
             self.shown.go(0.0, SHEET_OUT_SECS, Ease::STANDARD);
+            self.panel_h.target = 0.0;
+            self.unfolding = false;
             return;
         }
-        if self.shown.target() <= 0.0 && self.shown.done() {
-            self.panel_h.snap(to);
+        // 사라지던 중이든 다 사라졌든 다시 나타나면 다 펼 때까지 아래 빈 곳도 판 자리, 0에서 펴는 건 다 사라졌을 때만
+        if self.shown.target() <= 0.0 {
+            self.unfolding = true;
+            if self.shown.done() {
+                self.panel_h.snap(0.0);
+            }
+        } else if self.panel_h.settled_to(PANEL_REST) {
+            self.unfolding = false; // 다 편 뒤엔 보기를 바꿔 커져도 그려진 데까지만
         }
         self.panel_h.target = to;
         self.shown.go(1.0, SHEET_IN_SECS, Ease::DECEL);
@@ -2187,16 +2362,16 @@ impl Popup {
         if inside(&bar, x, y) {
             return if x < self.text_right() { Hit::Text } else { Hit::Inside };
         }
-        // 그려진 대로 판정: 시트는 비켜난 자리, 내용은 같이 비켜난 자리 (`dy`)
-        // 반 넘게 보이기 전엔 줄·버튼을 못 누름
+        // 그려진 대로 판정: 반 넘게 보이기 전이나 사라지기 시작한 뒤엔 줄·버튼을 못 누름
+        // 다시 펼쳐지는 동안 아직 안 보이는 아래쪽은 다 편 자리까지 아무 일 없음, 펼쳐질 자리를 눌러도 안 닫힘
         let sg = self.sheet_geom();
         if !inside(&sg.rect, x, y) {
-            return Hit::None;
+            let full = rect(sg.rect.left, sg.rect.top, sg.rect.right, sg.rect.top + self.panel_h.target.max(0.0));
+            return if self.unfolding && inside(&full, x, y) { Hit::Inside } else { Hit::None };
         }
-        if sg.alpha < 0.5 {
+        if sg.alpha < 0.5 || self.shown.target() <= 0.0 {
             return Hit::Inside;
         }
-        let y = y - sg.dy;
         if self.view == View::Exclude {
             if inside(&self.exclude_done(), x, y) {
                 return Hit::DoneExclude;
@@ -3299,8 +3474,7 @@ impl Popup {
             g.dc.DrawTextLayout(gfx::pt(left - BEARING, self.panel_top() + self.px(lay::PAD + 6.67)), &title, &g.brush(TEXT)?, D2D1_DRAW_TEXT_OPTIONS_NONE);
         }
         draw_button(g, &f.item, done, "완료", self.hover == Hit::DoneExclude, self.scale)?;
-        let at = self.seg[SEG_EXCLUDE].value();
-        draw_segments(g, f, self.exclude_tabs_rect(), &["DLC", "숨긴 곡"], (at, at + 1.0), lay::PANEL_R - lay::PAD, self.scale)
+        draw_segments(g, f, self.exclude_tabs_rect(), &["DLC", "숨긴 곡"], self.seg[SEG_EXCLUDE].ends(), lay::PANEL_R - lay::PAD, self.scale)
     }
 
     /// 탭마다 바뀌는 요약과 줄 목록, 줄이 없으면 빈 목록 띠 가운데에 문구
@@ -4082,9 +4256,8 @@ impl Popup {
         self.set_scroll(ns);
         self.hover = self.hit(cursor.0, cursor.1);
         // 멈췄을 때 커서 아래에 오는 줄
-        let dy = self.sheet_geom().dy;
         let under = match self.hover {
-            Hit::Row(_) => self.row_at(cursor.1 - dy, self.scroll_s.target),
+            Hit::Row(_) => self.row_at(cursor.1, self.scroll_s.target),
             _ => None,
         };
         // 보이는 줄 안에서 가장 가까운 고를 수 있는 줄, 없으면 지금 선택 그대로
@@ -4166,6 +4339,58 @@ impl Popup {
         }
     }
 
+    /// 히스토리·톱니 버튼을 마우스로 누름, 떼거나 캡처를 잃거나 보기가 바뀔 때까지 부푼 채
+    fn press_bead(&mut self, k: usize, at: (f32, f32)) {
+        self.bead_down = Some((k, self.view));
+        self.bead_at = Some(at);
+        self.bead_letgo[k] = false;
+        self.swell_bead(k, true);
+        unsafe {
+            SetCapture(self.hwnd);
+        }
+    }
+
+    /// 누른 자리가 지금 버튼 원 (누름 배율을 뺀 원래 크기) 안이면 부풀리고 밖이면 1배로
+    fn follow_press(&mut self) {
+        let (Some((k, _)), Some((x, y))) = (self.bead_down, self.bead_at) else { return };
+        let (bx, by, br) = self.bead_now(k);
+        let over = (x - bx).powi(2) + (y - by).powi(2) <= br * br;
+        if over != (self.bead_press[k].target > 1.0) {
+            self.swell_bead(k, over);
+        }
+    }
+
+    /// 누른 버튼을 부풀리거나 나올 때와 같은 스프링으로 1배로 되돌림
+    fn swell_bead(&mut self, k: usize, on: bool) {
+        let s = &mut self.bead_press[k];
+        if on {
+            s.tune(BEAD_PRESS_IN);
+            s.target = BEAD_PRESS;
+        } else {
+            s.tune(BEAD_SPRING);
+            s.target = 1.0;
+        }
+    }
+
+    /// 버튼에서 손을 뗌, 버튼 밖에서 떼도 돌아옴
+    fn release_bead(&mut self) {
+        if let Some((k, _)) = self.bead_down.take() {
+            self.let_go_bead(k);
+            unsafe {
+                let _ = ReleaseCapture();
+            }
+        }
+    }
+
+    /// 짧게 눌렀으면 75 %까지 부푼 뒤 돌아감 (`step_beads`), 커서가 밖이라 이미 돌아가는 중이면 그대로
+    fn let_go_bead(&mut self, k: usize) {
+        if self.bead_press[k].target > 1.0 && self.bead_press[k].value < BEAD_PRESS_SHOWN {
+            self.bead_letgo[k] = true;
+        } else {
+            self.swell_bead(k, false);
+        }
+    }
+
     /// 세그먼트마다 고른 칸: 모드, 난이도, 히스토리 탭, 검색 제외 탭
     fn segment_choices(&self) -> [usize; 4] {
         [self.mode_choice.index(), self.diff_choice.index(), self.history_tab as usize, self.exclude_tab as usize]
@@ -4177,7 +4402,7 @@ impl Popup {
         }
     }
 
-    /// 손잡이를 지금 선택으로 보냄, 한 덩어리로 처음엔 빠르게 미끄러지다 부드럽게 멈춤
+    /// 손잡이를 지금 선택으로 보냄, 가는 쪽 끝이 먼저 가서 늘어났다가 뒤 끝이 따라와 내려앉음
     /// 라벨 색도 손잡이를 따라감
     fn retarget_segments(&mut self) {
         for (k, idx) in self.segment_choices().into_iter().enumerate() {
@@ -4185,7 +4410,7 @@ impl Popup {
             if (self.seg[k].target() - to).abs() < 1e-3 {
                 continue;
             }
-            self.seg[k].go(to, SEG_SECS, Ease::OUT);
+            self.seg[k].go(to);
         }
     }
 
@@ -4527,6 +4752,10 @@ impl Popup {
                 self.release_exclude();
                 Some((0, if over { self.toggle_exclude(i) } else { Action::None }))
             }
+            WM_LBUTTONUP if self.bead_down.is_some() => {
+                self.release_bead();
+                Some((0, Action::None))
+            }
             WM_LBUTTONUP if self.toggle_down.is_some() => {
                 let (x, y) = (lp.0 as i16 as f32, (lp.0 >> 16) as i16 as f32);
                 let toggle = self.toggle_down.unwrap();
@@ -4546,6 +4775,9 @@ impl Popup {
                 // 다른 데로 캡처를 뺏기면 안 바꾸고 놓음
                 if let Some(toggle) = self.toggle_down.take() {
                     self.toggles[toggle as usize].press.go(1.0, QUICK_SECS, QUICK_EASE);
+                }
+                if let Some((k, _)) = self.bead_down.take() {
+                    self.let_go_bead(k);
                 }
                 None
             }
@@ -4727,6 +4959,11 @@ impl Popup {
             self.input_changed();
             return;
         }
+        // 누른 채 버튼 원 밖으로 나가면 1배로, 다시 들어오면 다시 부풂
+        if self.bead_down.is_some() {
+            self.bead_at = Some((x, y));
+            self.follow_press();
+        }
         if !self.tracking {
             let mut tme = TRACKMOUSEEVENT {
                 cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
@@ -4814,12 +5051,15 @@ impl Popup {
                 }
                 Action::None
             }
+            // 보기는 누를 때 바로 바뀌고 버튼은 뗄 때까지 부푼 채, 바뀐 보기를 기억해야 바로 안 놓임
             Hit::Gear => {
                 self.toggle_settings();
+                self.press_bead(BEAD_GEAR, (x, y));
                 Action::None
             }
             Hit::History => {
                 self.toggle_history();
+                self.press_bead(BEAD_HISTORY, (x, y));
                 Action::None
             }
             Hit::ModeSeg(i) => {
@@ -5120,12 +5360,8 @@ impl Popup {
                 let lb = if self.kb_focus == Some(focus) { &text_b } else { &sub_b };
                 dc.DrawTextLayout(gfx::pt(l0t, y), &ll, lb, D2D1_DRAW_TEXT_OPTIONS_NONE);
             }
-            let thumb = |k: usize| {
-                let at = self.seg[k].value();
-                (at, at + 1.0)
-            };
-            draw_segments(g, f, sl.mode, &Mode::ALL.map(Mode::label), thumb(SEG_MODE), lay::SEG_R, s)?;
-            draw_segments(g, f, sl.diff, &Diff::ALL.map(Diff::label), thumb(SEG_DIFF), lay::SEG_R, s)?;
+            draw_segments(g, f, sl.mode, &Mode::ALL.map(Mode::label), self.seg[SEG_MODE].ends(), lay::SEG_R, s)?;
+            draw_segments(g, f, sl.diff, &Diff::ALL.map(Diff::label), self.seg[SEG_DIFF].ends(), lay::SEG_R, s)?;
             let note_b = g.brush(FAINT)?;
             let lt = g.layout("내 곡 목록", &f.item_bold, self.px(200.0), self.px(20.0))?;
             dc.DrawTextLayout(gfx::pt(l0t, sl.list_title), &lt, &text_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
@@ -5341,13 +5577,15 @@ impl Popup {
             self.scroll_s.snap(self.scroll_s.target); // 정수 픽셀에서 멈춰야 글자가 선명함
         }
         self.retarget_segments();
+        self.seg.iter_mut().for_each(|s| s.step(dt));
         self.retarget_panel();
         self.open_s.step(dt);
         self.reveal.iter_mut().for_each(|r| r.step(dt));
+        self.step_beads(dt);
         self.panel_h.step(dt);
         self.rest_on_pixels();
         if self.shown.target() <= 0.0 && self.shown.done() {
-            self.panel_h.snap(0.0); // 다 사라짐, 다음엔 새 높이에서 바로 나타남
+            self.panel_h.snap(0.0); // 다 사라짐, 접히다 남은 높이도 정리
         }
         if self.closing && self.close.done() {
             self.finish_hide();
@@ -5385,6 +5623,7 @@ impl Popup {
             Vec::new()
         };
         let exclude_shown: Vec<_> = exclude_ids.into_iter().map(|(i, id)| (i, id.and_then(|id| self.jacket(id)))).collect();
+        let blob = self.blob_geometry()?;
 
         let glass = self.glass_mix();
         let g = self.gfx.as_ref().unwrap();
@@ -5394,11 +5633,12 @@ impl Popup {
         let bar = self.bar_rect();
         let sg = self.sheet_geom();
         let (panel, panel_a) = (sg.rect, sg.alpha);
-        let has_panel = panel_a > 0.0 && panel.bottom > panel.top;
-        let bar_r = self.px(lay::BAR_R);
-        let pr = self.px(lay::PANEL_R);
+        // 펼쳐지기 시작할 때처럼 1 px도 안 되는 판은 판·그림자·테두리 다 안 그림
+        let has_panel = panel_a > 0.0 && panel.bottom - panel.top >= 1.0;
+        // 둥근 사각형은 반지름이 높이 절반을 넘으면 모양이 정해지지 않음
+        let pr = self.px(lay::PANEL_R).min((panel.bottom - panel.top) / 2.0).min((panel.right - panel.left) / 2.0);
         let (gx, _gy, gr) = self.bead_circle(BEAD_GEAR);
-        let beads = [BEAD_HISTORY, BEAD_GEAR].map(|k| self.bead_now(k));
+        let beads = [BEAD_HISTORY, BEAD_GEAR].map(|k| self.bead_shape(k, true));
         // 열 땐 따로 페이드 인, 닫을 땐 그 순간의 불투명도에서 흐려짐
         let fade = 1.0 - self.close.value();
         let open_t = Ease::OUT.apply((self.shown_at.elapsed().as_secs_f32() / OPEN_FADE).min(1.0)) * fade;
@@ -5413,21 +5653,16 @@ impl Popup {
             let target = dc.GetTarget()?;
             let _home = Retarget(dc, target.clone()); // 마스크와 빛은 다른 데 기록함, 끝나면 창으로 되돌림
 
-            // 1) 모양 마스크: 바 + 두 버튼은 액체처럼 늘어나며 떨어지고, 패널은 선명함
+            // 1) 모양 마스크: 바 + 두 버튼은 액체처럼 늘어나며 떨어지고 (`blob`), 패널은 선명함
+            // 누름으로 1배 넘게 부푼 버튼도 같은 경로 안, 녹이지 않아서 이웃 쪽으로 안 당겨짐
             let mask_b = g.brush(white(1.0))?;
-            let bar_h = bar.bottom - bar.top;
             let cl = dc.CreateCommandList()?;
             dc.SetTarget(&cl);
             let d = Drawing::begin(dc, &shrink);
-            dc.FillRoundedRectangle(&rounded(bar, bar_h.min(bar_r * 2.0) / 2.0), &mask_b);
-            for (k, &(bx, by, brr)) in beads.iter().enumerate() {
-                if self.reveal[k].value > 0.02 {
-                    dc.FillEllipse(&circle(bx, by, brr), &mask_b);
-                }
-            }
+            dc.FillGeometry(&blob, &mask_b, None);
             d.end()?;
             cl.Close()?;
-            gfx::set_input_image(&fx.goo_blur, 0, &cl.cast()?);
+            gfx::set_input_image(&fx.sheets, 0, &cl.cast()?);
             let pl = dc.CreateCommandList()?;
             dc.SetTarget(&pl);
             let d = Drawing::begin(dc, &shrink);
@@ -5621,8 +5856,7 @@ impl Popup {
                     dc.DrawTextLayout(gfx::pt(l0, rl.label), &cl, &g.brush(FAINT)?, D2D1_DRAW_TEXT_OPTIONS_NONE);
                     draw_list()?;
                 } else if self.sheet == Sheet::History {
-                    let at = self.seg[SEG_HISTORY].value();
-                    draw_segments(g, f, self.tabs_rect(), &["최근", "즐겨찾기"], (at, at + 1.0), lay::PANEL_R - lay::PAD, s)?;
+                    draw_segments(g, f, self.tabs_rect(), &["최근", "즐겨찾기"], self.seg[SEG_HISTORY].ends(), lay::PANEL_R - lay::PAD, s)?;
                     if let Some(list) = list {
                         dc.DrawImage(list, None, None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
                     }
@@ -5714,7 +5948,7 @@ impl Popup {
             let pressed = self.bead_view();
             let icons = [(BEAD_HISTORY, Hit::History, View::History, Icon::History), (BEAD_GEAR, Hit::Gear, View::Settings, Icon::Settings)];
             for (k, hit, view, icon) in icons {
-                let (bx, by, brr) = beads[k];
+                let (bx, by, rx, ry) = beads[k];
                 let ia = ia * self.bead_shown(k);
                 if ia <= 0.01 {
                     continue;
@@ -5722,10 +5956,11 @@ impl Popup {
                 let lit = self.hover == hit || pressed == view;
                 if lit {
                     let hb = g.brush(white(if pressed == view { FILL_SELECTED } else { FILL_HOVER } * ia))?;
-                    dc.FillEllipse(&circle(bx, by, brr), &hb);
+                    dc.FillEllipse(&ellipse(bx, by, rx, ry), &hb);
                 }
+                // 아이콘은 누름만큼만 커지고 늘어나진 않음
                 let ink = if lit { TEXT } else { SUB };
-                g.fill_icon(icon, bx, by, icon_box, &g.brush(with_alpha(ink, ia))?)?;
+                g.fill_icon(icon, bx, by, icon_box * self.bead_press[k].value, &g.brush(with_alpha(ink, ia))?)?;
             }
 
             // 7) 패널 내용 (움직이는 패널 모양으로 자름, 보기·카드·탭을 바꾸면 겹쳐 바꿈)
@@ -5733,10 +5968,7 @@ impl Popup {
                 // 마스크는 PopLayer 뒤 이 블록이 끝날 때 해제
                 let mask: ID2D1Geometry = g.factory.CreateRoundedRectangleGeometry(&rounded(panel, pr))?.cast()?;
                 dc.PushLayer(&D2D1_LAYER_PARAMETERS1 { contentBounds: panel, ..gfx::layer(panel_a, Some(&mask)) }, None);
-                // 내용은 다 편 시트 자리에서 시트와 같이 비켜남
-                dc.SetTransform(&windows_numerics::Matrix3x2 { M32: shrink.M32 + k * sg.dy, ..shrink });
                 dc.DrawImage(drawn, None, None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
-                dc.SetTransform(&shrink);
                 dc.PopLayer();
             }
 
@@ -5748,10 +5980,15 @@ impl Popup {
 
             // 8) 유리 효과 마스크: 판과 같은 모양·불투명도, 모양 마스크는 닫을 때 줄어드는 변환까지 들어간 창 좌표
             if glass > 0.0 {
-                // 키는 1)의 모양 마스크를 정하는 값만, 안 그린 버튼은 반지름 0
-                let bead = |i: usize| if self.reveal[i].value > 0.02 { beads[i].2 } else { 0.0 };
+                // 키는 1)의 모양 마스크를 정하는 값만: 바, 버튼마다 녹이는 타원과 부푼 타원 (안 그린 버튼은 0)
+                let bead = |i: usize| {
+                    let (x, _, rx, ry) = self.bead_shape(i, false);
+                    if self.reveal[i].value > 0.02 { [x, rx, ry, beads[i].2, beads[i].3] } else { [0.0; 5] }
+                };
                 let panel_key = if has_panel { [panel.left, panel.top, panel.right, panel.bottom, panel_a] } else { [0.0; 5] };
-                let mut key = vec![bar.left, bar.top, bar.right, bar.bottom, beads[0].0, bead(0), beads[1].0, bead(1), open_t, k];
+                let mut key = vec![bar.left, bar.top, bar.right, bar.bottom, open_t, k];
+                key.extend(bead(0));
+                key.extend(bead(1));
                 key.extend(panel_key);
                 g.paint_mask(&key, || {
                     dc.PushLayer(&gfx::layer(open_t, None), None);
@@ -5766,11 +6003,11 @@ impl Popup {
             eprintln!("glass: {e:?}");
         }
         if let Some(b) = &self.beams {
-            // 목록 인식 카드 (첫 인식·다시 인식), 결과·히스토리에서 선택된 무작위로 고르기 줄 (시트 내용과 같이 비켜나고 바뀌면 새 내용과 같이 나타남)
+            // 목록 인식 카드 (첫 인식·다시 인식), 결과·히스토리에서 선택된 무작위로 고르기 줄 (바뀌면 새 내용과 같이 나타남)
             let content_a = panel_a * alpha_step(self.sheet_swap.shown.value());
             let scan_card = matches!(self.card(), Some(Card::Scan | Card::Stale));
             let card = (self.sheet == Sheet::Card && scan_card && has_panel).then_some((panel, content_a));
-            let list_top = self.panel_top() + sg.dy + self.list_top(self.sheet);
+            let list_top = self.panel_top() + self.list_top(self.sheet);
             let list_bottom = (list_top + pitch * n_page as f32).min(panel.bottom);
             let random_sheet = matches!(self.sheet, Sheet::Results | Sheet::History);
             let random = (random_sheet && has_panel && listed && self.rows_of(self.sheet).get(self.selected) == Some(&Row::Random))
@@ -5920,9 +6157,13 @@ fn draw_segments(
         let inset = (3.0 * s).round();
         let (tl, tr) = (thumb.0.clamp(-0.2, n as f32 + 0.2), thumb.1.clamp(-0.2, n as f32 + 0.2));
         let tb = g.brush(white(FILL_STRONG))?;
-        let (x0, x1) = ((r.left + w * tl + inset).max(r.left + inset), (r.left + w * tr - inset).min(r.right - inset));
+        // 두 끝 스프링이 엇갈려도 0.5칸보다 좁아지지 않게 가운데 기준으로 넓힘
+        let (dl, dr) = if tr - tl < 0.5 { ((tl + tr) / 2.0 - 0.25, (tl + tr) / 2.0 + 0.25) } else { (tl, tr) };
+        let (x0, x1) = ((r.left + w * dl + inset).max(r.left + inset), (r.left + w * dr - inset).min(r.right - inset));
+        let (top, bottom) = (r.top + inset, r.bottom - inset);
         if x1 > x0 {
-            dc.FillRoundedRectangle(&rrect(x0, r.top + inset, x1, r.bottom - inset, rad - inset), &tb);
+            let rr = (rad - inset).min((bottom - top) / 2.0).min((x1 - x0) / 2.0);
+            dc.FillRoundedRectangle(&rrect(x0, top, x1, bottom, rr), &tb);
         }
         for (i, label) in labels.iter().enumerate() {
             // 라벨 색은 손잡이를 따라감, 지금 손잡이가 이 칸을 얼마나 덮는지로 정함

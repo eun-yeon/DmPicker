@@ -5,6 +5,7 @@
 
 mod anim;
 mod beam;
+mod blob;
 mod catalog;
 mod driver;
 mod edit;

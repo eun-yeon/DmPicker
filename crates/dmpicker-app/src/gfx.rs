@@ -602,7 +602,11 @@ pub fn rounded(r: D2D_RECT_F, rad: f32) -> D2D1_ROUNDED_RECT {
 }
 
 pub fn circle(x: f32, y: f32, r: f32) -> D2D1_ELLIPSE {
-    D2D1_ELLIPSE { point: pt(x, y), radiusX: r, radiusY: r }
+    ellipse(x, y, r, r)
+}
+
+pub fn ellipse(x: f32, y: f32, rx: f32, ry: f32) -> D2D1_ELLIPSE {
+    D2D1_ELLIPSE { point: pt(x, y), radiusX: rx, radiusY: ry }
 }
 
 pub fn pt(x: f32, y: f32) -> windows_numerics::Vector2 {
@@ -617,12 +621,7 @@ pub fn set_u32(e: &ID2D1Effect, idx: u32, v: u32) -> Result<()> {
     unsafe { e.SetValue(idx, D2D1_PROPERTY_TYPE_UNKNOWN, &v.to_le_bytes()) }
 }
 
-pub fn set_bool(e: &ID2D1Effect, idx: u32, v: bool) -> Result<()> {
-    set_u32(e, idx, v as u32)
-}
-
 /// 벡터나 행렬 속성, 행렬은 D2D가 받는 대로 행 우선
-/// 5x4 색 행렬은 [r,g,b,a] 곱수 5행
 pub fn set_floats(e: &ID2D1Effect, idx: u32, v: &[f32]) -> Result<()> {
     let b: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
     unsafe { e.SetValue(idx, D2D1_PROPERTY_TYPE_UNKNOWN, &b) }

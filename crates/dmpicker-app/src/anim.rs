@@ -49,6 +49,12 @@ impl Spring {
     pub fn settled(&self) -> bool {
         (self.target - self.value).abs() < 0.01 && self.velocity.abs() < 0.01
     }
+
+    /// 목표에서 `eps` 안, 속도는 그 10배 안
+    /// 배율·칸 단위 값은 0.01만 남아도 큰 판에선 몇 px라 멈출 때 목표로 맞추면 튐
+    pub fn settled_to(&self, eps: f32) -> bool {
+        (self.target - self.value).abs() < eps && self.velocity.abs() < 10.0 * eps
+    }
 }
 
 /// 검색창·알림 열기: 띄울 때 0에서 1로 가는 스프링 (stiffness, damping), 살짝 튐
