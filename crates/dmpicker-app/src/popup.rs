@@ -70,9 +70,6 @@ const SHEET_IN_SECS: f32 = 0.22;
 const SHEET_OUT_SECS: f32 = 0.16;
 /// 보기·탭·카드를 바꿀 때 옛 내용에서 새 내용으로 섞이는 시간 (`Crossfade`)
 const SWAP_SECS: f32 = 0.25;
-/// 설정 시트 스크롤 막대: 멈춘 뒤 이만큼 그대로 있다가 흐려짐
-const SCROLLBAR_HOLD_SECS: f32 = 0.45;
-const SCROLLBAR_FADE_SECS: f32 = 0.2;
 /// 즐겨찾기 별 (`StarMotion`): 색과 채움은 켤 때도 끌 때도 이 시간에 바뀜, 눌림과 점 튀기는 켤 때만
 const STAR_FILL_SECS: f32 = 0.15;
 /// 눌림: 앞 30 %에 이 배율까지 줄었다 나머지에 돌아옴, 구간마다 넘쳤다 돌아옴
@@ -110,14 +107,14 @@ mod lay {
     pub const SETTINGS_WHEEL: f32 = 54.0;
     /// 키워드 칩·결과 줄 수 한도 기준 높이 (설정 시트만 한 줄 더 김)
     pub const CONTENT_H: f32 = 402.0;
-    /// 제목·요약·탭 아래부터 목록
-    pub const EXCLUDE_TOP: f32 = 108.0;
+    /// 탭 아래 끝, 제목·요약은 다른 시트 첫 줄 띠(위 8, 높이 48)에 두고 탭은 그 아래 8부터 높이 32
+    pub const EXCLUDE_TOP: f32 = 96.0;
     pub const DLC_ROW_H: f32 = 40.0;
-    /// 검색 제외 목록 최대 높이, DLC 6줄 = 곡 5줄이라 어느 탭에서도 반 줄이 걸쳐 보이지 않음
-    pub const EXCLUDE_LIST_H: f32 = 240.0;
+    /// DLC 6.6줄, 곡 5.5줄이라 아래에 더 있는 줄이 걸쳐 보임
+    pub const EXCLUDE_LIST_H: f32 = 264.0;
     /// 줄이 없을 때 목록 자리, 문구는 이 띠 가운데
     pub const EXCLUDE_EMPTY_H: f32 = 120.0;
-    /// 설정·검색 제외 세그먼트 트랙 모서리, 히스토리 탭은 줄 강조와 같은 12
+    /// 설정 세그먼트 트랙 모서리, 히스토리·검색 제외 탭은 줄 강조와 같은 12
     pub const SEG_R: f32 = 9.0;
     pub const TOGGLE_W: f32 = 42.0;
     pub const TOGGLE_H: f32 = 24.0;
@@ -150,7 +147,6 @@ struct Fonts {
     placeholder: IDWriteTextFormat,
     title: IDWriteTextFormat,
     sub: IDWriteTextFormat,
-    head: IDWriteTextFormat,
     item: IDWriteTextFormat,
     item_bold: IDWriteTextFormat,
     item_regular: IDWriteTextFormat,
@@ -234,18 +230,13 @@ impl ExcludeTab {
             Self::Songs => lay::ROW_H,
         }
     }
-
-    /// 목록 최대 높이에 다 들어가는 줄 수
-    fn visible_rows(self) -> usize {
-        (lay::EXCLUDE_LIST_H / self.row_height()) as usize
-    }
 }
 
 /// 시트에 그리는 내용, 보이거나 나타나는 중에만 바뀌고 사라지는 동안엔 그대로 (`retarget_panel`)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Sheet {
     Settings,
-    /// 팩·곡 줄과 토글
+    /// 팩·곡의 검색 제외 목록
     Exclude,
     Card,
     /// 검색 결과 줄
@@ -651,6 +642,7 @@ enum Hit {
     /// 설정의 검색 제외 버튼, 첫 인식 전엔 안 걸림
     Exclude,
     ExcludeRow(usize),
+    ExcludeButton(usize),
     DoneExclude,
     Hotkey,
     Toggle(Toggle),
@@ -798,6 +790,33 @@ impl ExcludeKind {
 struct ExcludeRow {
     kind: ExcludeKind,
     motion: ToggleMotion,
+    removal: Option<ExcludeRemoval>,
+}
+
+struct ExcludeRemoval {
+    elapsed: f32,
+    collapse: bool,
+}
+
+impl ExcludeRemoval {
+    const FADE: f32 = 0.15;
+    const FOLD: f32 = 0.3;
+
+    fn alpha(&self) -> f32 {
+        (1.0 - self.elapsed / Self::FADE).max(0.0)
+    }
+
+    fn height(&self) -> f32 {
+        if !self.collapse {
+            return 1.0;
+        }
+        let t = (self.elapsed / Self::FOLD).min(1.0);
+        if t < 0.5 { 1.0 - 4.0 * t.powi(3) } else { 4.0 * (1.0 - t).powi(3) }
+    }
+
+    fn done(&self) -> bool {
+        self.elapsed >= if self.collapse { Self::FOLD } else { Self::FADE }
+    }
 }
 
 pub struct Popup {
@@ -888,18 +907,16 @@ pub struct Popup {
     kb_focus: Option<usize>, // 설정 키보드 포커스: 0 모드, 1 난이도, 2 검색 제외, 3 다시 인식, 4 단축키, 5 검색어 유지, 6 DLC 표시, 7 유리 효과
     settings_room: f32, // 패널 위에서 기준 영역 아래 16까지 px, 설정 시트가 더 길면 줄여서 스크롤
     settings_scroll_s: Spring, // 설정 내용을 올린 px, 멈추면 정수
-    settings_scroll_at: Option<Instant>, // 마지막으로 스크롤한 때, 막대가 그 뒤 잠깐 보임
+    settings_scrolling: bool, // 스크롤이 멈춘 프레임까지 참, 그동안 커서 아래 호버를 다시 봄
     toggle_down: Option<Toggle>, // 누른 토글 (떼면 바뀜)
     exclude_rows: Vec<ExcludeRow>,
     exclude_tab: ExcludeTab,
     /// 닫히는 동안 원래 검색어로 돌아가도 빈 목록 문구는 유지함
     exclude_filtered: bool,
-    /// 탭을 연 뒤 숨김을 풀어도 줄을 남겨 바로 되돌릴 수 있게 함
-    exclude_songs: HashSet<u32>,
     exclude_focus: Option<usize>, // 화살표로 고른 줄, 마우스를 움직이면 풀림
     exclude_down: Option<usize>, // 누른 줄 (떼면 바뀜)
-    exclude_scroll: usize, // 처음 보이는 줄
-    exclude_scroll_s: Spring, // 목록 오프셋 px, exclude_scroll x 줄 간격을 따라감
+    exclude_space: bool, // 마지막 줄을 빼서 포커스가 없어져도 뒤따르는 공백은 입력하지 않음
+    exclude_scroll_s: Spring, // 끝 오프셋은 한 줄보다 작을 수 있어 px로 저장함
     keyword_edit: Option<KeywordEdit>,
     roll_edit: Option<RollEdit>,
     hover: Hit,
@@ -982,7 +999,7 @@ impl Foot {
     }
 }
 
-/// 아래 칸 `foot`을 빼고 창 높이 (설정 시트 402)에 드는 줄 수, 아래 칸이 없으면 `ROWS`
+/// 아래 칸 `foot`을 빼고 시트 높이 기준(`CONTENT_H` 402)에 드는 줄 수, 아래 칸이 없으면 `ROWS`
 /// 코멘트가 5줄에서 잘려서 효과 줄이 있어도 5줄은 남음
 fn page_above(foot: Option<&Foot>) -> usize {
     let Some(foot) = foot else { return lay::ROWS };
@@ -1110,15 +1127,14 @@ impl Popup {
             kb_focus: None,
             settings_room: f32::INFINITY,
             settings_scroll_s: Spring::new(0.0, 600.0, 46.0),
-            settings_scroll_at: None,
+            settings_scrolling: false,
             toggle_down: None,
             exclude_rows: Vec::new(),
             exclude_tab: ExcludeTab::Dlc,
             exclude_filtered: false,
-            exclude_songs: HashSet::new(),
             exclude_focus: None,
             exclude_down: None,
-            exclude_scroll: 0,
+            exclude_space: false,
             exclude_scroll_s: Spring::new(0.0, 600.0, 46.0),
             keyword_edit: None,
             roll_edit: None,
@@ -1312,8 +1328,8 @@ impl Popup {
                 || !self.glass_fade.done()
                 || !self.exclude_scroll_s.settled()
                 || !self.settings_scroll_s.settled()
-                || self.settings_scroll_at.is_some()
-                || self.exclude_rows.iter().any(|r| !r.motion.done())
+                || self.settings_scrolling
+                || self.exclude_rows.iter().any(|r| r.removal.is_some() || !r.motion.done())
                 || self.hover_since.is_some()
                 || self.leave_since.is_some())
     }
@@ -1594,7 +1610,6 @@ impl Popup {
             placeholder: g.ui_format(17.0 * s, DWRITE_FONT_WEIGHT_NORMAL)?,
             title: g.ui_format(15.0 * s, DWRITE_FONT_WEIGHT_SEMI_BOLD)?,
             sub: g.ui_format(12.0 * s, DWRITE_FONT_WEIGHT_NORMAL)?,
-            head: g.ui_format(14.0 * s, DWRITE_FONT_WEIGHT_SEMI_BOLD)?,
             item: g.ui_format(13.0 * s, DWRITE_FONT_WEIGHT_MEDIUM)?,
             item_bold: g.ui_format(13.0 * s, DWRITE_FONT_WEIGHT_SEMI_BOLD)?,
             item_regular: g.ui_format(13.0 * s, DWRITE_FONT_WEIGHT_NORMAL)?,
@@ -1824,11 +1839,11 @@ impl Popup {
     fn settings_layout_at(&self, top: f32) -> SettingsLayout {
         let (l, r) = (self.px(lay::MARGIN + lay::INSET), self.px(lay::MARGIN + lay::W - lay::INSET));
         let y = |v: f32| top + self.px(v);
-        // 글자 기준 한 리듬 (글자는 텍스트 박스보다 ~2 아래): 위 끝에서 제목까지 20 (모서리 반지름,
-        // 둥근 모서리에 안 붙게), 첫 라벨까지 20, 라벨에서 컨트롤까지 8, 컨트롤에서 다음 라벨까지 16,
-        // 묶음 사이 24 (구분선 없이 따로 묶음), 맨 아래 버튼 아래는 오른쪽 여백과 같은 16
+        // 제목은 다른 시트 첫 줄의 곡 제목 자리 (위 8 띠 안 6.67), 검색 제외로 겹쳐 바꿀 때 "검색" 글자가 그대로
+        // 그 아래는 글자 기준 한 리듬 (글자는 텍스트 박스보다 ~2 아래): 라벨에서 컨트롤까지 8,
+        // 컨트롤에서 다음 라벨까지 16, 묶음 사이 24 (구분선 없이 따로 묶음), 맨 아래 버튼 아래는 오른쪽 여백과 같은 16
         SettingsLayout {
-            title: y(18.0),
+            title: y(lay::PAD + 6.67),
             labels: [y(52.0), y(118.0)],
             mode: rect(l, y(72.0), r, y(104.0)),
             diff: rect(l, y(138.0), r, y(170.0)),
@@ -1891,26 +1906,6 @@ impl Popup {
 
     fn settings_scroll_max(&self) -> f32 {
         self.px(lay::SETTINGS_H) - self.settings_height()
-    }
-
-    /// 스크롤 막대 자리 (다 편 시트 자리)와 불투명도, 스크롤한 뒤 잠깐만
-    /// 위아래는 판 모서리 반지름만큼 띄움, 8만 띄우면 막대 끝이 둥근 모서리에 붙어 보임
-    fn settings_scrollbar(&self, now: Instant) -> Option<(D2D_RECT_F, f32)> {
-        let max = self.settings_scroll_max();
-        if max <= 0.0 {
-            return None;
-        }
-        let elapsed = now.duration_since(self.settings_scroll_at?).as_secs_f32();
-        let alpha = 0.3 * (1.0 - (elapsed - SCROLLBAR_HOLD_SECS) / SCROLLBAR_FADE_SECS).clamp(0.0, 1.0);
-        if alpha <= 0.0 {
-            return None;
-        }
-        let height = self.settings_height();
-        let track = height - self.px(lay::PANEL_R) * 2.0;
-        let length = track * height / self.px(lay::SETTINGS_H);
-        let top = self.panel_top() + self.px(lay::PANEL_R) + (track - length) * (self.settings_scroll_s.value / max).clamp(0.0, 1.0);
-        let right = self.px(lay::MARGIN + lay::W) - self.px(5.0);
-        Some((rect(right - self.px(3.0), top, right, top + length), alpha))
     }
 
     /// 키워드 시트: 결과 줄과 같은 곡 줄, 라벨, 줄바꿈하며 흐르는 칩, 안내 문구
@@ -2031,7 +2026,7 @@ impl Popup {
         let top = self.panel_top();
         let r = self.px(lay::MARGIN + lay::W - lay::INSET);
         let cy = top + self.px(lay::CARD_H) / 2.0;
-        rect(r - self.px(lay::CARD_BTN_W), cy - self.px(16.0), r, cy + self.px(16.0))
+        rect(r - self.px(lay::CARD_BTN_W), cy - self.px(15.0), r, cy + self.px(15.0))
     }
 
     /// 캐럿 자리 (조합 중이면 조합 글자의 앞), IME 후보 창을 여기에 둠
@@ -2079,8 +2074,8 @@ impl Popup {
     fn panel_target(&self) -> f32 {
         match self.sheet_now() {
             Sheet::Settings => self.settings_height(),
-            // 줄 자리를 그리기·판정과 같은 식으로 더해야 다 편 패널 아래 끝이 마지막 줄 아래 8에 딱 맞음
-            Sheet::Exclude => self.px(lay::EXCLUDE_TOP) + self.px(lay::PAD) + self.exclude_list_h() + self.px(lay::PAD),
+            // 줄이 넘치면 판 끝까지, 모두 들어가면 마지막 줄 아래 8을 남김
+            Sheet::Exclude => self.px(lay::EXCLUDE_TOP) + self.px(lay::PAD) + self.exclude_list_h() + self.exclude_bottom_pad(),
             Sheet::Keywords => self.keyword_layout().height,
             Sheet::Card => self.px(lay::CARD_H),
             Sheet::Results if self.playlist_waiting() => 0.0,
@@ -2194,7 +2189,13 @@ impl Popup {
             if inside(&r, x, y) {
                 return Hit::ExcludeTab(ExcludeTab::ALL[segment_at(&r, x, ExcludeTab::ALL.len())]);
             }
-            return self.exclude_at(x, y).map_or(Hit::Inside, Hit::ExcludeRow);
+            return self.exclude_at(x, y).map_or(Hit::Inside, |i| {
+                if self.exclude_rows[i].kind.song().is_some() && inside(&self.exclude_control_rect(i), x, y) {
+                    Hit::ExcludeButton(i)
+                } else {
+                    Hit::ExcludeRow(i)
+                }
+            });
         }
         if self.view == View::Keywords {
             let kl = self.keyword_layout();
@@ -2705,7 +2706,7 @@ impl Popup {
         if v == View::Settings {
             let scrolled = self.settings_scroll_s.value != 0.0;
             self.settings_scroll_s.snap(0.0);
-            self.settings_scroll_at = None;
+            self.settings_scrolling = false;
             // 내려 둔 채 나갔으면 커서 아래 컨트롤이 바뀌어서 호버를 다시 봄
             if scrolled {
                 if let Some((x, y)) = self.last_mouse.filter(|_| self.tracking) {
@@ -2843,7 +2844,7 @@ impl Popup {
     }
 
     fn exclude_empty_text(&self) -> Option<(&'static str, Option<&'static str>)> {
-        if !self.exclude_rows.is_empty() {
+        if self.exclude_rows.iter().any(|r| r.removal.is_none()) {
             return None;
         }
         match (self.exclude_tab, self.exclude_filtered) {
@@ -2862,7 +2863,7 @@ impl Popup {
         self.finish_input();
         self.search_now();
         self.set_view(View::Exclude);
-        self.reset_exclude_rows();
+        self.fill_exclude();
         self.hover = Hit::None;
     }
 
@@ -2886,6 +2887,9 @@ impl Popup {
         if matches!(vk, VK_UP | VK_DOWN | VK_RETURN | VK_SPACE) {
             self.search_now();
         }
+        if vk == VK_SPACE && !repeat {
+            self.exclude_space = self.space_toggles_row();
+        }
         Some(match vk {
             VK_ESCAPE => {
                 self.close_exclude();
@@ -2895,7 +2899,7 @@ impl Popup {
                 self.move_exclude(if vk == VK_UP { -1 } else { 1 });
                 Action::None
             }
-            VK_RETURN | VK_SPACE if vk == VK_RETURN || self.space_toggles_row() => {
+            VK_RETURN | VK_SPACE if vk == VK_RETURN || self.space_toggles_row() || self.exclude_space => {
                 if repeat {
                     Action::None
                 } else if let Some(i) = self.exclude_focus {
@@ -2930,12 +2934,6 @@ impl Popup {
         self.clear_input();
         self.exclude_tab = tab;
         self.list_swap.swap();
-        self.reset_exclude_rows();
-    }
-
-    /// 숨긴 곡 탭에 남길 곡을 지금 숨긴 곡으로 다시 잡고 줄을 채움, 시트나 탭을 새로 열 때
-    fn reset_exclude_rows(&mut self) {
-        self.exclude_songs = self.hidden_songs().clone();
         self.fill_exclude();
     }
 
@@ -2959,7 +2957,7 @@ impl Popup {
             ExcludeTab::Songs => {
                 let songs = if q.is_empty() {
                     let mut songs: Vec<_> = self.catalog.songs.iter().enumerate()
-                        .filter(|(_, s)| self.exclude_songs.contains(&s.id)).map(|(i, _)| i).collect();
+                        .filter(|(_, s)| self.hidden_songs().contains(&s.id)).map(|(i, _)| i).collect();
                     songs.sort_by_cached_key(|&i| self.catalog.songs[i].name.to_lowercase());
                     songs
                 } else {
@@ -2971,11 +2969,11 @@ impl Popup {
         self.exclude_rows = kinds.into_iter().map(|kind| {
             let mut motion = ToggleMotion::new();
             motion.snap(self.exclude_on(&kind));
-            ExcludeRow { kind, motion }
+            ExcludeRow { kind, motion, removal: None }
         }).collect();
         self.searched = query;
         self.exclude_focus = None;
-        self.exclude_scroll = 0;
+        self.exclude_space = false;
         self.exclude_scroll_s.snap(0.0);
         self.wheel_acc = 0;
         self.retarget_panel();
@@ -2986,19 +2984,34 @@ impl Popup {
         if self.search_now() {
             return Action::None;
         }
-        let Some(row) = self.exclude_rows.get(i) else { return Action::None };
+        let Some(row) = self.exclude_rows.get(i).filter(|r| r.removal.is_none()) else { return Action::None };
         let on = match &row.kind {
             ExcludeKind::Dlc(pack) => self.catalog.toggle_dlc(&pack.code),
             ExcludeKind::Song(song) => {
                 let id = self.catalog.songs[*song].id;
-                let on = self.catalog.toggle_song(id);
-                if !on {
-                    self.exclude_songs.insert(id);
-                }
-                on
+                self.catalog.toggle_song(id)
             }
         };
-        self.exclude_rows[i].motion.go(on);
+        let row = &mut self.exclude_rows[i];
+        // 곡 줄은 버튼이라 노브 없이 글 밝기만 바뀜
+        if matches!(row.kind, ExcludeKind::Song(_)) {
+            row.motion.tint.go(on as u8 as f32, QUICK_SECS, QUICK_EASE);
+        } else {
+            row.motion.go(on);
+        }
+        self.fit_exclude_scroll(i);
+        if self.exclude_tab == ExcludeTab::Songs && on && !self.exclude_filtered {
+            if self.exclude_down == Some(i) {
+                self.release_exclude();
+            }
+            let collapse = self.exclude_rows.iter().filter(|r| r.removal.is_none()).count() > 1;
+            self.exclude_rows[i].removal = Some(ExcludeRemoval { elapsed: 0.0, collapse });
+            if self.exclude_focus == Some(i) {
+                self.exclude_focus = (i + 1..self.exclude_rows.len()).find(|&j| self.exclude_rows[j].removal.is_none())
+                    .or_else(|| (0..i).rev().find(|&j| self.exclude_rows[j].removal.is_none()));
+            }
+            self.hover = Hit::Inside;
+        }
         self.refresh_available();
         Action::Choice
     }
@@ -3033,42 +3046,93 @@ impl Popup {
         self.settings_scroll_s.target = offset.round().clamp(0.0, self.settings_scroll_max());
     }
 
-    /// 끝에서 더 굴려도 막대를 보여 끝임을 알림
     fn scroll_settings(&mut self, rows: i32) {
         self.set_settings_scroll(self.settings_scroll_s.target + self.px(lay::SETTINGS_WHEEL) * rows as f32);
-        self.settings_scroll_at = Some(Instant::now());
     }
 
-    /// 움직이는 동안은 막대를 남기고, 멈추면 목표 정수 px에 딱 맞춤
-    fn step_settings_scroll(&mut self, dt: f32, now: Instant) {
+    /// 멈추면 목표 정수 px에 딱 맞춤, 멈춘 프레임까지 움직인 걸로 쳐서 마지막 자리에서도 호버를 다시 봄
+    fn step_settings_scroll(&mut self, dt: f32) {
         let moving = !self.settings_scroll_s.settled();
         self.settings_scroll_s.step(dt);
         if self.settings_scroll_s.settled() {
             self.settings_scroll_s.snap(self.settings_scroll_s.target);
         }
-        if moving {
-            self.settings_scroll_at = Some(now);
-        } else if self.settings_scroll_at.is_some_and(|at| now.duration_since(at).as_secs_f32() >= SCROLLBAR_HOLD_SECS + SCROLLBAR_FADE_SECS) {
-            self.settings_scroll_at = None;
-        }
+        self.settings_scrolling = moving;
     }
 
     /// 고른 줄이 보이게 스크롤
     fn move_exclude(&mut self, d: i32) {
-        if self.exclude_rows.is_empty() {
-            return;
-        }
-        let i = self.exclude_focus.map_or(0, |i| (i as i32 + d).clamp(0, self.exclude_rows.len() as i32 - 1) as usize);
+        let active = |i: &usize| self.exclude_rows[*i].removal.is_none();
+        let next = match self.exclude_focus {
+            Some(i) if d > 0 => (i + 1..self.exclude_rows.len()).find(active).or(Some(i)),
+            Some(i) if d < 0 => (0..i).rev().find(active).or(Some(i)),
+            Some(i) => Some(i),
+            None => (0..self.exclude_rows.len()).find(active),
+        };
+        let Some(i) = next else { return };
         self.exclude_focus = Some(i);
         self.hover = Hit::Inside;
-        let scroll = self.exclude_scroll.min(i).max((i + 1).saturating_sub(self.exclude_tab.visible_rows()));
-        self.scroll_exclude(scroll as i32 - self.exclude_scroll as i32);
+        self.fit_exclude_scroll(i);
+    }
+
+    fn exclude_scroll_max(&self) -> f32 {
+        (self.exclude_content_h() - self.exclude_list_h()).max(0.0).round()
+    }
+
+    fn set_exclude_scroll(&mut self, offset: f32) {
+        self.exclude_scroll_s.target = offset.round().clamp(0.0, self.exclude_scroll_max());
     }
 
     fn scroll_exclude(&mut self, d: i32) {
-        let max = self.exclude_rows.len().saturating_sub(self.exclude_tab.visible_rows()) as i32;
-        self.exclude_scroll = (self.exclude_scroll as i32 + d).clamp(0, max) as usize;
-        self.exclude_scroll_s.target = self.px(self.exclude_tab.row_height()) * self.exclude_scroll as f32;
+        self.set_exclude_scroll(self.exclude_scroll_s.target + self.px(self.exclude_tab.row_height()) * d as f32);
+    }
+
+    fn fit_exclude_scroll(&mut self, i: usize) {
+        let top = self.exclude_row_top(i);
+        let bottom = top + self.exclude_row_h(i);
+        let offset = self.exclude_scroll_s.target;
+        let height = self.exclude_list_h();
+        if top < offset {
+            self.set_exclude_scroll(top);
+        } else if bottom > offset + height {
+            self.set_exclude_scroll(bottom - height);
+        }
+    }
+
+    fn step_exclude_rows(&mut self, dt: f32) {
+        if !self.exclude_rows.iter().any(|r| r.removal.is_some()) {
+            return;
+        }
+        let before = self.panel_target();
+        for row in &mut self.exclude_rows {
+            if let Some(removal) = &mut row.removal {
+                removal.elapsed += dt;
+            }
+        }
+        for i in (0..self.exclude_rows.len()).rev() {
+            if self.exclude_rows[i].removal.as_ref().is_some_and(ExcludeRemoval::done) {
+                self.exclude_rows.remove(i);
+                let shifted = |at: Option<usize>| at.filter(|&j| j != i).map(|j| j - usize::from(j > i));
+                self.exclude_focus = shifted(self.exclude_focus);
+                self.exclude_down = shifted(self.exclude_down);
+                self.hover = match self.hover {
+                    Hit::ExcludeRow(j) => shifted(Some(j)).map_or(Hit::Inside, Hit::ExcludeRow),
+                    Hit::ExcludeButton(j) => shifted(Some(j)).map_or(Hit::Inside, Hit::ExcludeButton),
+                    hit => hit,
+                };
+            }
+        }
+        self.set_exclude_scroll(self.exclude_scroll_s.target);
+        self.exclude_scroll_s.value = self.exclude_scroll_s.value.min(self.exclude_scroll_max());
+        if let Some(i) = self.exclude_focus {
+            self.fit_exclude_scroll(i);
+        }
+        if self.view == View::Exclude && self.sheet == Sheet::Exclude {
+            let target = self.panel_target();
+            // 줄이 접힌 만큼 판도 같은 프레임에 줄여 빈 공간이 뒤늦게 따라오지 않게 함
+            self.panel_h.value += target - before;
+            self.panel_h.target = target;
+        }
     }
 
     /// 내용이 스크롤로 움직이면 커서 아래를 다시 호버
@@ -3076,7 +3140,7 @@ impl Popup {
     fn refresh_scroll_hover(&mut self) {
         let follow = match self.view {
             View::Exclude => self.exclude_focus.is_none(),
-            View::Settings => self.settings_scroll_at.is_some(),
+            View::Settings => self.settings_scrolling,
             _ => false,
         };
         if let Some((x, y)) = self.last_mouse.filter(|_| follow && self.tracking) {
@@ -3086,46 +3150,97 @@ impl Popup {
 
     fn release_exclude(&mut self) {
         if let Some(i) = self.exclude_down.take() {
-            self.exclude_rows[i].motion.press.go(1.0, QUICK_SECS, QUICK_EASE);
+            if matches!(self.exclude_rows[i].kind, ExcludeKind::Dlc(_)) {
+                self.exclude_rows[i].motion.press.go(1.0, QUICK_SECS, QUICK_EASE);
+            }
             unsafe { let _ = ReleaseCapture(); }
         }
     }
 
-    /// 완료 버튼, 폭은 다른 시트와 같고 세로는 제목·요약 두 줄 묶음 가운데
+    /// 완료 버튼, 다른 시트와 같은 자리 (첫 줄 띠 가운데)
     fn exclude_done(&self) -> D2D_RECT_F {
-        let r = self.done_button();
-        rect(r.left, self.panel_top() + self.px(22.0), r.right, self.panel_top() + self.px(52.0))
+        self.done_button()
     }
 
-    /// 탭 (세그먼트): 16 정렬선 사이, 요약 글줄 아래 16에 높이 32, 바로 아래부터 줄 목록
+    /// 탭 (세그먼트): 히스토리 탭처럼 양 끝이 줄 강조와 같음, 첫 줄 띠 아래 8에 높이 32, 바로 아래부터 줄 목록
     fn exclude_tabs_rect(&self) -> D2D_RECT_F {
         let top = self.panel_top();
-        rect(self.px(lay::MARGIN + lay::INSET), top + self.px(lay::EXCLUDE_TOP - 32.0),
-            self.px(lay::MARGIN + lay::W - lay::INSET), top + self.px(lay::EXCLUDE_TOP))
+        rect(self.px(lay::MARGIN) + self.px(lay::PAD), top + self.px(lay::EXCLUDE_TOP - 32.0),
+            self.px(lay::MARGIN + lay::W) - self.px(lay::PAD), top + self.px(lay::EXCLUDE_TOP))
     }
 
-    /// 줄 칸, 탭 아래 8부터 다 편 목록 높이까지 (결과 목록처럼 멈추면 딱 보이는 줄만)
-    /// 패널이 그보다 짧은 동안엔 지금 패널 아래 끝까지라 패널 밖으로 나간 줄은 안 그리고 안 눌림
+    /// 스크롤되는 목록은 판 끝에서 잘려야 안쪽에 빈 선이 생기지 않음
     fn exclude_clip(&self) -> D2D_RECT_F {
         let top = self.panel_top() + self.px(lay::EXCLUDE_TOP) + self.px(lay::PAD);
+        let bottom = self.panel_top() + self.panel_h.value;
         rect(self.px(lay::MARGIN) + self.px(lay::PAD), top, self.px(lay::MARGIN + lay::W) - self.px(lay::PAD),
-            (top + self.exclude_list_h()).min(self.panel_top() + self.panel_h.value))
+            if self.exclude_scroll_max() > 0.0 { bottom } else { (top + self.exclude_list_h()).min(bottom) })
+    }
+
+    fn exclude_row_h(&self, i: usize) -> f32 {
+        self.px(self.exclude_tab.row_height()) * self.exclude_rows[i].removal.as_ref().map_or(1.0, ExcludeRemoval::height)
+    }
+
+    fn exclude_row_top(&self, i: usize) -> f32 {
+        (0..i).map(|j| self.exclude_row_h(j)).sum()
+    }
+
+    fn exclude_content_h(&self) -> f32 {
+        if self.exclude_rows.iter().all(|r| r.removal.is_some()) {
+            0.0
+        } else {
+            self.exclude_row_top(self.exclude_rows.len())
+        }
+    }
+
+    fn exclude_bottom_pad(&self) -> f32 {
+        (self.px(lay::EXCLUDE_LIST_H) - self.exclude_content_h()).clamp(0.0, self.px(lay::PAD))
     }
 
     /// 다 편 패널에서 줄이 차지하는 높이, 최대 높이를 넘으면 스크롤 (줄이 없으면 빈 목록 문구 띠)
     fn exclude_list_h(&self) -> f32 {
-        match self.exclude_rows.len().min(self.exclude_tab.visible_rows()) {
-            0 => self.px(lay::EXCLUDE_EMPTY_H),
-            n => self.px(self.exclude_tab.row_height()) * n as f32,
-        }
+        let height = self.exclude_content_h();
+        if height == 0.0 { self.px(lay::EXCLUDE_EMPTY_H) } else { height.min(self.px(lay::EXCLUDE_LIST_H)) }
     }
 
     /// 판정(`exclude_at`)·스크롤·패널 높이와 같은 식, 한꺼번에 반올림하면 4/3 배율에서 아래 줄로 몇 px씩 밀림
     fn exclude_row_rect(&self, i: usize) -> D2D_RECT_F {
         let clip = self.exclude_clip();
-        let h = self.px(self.exclude_tab.row_height());
-        let top = clip.top + h * i as f32 - self.exclude_scroll_s.value;
-        rect(clip.left, top, clip.right, top + h)
+        let top = clip.top + self.exclude_row_top(i) - self.exclude_scroll_s.value;
+        rect(clip.left, top, clip.right, top + self.exclude_row_h(i))
+    }
+
+    fn exclude_control_rect(&self, i: usize) -> D2D_RECT_F {
+        let row = self.exclude_row_rect(i);
+        let right = self.px(lay::MARGIN + lay::W - lay::INSET);
+        let cy = (row.top + row.bottom) / 2.0;
+        let (w, half) = if self.exclude_rows[i].kind.song().is_some() {
+            (self.px(88.0), self.px(30.0) / 2.0)
+        } else {
+            (self.px(lay::TOGGLE_W), self.px(lay::TOGGLE_H / 2.0))
+        };
+        rect(right - w, cy - half, right, cy + half)
+    }
+
+    /// 빠지는 줄은 누른 버튼 글자 그대로 흐려짐
+    fn exclude_button_label(&self, i: usize) -> &'static str {
+        let row = &self.exclude_rows[i];
+        if row.removal.is_none() && self.exclude_on(&row.kind) { "숨기기" } else { "숨김 해제" }
+    }
+
+    fn exclude_empty_alpha(&self) -> f32 {
+        1.0 - self.exclude_rows.iter().filter_map(|r| r.removal.as_ref()).map(ExcludeRemoval::alpha).fold(0.0, f32::max)
+    }
+
+    fn exclude_bands(&self) -> impl Iterator<Item = (usize, D2D_RECT_F)> + '_ {
+        let clip = self.exclude_clip();
+        let mut offset = 0.0;
+        (0..self.exclude_rows.len()).map(move |i| {
+            let top = clip.top + offset - self.exclude_scroll_s.value;
+            let height = self.exclude_row_h(i);
+            offset += height;
+            (i, rect(clip.left, top, clip.right, top + height))
+        })
     }
 
     fn exclude_at(&self, x: f32, y: f32) -> Option<usize> {
@@ -3134,20 +3249,15 @@ impl Popup {
         if !inside(&clip, x, y) || y >= clip.bottom {
             return None;
         }
-        let offset = y - clip.top + self.exclude_scroll_s.value;
-        let i = (offset / self.px(self.exclude_tab.row_height())).floor() as usize;
-        (i < self.exclude_rows.len()).then_some(i)
+        self.exclude_bands().find_map(|(i, r)| {
+            (self.exclude_rows[i].removal.is_none() && y >= r.top && y < r.bottom).then_some(i)
+        })
     }
 
     /// 목록 자리에 걸치는 줄
     fn exclude_shown(&self) -> Vec<usize> {
         let clip = self.exclude_clip();
-        (0..self.exclude_rows.len())
-            .filter(|&i| {
-                let r = self.exclude_row_rect(i);
-                r.bottom > clip.top && r.top < clip.bottom
-            })
-            .collect()
+        self.exclude_bands().filter_map(|(i, r)| (r.bottom > clip.top && r.top < clip.bottom).then_some(i)).collect()
     }
 
     /// 머리: 제목·완료 버튼과 탭, 탭마다 바뀌는 요약과 줄 목록은 따로 그림 (`draw_exclude_list`)
@@ -3156,13 +3266,13 @@ impl Popup {
         let (g, f) = (self.gfx.as_ref().unwrap(), self.fonts.as_ref().unwrap());
         let done = self.exclude_done();
         let left = self.px(lay::MARGIN + lay::INSET);
-        let title = g.layout("검색 제외", &f.head, done.left - left, self.px(22.0))?;
+        let title = g.layout("검색 제외", &f.title, done.left - left, self.px(19.0))?;
         unsafe {
-            g.dc.DrawTextLayout(gfx::pt(left - BEARING, self.panel_top() + self.px(18.0)), &title, &g.brush(TEXT)?, D2D1_DRAW_TEXT_OPTIONS_NONE);
+            g.dc.DrawTextLayout(gfx::pt(left - BEARING, self.panel_top() + self.px(lay::PAD + 6.67)), &title, &g.brush(TEXT)?, D2D1_DRAW_TEXT_OPTIONS_NONE);
         }
         draw_button(g, &f.item, done, "완료", self.hover == Hit::DoneExclude, self.scale)?;
         let at = self.seg[3].value();
-        draw_segments(g, f, self.exclude_tabs_rect(), &["DLC", "숨긴 곡"], (at, at + 1.0), lay::SEG_R, self.scale)
+        draw_segments(g, f, self.exclude_tabs_rect(), &["DLC", "숨긴 곡"], (at, at + 1.0), lay::PANEL_R - lay::PAD, self.scale)
     }
 
     /// 탭마다 바뀌는 요약과 줄 목록, 줄이 없으면 빈 목록 띠 가운데에 문구
@@ -3173,16 +3283,34 @@ impl Popup {
         let left = self.px(lay::MARGIN + lay::INSET);
         let summary = g.layout(&self.exclude_summary(), &f.sub, self.exclude_done().left - left - self.px(12.0), self.px(18.0))?;
         unsafe {
-            dc.DrawTextLayout(gfx::pt(left - BEARING, self.panel_top() + self.px(42.0)), &summary, &g.brush(FAINT)?, D2D1_DRAW_TEXT_OPTIONS_NONE);
+            dc.DrawTextLayout(gfx::pt(left - BEARING, self.panel_top() + self.px(lay::PAD + 26.67)), &summary, &g.brush(FAINT)?, D2D1_DRAW_TEXT_OPTIONS_NONE);
         }
         let clip = self.exclude_clip();
         unsafe { dc.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_ALIASED) };
         let result = (|| -> Result<()> {
-            if self.exclude_rows.is_empty() {
-                return self.draw_exclude_empty(clip);
+            if self.exclude_empty_text().is_some() {
+                unsafe { dc.PushLayer(&gfx::layer(self.exclude_empty_alpha(), None), None) };
+                let result = self.draw_exclude_empty(clip);
+                unsafe { dc.PopLayer() };
+                result?;
             }
             for (i, jacket) in shown {
-                self.draw_exclude_row(*i, jacket.as_ref())?;
+                let row = &self.exclude_rows[*i];
+                if let Some(removal) = &row.removal {
+                    if removal.alpha() <= 0.0 { continue; }
+                    unsafe {
+                        dc.PushAxisAlignedClip(&self.exclude_row_rect(*i), D2D1_ANTIALIAS_MODE_ALIASED);
+                        dc.PushLayer(&gfx::layer(removal.alpha(), None), None);
+                    }
+                    let result = self.draw_exclude_row(*i, jacket.as_ref());
+                    unsafe {
+                        dc.PopLayer();
+                        dc.PopAxisAlignedClip();
+                    }
+                    result?;
+                } else {
+                    self.draw_exclude_row(*i, jacket.as_ref())?;
+                }
             }
             Ok(())
         })();
@@ -3217,20 +3345,17 @@ impl Popup {
         Ok(())
     }
 
-    /// 줄 하나: 호버·포커스면 채움, 팩은 이름과 곡 수, 곡은 결과 줄과 같은 재킷·제목·아랫줄, 오른쪽 16 정렬선에 토글
     /// 켜진 줄은 결과 줄과 같은 색, 꺼 둔 줄은 글이 다 흐리고 곡 재킷은 반투명, 그 사이는 토글 색을 따라 섞음
     fn draw_exclude_row(&self, i: usize, jacket: Option<&ID2D1Bitmap1>) -> Result<()> {
         let (g, f) = (self.gfx.as_ref().unwrap(), self.fonts.as_ref().unwrap());
         let dc = &g.dc;
         let row = &self.exclude_rows[i];
         let r = self.exclude_row_rect(i);
-        let lit = self.exclude_focus.map_or(self.hover == Hit::ExcludeRow(i), |focus| focus == i);
+        let lit = row.removal.is_none() && self.exclude_focus.map_or(matches!(self.hover, Hit::ExcludeRow(j) | Hit::ExcludeButton(j) if i == j), |focus| focus == i);
         let on = alpha_step(row.motion.tint.value());
         let ink = |c: D2D1_COLOR_F| g.brush(white(FAINT.a + (c.a - FAINT.a) * on));
         let (title_b, sub_b, faint) = (ink(TEXT)?, ink(SUB)?, g.brush(FAINT)?);
-        let right = self.px(lay::MARGIN + lay::W - lay::INSET);
-        let cy = (r.top + r.bottom) / 2.0;
-        let toggle = rect(right - self.px(lay::TOGGLE_W), cy - self.px(lay::TOGGLE_H / 2.0), right, cy + self.px(lay::TOGGLE_H / 2.0));
+        let control = self.exclude_control_rect(i);
         if lit {
             unsafe { dc.FillRoundedRectangle(&rounded(r, self.px(12.0)), &g.brush(white(FILL_HOVER))?) };
         }
@@ -3240,7 +3365,7 @@ impl Popup {
                 let count = format!("{}곡", pack.count);
                 let count_w = self.measure(&count, |f| &f.sub).ceil();
                 let name_w = self.measure(&pack.name, |f| &f.item_bold).ceil()
-                    .min((toggle.left - self.px(24.0) - count_w - left).max(0.0));
+                    .min((control.left - self.px(24.0) - count_w - left).max(0.0));
                 let name = g.layout(&pack.name, &f.item_bold, name_w, r.bottom - r.top)?;
                 let count = g.layout(&count, &f.sub, count_w, r.bottom - r.top)?;
                 unsafe {
@@ -3255,11 +3380,16 @@ impl Popup {
                 if let Some(bmp) = jacket {
                     draw_jacket(g, bmp, &self.jacket_slot(r.top), 0.5 + 0.5 * on)?;
                 }
-                self.draw_row_text(r.top, toggle.left - self.px(16.0), &song.name, &song.composer, self.sub_tail(song, false).as_deref(), (&title_b, &sub_b))?;
+                self.draw_row_text(r.top, control.left - self.px(16.0), &song.name, &song.composer, self.sub_tail(song, false).as_deref(), (&title_b, &sub_b))?;
             }
         }
-        let m = &row.motion;
-        draw_toggle(g, toggle, (m.knob.value(), m.tint.value(), m.press.value()), lit, self.scale)
+        if row.kind.song().is_some() {
+            let pressed = self.exclude_focus == Some(i) || self.exclude_down == Some(i) || self.hover == Hit::ExcludeButton(i);
+            draw_button(g, &f.item, control, self.exclude_button_label(i), pressed, self.scale)
+        } else {
+            let m = &row.motion;
+            draw_toggle(g, control, (m.knob.value(), m.tint.value(), m.press.value()), lit, self.scale)
+        }
     }
 
     fn toggle_settings(&mut self) {
@@ -4187,7 +4317,7 @@ impl Popup {
             WM_CHAR => {
                 // BMP 밖 글자 (이모지)는 UTF-16 두 조각으로 옴, 앞 조각을 들고 있다가 합침 (짝이 안 맞으면 버림)
                 let c = wp.0 as u32;
-                if c == 0x20 && self.space_toggles_row() {
+                if c == 0x20 && (self.space_toggles_row() || (self.view == View::Exclude && self.exclude_space)) {
                     return Some((0, Action::None));
                 }
                 let ch = match c {
@@ -4235,13 +4365,17 @@ impl Popup {
                 Some((0, act))
             }
             WM_SYSKEYUP if self.hotkey_wait.is_some() => Some((0, Action::None)),
+            WM_KEYUP if wp.0 == VK_SPACE.0 as usize && self.exclude_space => {
+                self.exclude_space = false;
+                Some((0, Action::None))
+            }
             WM_KEYDOWN | WM_SYSKEYDOWN => {
                 let mut vk = VIRTUAL_KEY(wp.0 as u16);
                 if vk == VK_PROCESSKEY {
                     let real = unsafe { ImmGetVirtualKey(self.hwnd) };
                     vk = VIRTUAL_KEY(real as u16);
                     if matches!(vk, VK_RETURN | VK_UP | VK_DOWN | VK_LEFT | VK_RIGHT | VK_HOME | VK_END | VK_DELETE | VK_ESCAPE | VK_PRIOR | VK_NEXT | VK_TAB)
-                        || (vk == VK_SPACE && self.space_toggles_row()) {
+                        || (vk == VK_SPACE && (self.space_toggles_row() || (self.view == View::Exclude && self.exclude_space))) {
                         // 한국어 Windows 관례: Enter·화살표는 글자를 확정하고 동작도 함
                         self.complete_composition();
                     } else {
@@ -4600,10 +4734,13 @@ impl Popup {
                         self.set_exclude_tab(tab);
                         Action::None
                     }
-                    Hit::ExcludeRow(i) => {
+                    Hit::ExcludeRow(i) | Hit::ExcludeButton(i) if self.exclude_tab == ExcludeTab::Dlc || hit == Hit::ExcludeButton(i) => {
                         self.exclude_focus = None;
                         self.exclude_down = Some(i);
-                        self.exclude_rows[i].motion.press.go(PRESS_Y, PRESS_SECS, PRESS_EASE);
+                        // 곡 줄은 버튼이라 토글 노브 눌림이 없음
+                        if matches!(self.exclude_rows[i].kind, ExcludeKind::Dlc(_)) {
+                            self.exclude_rows[i].motion.press.go(PRESS_Y, PRESS_SECS, PRESS_EASE);
+                        }
                         unsafe { SetCapture(self.hwnd); }
                         Action::None
                     }
@@ -4666,7 +4803,7 @@ impl Popup {
             WM_LBUTTONUP if self.exclude_down.is_some() => {
                 let (x, y) = (lp.0 as i16 as f32, (lp.0 >> 16) as i16 as f32);
                 let i = self.exclude_down.unwrap();
-                let over = self.hit(x, y) == Hit::ExcludeRow(i);
+                let over = self.hit(x, y) == if self.exclude_tab == ExcludeTab::Songs { Hit::ExcludeButton(i) } else { Hit::ExcludeRow(i) };
                 self.release_exclude();
                 Some((0, if over { self.toggle_exclude(i) } else { Action::None }))
             }
@@ -4916,11 +5053,12 @@ impl Popup {
         self.update_reveal(now);
         self.sel_y.step(dt);
         self.scroll_s.step(dt);
+        self.step_exclude_rows(dt);
         self.exclude_scroll_s.step(dt);
         if self.exclude_scroll_s.settled() {
             self.exclude_scroll_s.snap(self.exclude_scroll_s.target);
         }
-        self.step_settings_scroll(dt, now);
+        self.step_settings_scroll(dt);
         self.refresh_scroll_hover();
         if self.scroll_s.settled() {
             self.scroll_s.snap(self.scroll_s.target); // 정수 픽셀에서 멈춰야 글자가 선명함
@@ -5188,12 +5326,12 @@ impl Popup {
             let draw_sheet = |list: Option<&ID2D1Image>| -> Result<()> {
                 if self.sheet == Sheet::Settings {
                     let sl = self.settings_layout();
-                    let t = g.layout("검색 설정", &f.head, self.px(200.0), self.px(22.0))?;
+                    let t = g.layout("검색 설정", &f.title, self.px(200.0), self.px(19.0))?;
                     dc.DrawTextLayout(gfx::pt(l0t, sl.title), &t, &text_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
                     // 머리 줄 오른쪽: 곡 데이터 상태, 새 버전이 있으면 그 안내를 조금 밝게
                     // 오른쪽 정렬선에 붙이고 제목 오른쪽 12 앞에서 말줄임, 글자 기준선은 제목과 같음
                     if let Some((line, bright)) = &self.status_line {
-                        let left = l0t + self.measure("검색 설정", |f| &f.head) + self.px(12.0);
+                        let left = l0t + self.measure("검색 설정", |f| &f.title) + self.px(12.0);
                         let st = g.layout(line, &f.sub, (r0 - left).max(0.0), self.px(18.0))?;
                         st.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)?;
                         let sb = g.brush(if *bright { SUB } else { FAINT })?;
@@ -5251,10 +5389,6 @@ impl Popup {
                         } else {
                             draw_toggle(g, r, (m.knob.value(), m.tint.value(), m.press.value()), self.hover == Hit::Toggle(toggle) || self.kb_focus == Some(focus), s)?;
                         }
-                    }
-                    // 막대도 내용과 같이 기록해야 다른 시트로 바뀔 때 같이 흐려짐
-                    if let Some((at, alpha)) = self.settings_scrollbar(now) {
-                        dc.FillRoundedRectangle(&rounded(at, (at.right - at.left) / 2.0), &g.brush(white(alpha))?);
                     }
                 } else if self.sheet == Sheet::Exclude {
                     self.draw_exclude_head()?;
