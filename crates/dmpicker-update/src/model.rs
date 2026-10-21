@@ -168,6 +168,8 @@ pub struct CoreSong {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Core {
     pub songs: Vec<CoreSong>,
+    /// 팩 코드와 표시 이름 (표시 순서), 데이터에 표가 없거나 틀리면 비어 있음
+    pub dlcs: Vec<(String, String)>,
 }
 
 impl Core {
@@ -203,7 +205,8 @@ impl Core {
                 jacket: hash(field(obj, "jacket")?)?,
             });
         }
-        Ok(Self { songs })
+        let dlcs = root.get("dlcs").and_then(|v| dlcs(v).ok()).unwrap_or_default();
+        Ok(Self { songs, dlcs })
     }
 
     /// id 오름차순 `[[id,"<webp sha256>"],...]`를 공백 없이 쓴 JSON의 SHA-256
@@ -227,6 +230,23 @@ impl Core {
         bytes.extend_from_slice(self.set_hash().as_bytes());
         crate::sha256(&bytes)
     }
+}
+
+/// 선택 필드 `dlcs`, 틀린 항목이 하나라도 있으면 부르는 쪽이 표 전체를 버림 (곡 데이터는 그대로 씀)
+/// 빈 이름은 건너뛰고 같은 코드는 처음 것만
+fn dlcs(value: &Value) -> Result<Vec<(String, String)>> {
+    let mut entries = Vec::new();
+    let mut seen = BTreeSet::new();
+    for value in array(value, MAX_ARRAY_ITEMS)? {
+        let obj = object(value)?;
+        let code = string(field(obj, "code")?)?;
+        let name = field(obj, "name")?.as_str().ok_or_else(|| Error::invalid("expected string"))?.trim();
+        check_string(name)?;
+        if !name.is_empty() && seen.insert(code) {
+            entries.push((code.to_owned(), name.to_owned()));
+        }
+    }
+    Ok(entries)
 }
 
 pub(crate) fn validate_set_hash(manifest: &Manifest, core: &Core) -> Result<()> {
