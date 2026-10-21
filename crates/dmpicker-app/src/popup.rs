@@ -4451,203 +4451,12 @@ impl Popup {
                 if let Some(action) = self.exclude_key(vk, lp.0 & (1 << 30) != 0) {
                     return Some((0, action));
                 }
-                let act = if self.view == View::Settings {
-                    let f = self.kb_focus.unwrap_or(FOCUS_MODE);
-                    match vk {
-                        VK_ESCAPE => {
-                            self.set_view(View::Results);
-                            Action::None
-                        }
-                        VK_UP => {
-                            self.move_settings(-1);
-                            Action::None
-                        }
-                        VK_DOWN => {
-                            // 처음 누른 화살표는 첫 컨트롤로
-                            self.move_settings(1);
-                            Action::None
-                        }
-                        VK_LEFT | VK_RIGHT => {
-                            let d = if vk == VK_LEFT { -1 } else { 1 };
-                            self.focus_settings(f);
-                            match f {
-                                FOCUS_MODE => {
-                                    self.cycle_mode(d);
-                                    Action::Choice
-                                }
-                                FOCUS_DIFF => {
-                                    self.cycle_diff(d);
-                                    Action::Choice
-                                }
-                                // 토글은 왼쪽이 끔, 오른쪽이 켬
-                                FOCUS_KEEP if (d > 0) != self.keep_query => {
-                                    self.set_toggle(Toggle::KeepQuery, d > 0);
-                                    Action::Choice
-                                }
-                                FOCUS_DLC if (d > 0) != self.show_dlc => {
-                                    self.set_toggle(Toggle::ShowDlc, d > 0);
-                                    Action::Choice
-                                }
-                                FOCUS_GLASS if self.glass_unavailable().is_none() && (d > 0) != self.glass => {
-                                    self.set_toggle(Toggle::Glass, d > 0);
-                                    Action::Choice
-                                }
-                                _ => Action::None,
-                            }
-                        }
-                        VK_RETURN if f == FOCUS_EXCLUDE => {
-                            self.open_exclude();
-                            Action::None
-                        }
-                        VK_RETURN if f == FOCUS_RESCAN => Action::Scan,
-                        VK_RETURN if f == FOCUS_HOTKEY => {
-                            self.start_hotkey_wait();
-                            Action::None
-                        }
-                        VK_RETURN if f == FOCUS_KEEP => {
-                            self.set_toggle(Toggle::KeepQuery, !self.keep_query);
-                            Action::Choice
-                        }
-                        VK_RETURN if f == FOCUS_DLC => {
-                            self.set_toggle(Toggle::ShowDlc, !self.show_dlc);
-                            Action::Choice
-                        }
-                        VK_RETURN if f == FOCUS_GLASS && self.glass_unavailable().is_none() => {
-                            self.set_toggle(Toggle::Glass, !self.glass);
-                            Action::Choice
-                        }
-                        VK_BACK => {
-                            self.edit.backspace(false);
-                            self.requery(Edit::Typed);
-                            Action::None
-                        }
-                        _ => Action::None,
-                    }
-                } else {
-                    if matches!(vk, VK_RETURN | VK_UP | VK_DOWN | VK_PRIOR | VK_NEXT) {
-                        self.search_now(); // 입력한 글에 맞는 결과로 동작함
-                    }
-                    match vk {
-                        VK_ESCAPE if self.view == View::History => {
-                            self.set_view(View::Results);
-                            Action::None
-                        }
-                        VK_ESCAPE => Action::Hide,
-                        VK_RETURN if self.card().is_some() => self.card_action(),
-                        VK_RETURN => self.choose(self.selected),
-                        VK_UP => {
-                            self.move_sel(-1);
-                            Action::None
-                        }
-                        VK_DOWN => {
-                            self.move_sel(1);
-                            Action::None
-                        }
-                        VK_PRIOR => {
-                            self.move_sel(-(self.page() as i32));
-                            Action::None
-                        }
-                        VK_NEXT => {
-                            self.move_sel(self.page() as i32);
-                            Action::None
-                        }
-                        // 캐럿만 움직이면 다시 검색하지 않음, Ctrl은 단어 단위, Shift는 선택
-                        // 조합 중인 글자는 먼저 확정 (그래야 그 자리에 남음)
-                        VK_LEFT | VK_RIGHT | VK_HOME | VK_END => {
-                            self.complete_composition();
-                            match vk {
-                                VK_LEFT => self.edit.left(ctrl, shift),
-                                VK_RIGHT => self.edit.right(ctrl, shift),
-                                VK_HOME => self.edit.home(shift),
-                                _ => self.edit.end(shift),
-                            }
-                            self.input_changed();
-                            Action::None
-                        }
-                        // 조합 중 Backspace는 IME가 자모를 지움, Delete는 확정한 뒤 지움
-                        VK_BACK | VK_DELETE if vk == VK_DELETE || self.preedit.is_empty() => {
-                            self.complete_composition();
-                            // 지운 게 없으면 결과를 새로 기다리지 않음
-                            let gone = if vk == VK_BACK { self.edit.backspace(ctrl) } else { self.edit.delete(ctrl) };
-                            if gone {
-                                self.requery(Edit::Typed);
-                                self.fade_if_cleared();
-                            }
-                            Action::None
-                        }
-                        _ => Action::None,
-                    }
-                };
+                let act = if self.view == View::Settings { self.settings_key(vk) } else { self.list_key(vk, ctrl, shift) };
                 Some((0, act))
             }
             WM_MOUSEMOVE => {
                 let (x, y) = (lp.0 as i16 as f32, (lp.0 >> 16) as i16 as f32);
-                if self.dragging {
-                    self.complete_composition(); // 위치는 조합 글자가 없는 글 기준
-                    self.edit.move_to(self.text_index(x), true);
-                    self.input_changed();
-                    return Some((0, Action::None));
-                }
-                if !self.tracking {
-                    let mut tme = TRACKMOUSEEVENT {
-                        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
-                        dwFlags: TME_LEAVE,
-                        hwndTrack: self.hwnd,
-                        dwHoverTime: 0,
-                    };
-                    unsafe {
-                        let _ = TrackMouseEvent(&mut tme);
-                    }
-                    self.tracking = true;
-                }
-                self.hover = self.hit(x, y);
-                // 드러내는 영역: 바 오른쪽 부분 + 두 버튼이 나오는 자리
-                let bar = self.bar_rect();
-                let (gx, _, gr) = self.bead_circle(BEAD_GEAR);
-                let near = |k: usize| {
-                    let (bx, by, br) = self.bead_circle(k);
-                    (x - bx).powi(2) + (y - by).powi(2) <= (br + self.px(6.0)).powi(2)
-                };
-                let in_zone = (y >= bar.top - self.px(6.0)
-                    && y <= bar.bottom + self.px(6.0)
-                    && x >= bar.left + (bar.right - bar.left) * 0.55
-                    && x <= gx + gr + self.px(6.0))
-                    || near(BEAD_HISTORY)
-                    || near(BEAD_GEAR);
-                self.in_zone = in_zone;
-                if in_zone {
-                    self.leave_since = None;
-                    if !self.beads_out && self.hover_since.is_none() {
-                        self.hover_since = Some(Instant::now());
-                    }
-                } else {
-                    self.hover_since = None;
-                    if self.hover == Hit::None {
-                        if self.beads_out && self.leave_since.is_none() {
-                            self.leave_since = Some(Instant::now());
-                        }
-                    } else {
-                        self.leave_since = None;
-                    }
-                }
-                // Windows는 커서가 가만히 있어도 이동 메시지를 보냄 (띄운 뒤, 입력·스크롤 뒤)
-                // 진짜 움직였을 때만 줄을 호버함, 아니면 선택이 커서 아래로 되돌아감
-                let pos = (x as i32, y as i32);
-                if self.last_mouse.replace(pos) == Some(pos) {
-                    return Some((0, Action::None));
-                }
-                if self.view == View::Exclude {
-                    self.exclude_focus = None;
-                }
-                if let Hit::Row(i) = self.hover {
-                    // 스크롤 중 목록 밖으로 나가는 줄엔 강조 자리가 없음, 고를 수 없는 줄은 호버해도 그대로
-                    if i != self.selected && self.rows()[i].selectable() && (self.scroll..self.scroll + self.page()).contains(&i) {
-                        self.selected = i;
-                        // 아래 칸이 높아져 보이는 줄이 줄면 고른 줄이 가려질 수 있음
-                        self.fit_scroll();
-                        self.retarget_selection(false);
-                    }
-                }
+                self.on_mouse_move(x, y);
                 Some((0, Action::None))
             }
             WM_MOUSELEAVE => {
@@ -4703,121 +4512,7 @@ impl Popup {
             }
             WM_LBUTTONDOWN => {
                 let (x, y) = (lp.0 as i16 as f32, (lp.0 >> 16) as i16 as f32);
-                let hit = self.hit(x, y);
-                // 새 단축키를 기다리는 중 누르면 기다림을 끝냄, 단축키 버튼을 다시 누른 거면 그걸로 끝
-                if self.hotkey_wait.is_some() {
-                    self.end_hotkey_wait();
-                    if hit == Hit::Hotkey {
-                        return Some((0, Action::None));
-                    }
-                }
-                let act = match hit {
-                    Hit::Text => {
-                        // 조합 중인 글자는 확정하고, Shift를 누른 채면 선택을 넓힘
-                        // 고른 줄은 풂, 커서를 안 움직이고 누르면 이동 메시지로는 안 풀려서 Space가 줄을 토글함
-                        self.exclude_focus = None;
-                        self.complete_composition();
-                        let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
-                        self.edit.move_to(self.text_index(x), shift);
-                        self.input_changed();
-                        self.dragging = true;
-                        unsafe {
-                            SetCapture(self.hwnd);
-                        }
-                        Action::None
-                    }
-                    Hit::Gear => {
-                        self.toggle_settings();
-                        Action::None
-                    }
-                    Hit::History => {
-                        self.toggle_history();
-                        Action::None
-                    }
-                    Hit::ModeSeg(i) => {
-                        self.set_mode(Mode::ALL[i]);
-                        self.kb_focus = None;
-                        Action::Choice
-                    }
-                    Hit::DiffSeg(i) => {
-                        self.diff_choice = Diff::ALL[i];
-                        self.kb_focus = None;
-                        Action::Choice
-                    }
-                    Hit::Exclude => {
-                        self.kb_focus = None;
-                        self.open_exclude();
-                        Action::None
-                    }
-                    Hit::DoneExclude => {
-                        self.close_exclude();
-                        Action::None
-                    }
-                    Hit::ExcludeTab(tab) => {
-                        self.set_exclude_tab(tab);
-                        Action::None
-                    }
-                    Hit::ExcludeRow(i) | Hit::ExcludeButton(i) if self.exclude_tab == ExcludeTab::Dlc || hit == Hit::ExcludeButton(i) => {
-                        self.exclude_focus = None;
-                        self.exclude_down = Some(i);
-                        // 곡 줄은 버튼이라 토글 노브 눌림이 없음
-                        if matches!(self.exclude_rows[i].kind, ExcludeKind::Dlc(_)) {
-                            self.exclude_rows[i].motion.press.go(PRESS_Y, PRESS_SECS, PRESS_EASE);
-                        }
-                        unsafe { SetCapture(self.hwnd); }
-                        Action::None
-                    }
-                    Hit::Rescan => Action::Scan,
-                    Hit::CardButton => self.card_action(),
-                    Hit::Hotkey => {
-                        self.kb_focus = None;
-                        self.start_hotkey_wait();
-                        Action::None
-                    }
-                    // 누르는 동안 노브가 눌리고, 토글 위에서 떼면 바뀜
-                    Hit::Toggle(toggle) => {
-                        self.kb_focus = None;
-                        self.toggle_down = Some(toggle);
-                        self.toggles[toggle as usize].press.go(PRESS_Y, PRESS_SECS, PRESS_EASE);
-                        unsafe {
-                            SetCapture(self.hwnd);
-                        }
-                        Action::None
-                    }
-                    Hit::Favorite => {
-                        self.toggle_sheet_favorite();
-                        Action::None
-                    }
-                    Hit::Tab(tab) => {
-                        self.set_history_tab(tab);
-                        Action::None
-                    }
-                    Hit::Done => {
-                        self.close_keywords();
-                        Action::None
-                    }
-                    Hit::ClearRolls => {
-                        self.clear_rolls();
-                        Action::None
-                    }
-                    Hit::DoneRolls => {
-                        self.close_rolls();
-                        Action::None
-                    }
-                    Hit::RemoveKeyword(i) => {
-                        self.delete_keyword(i);
-                        Action::None
-                    }
-                    // 예전 검색어 결과가 보이던 줄을 누르면 대신 지금 결과를 띄움
-                    Hit::Row(_) if self.search_now() => Action::None,
-                    Hit::Row(i) if self.rows()[i].selectable() => {
-                        self.selected = i;
-                        self.choose(i)
-                    }
-                    Hit::None => Action::Hide,
-                    _ => Action::None,
-                };
-                Some((0, act))
+                Some((0, self.on_click(x, y)))
             }
             WM_LBUTTONUP if self.dragging => {
                 self.end_drag();
@@ -4887,6 +4582,326 @@ impl Popup {
                 Some((0, Action::None)) // 그리는 건 호출하는 쪽 (캐럿 깜빡임도)
             }
             _ => None,
+        }
+    }
+
+    /// 설정 보기의 키, 포커스가 없으면 첫 컨트롤 기준
+    fn settings_key(&mut self, vk: VIRTUAL_KEY) -> Action {
+        let f = self.kb_focus.unwrap_or(FOCUS_MODE);
+        match vk {
+            VK_ESCAPE => {
+                self.set_view(View::Results);
+                Action::None
+            }
+            VK_UP => {
+                self.move_settings(-1);
+                Action::None
+            }
+            VK_DOWN => {
+                // 처음 누른 화살표는 첫 컨트롤로
+                self.move_settings(1);
+                Action::None
+            }
+            VK_LEFT | VK_RIGHT => {
+                let d = if vk == VK_LEFT { -1 } else { 1 };
+                self.focus_settings(f);
+                match f {
+                    FOCUS_MODE => {
+                        self.cycle_mode(d);
+                        Action::Choice
+                    }
+                    FOCUS_DIFF => {
+                        self.cycle_diff(d);
+                        Action::Choice
+                    }
+                    // 토글은 왼쪽이 끔, 오른쪽이 켬
+                    FOCUS_KEEP if (d > 0) != self.keep_query => {
+                        self.set_toggle(Toggle::KeepQuery, d > 0);
+                        Action::Choice
+                    }
+                    FOCUS_DLC if (d > 0) != self.show_dlc => {
+                        self.set_toggle(Toggle::ShowDlc, d > 0);
+                        Action::Choice
+                    }
+                    FOCUS_GLASS if self.glass_unavailable().is_none() && (d > 0) != self.glass => {
+                        self.set_toggle(Toggle::Glass, d > 0);
+                        Action::Choice
+                    }
+                    _ => Action::None,
+                }
+            }
+            VK_RETURN if f == FOCUS_EXCLUDE => {
+                self.open_exclude();
+                Action::None
+            }
+            VK_RETURN if f == FOCUS_RESCAN => Action::Scan,
+            VK_RETURN if f == FOCUS_HOTKEY => {
+                self.start_hotkey_wait();
+                Action::None
+            }
+            VK_RETURN if f == FOCUS_KEEP => {
+                self.set_toggle(Toggle::KeepQuery, !self.keep_query);
+                Action::Choice
+            }
+            VK_RETURN if f == FOCUS_DLC => {
+                self.set_toggle(Toggle::ShowDlc, !self.show_dlc);
+                Action::Choice
+            }
+            VK_RETURN if f == FOCUS_GLASS && self.glass_unavailable().is_none() => {
+                self.set_toggle(Toggle::Glass, !self.glass);
+                Action::Choice
+            }
+            VK_BACK => {
+                self.edit.backspace(false);
+                self.requery(Edit::Typed);
+                Action::None
+            }
+            _ => Action::None,
+        }
+    }
+
+    /// 설정 밖 보기의 키: 줄 이동·고르기, 입력 칸 캐럿 이동과 지우기
+    fn list_key(&mut self, vk: VIRTUAL_KEY, ctrl: bool, shift: bool) -> Action {
+        if matches!(vk, VK_RETURN | VK_UP | VK_DOWN | VK_PRIOR | VK_NEXT) {
+            self.search_now(); // 입력한 글에 맞는 결과로 동작함
+        }
+        match vk {
+            VK_ESCAPE if self.view == View::History => {
+                self.set_view(View::Results);
+                Action::None
+            }
+            VK_ESCAPE => Action::Hide,
+            VK_RETURN if self.card().is_some() => self.card_action(),
+            VK_RETURN => self.choose(self.selected),
+            VK_UP => {
+                self.move_sel(-1);
+                Action::None
+            }
+            VK_DOWN => {
+                self.move_sel(1);
+                Action::None
+            }
+            VK_PRIOR => {
+                self.move_sel(-(self.page() as i32));
+                Action::None
+            }
+            VK_NEXT => {
+                self.move_sel(self.page() as i32);
+                Action::None
+            }
+            // 캐럿만 움직이면 다시 검색하지 않음, Ctrl은 단어 단위, Shift는 선택
+            // 조합 중인 글자는 먼저 확정 (그래야 그 자리에 남음)
+            VK_LEFT | VK_RIGHT | VK_HOME | VK_END => {
+                self.complete_composition();
+                match vk {
+                    VK_LEFT => self.edit.left(ctrl, shift),
+                    VK_RIGHT => self.edit.right(ctrl, shift),
+                    VK_HOME => self.edit.home(shift),
+                    _ => self.edit.end(shift),
+                }
+                self.input_changed();
+                Action::None
+            }
+            // 조합 중 Backspace는 IME가 자모를 지움, Delete는 확정한 뒤 지움
+            VK_BACK | VK_DELETE if vk == VK_DELETE || self.preedit.is_empty() => {
+                self.complete_composition();
+                // 지운 게 없으면 결과를 새로 기다리지 않음
+                let gone = if vk == VK_BACK { self.edit.backspace(ctrl) } else { self.edit.delete(ctrl) };
+                if gone {
+                    self.requery(Edit::Typed);
+                    self.fade_if_cleared();
+                }
+                Action::None
+            }
+            _ => Action::None,
+        }
+    }
+
+    /// 끄는 중이면 선택을 넓히고, 아니면 호버와 두 버튼을 드러내는 영역, 줄 호버를 맞춤
+    fn on_mouse_move(&mut self, x: f32, y: f32) {
+        if self.dragging {
+            self.complete_composition(); // 위치는 조합 글자가 없는 글 기준
+            self.edit.move_to(self.text_index(x), true);
+            self.input_changed();
+            return;
+        }
+        if !self.tracking {
+            let mut tme = TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: self.hwnd,
+                dwHoverTime: 0,
+            };
+            unsafe {
+                let _ = TrackMouseEvent(&mut tme);
+            }
+            self.tracking = true;
+        }
+        self.hover = self.hit(x, y);
+        // 드러내는 영역: 바 오른쪽 부분 + 두 버튼이 나오는 자리
+        let bar = self.bar_rect();
+        let (gx, _, gr) = self.bead_circle(BEAD_GEAR);
+        let near = |k: usize| {
+            let (bx, by, br) = self.bead_circle(k);
+            (x - bx).powi(2) + (y - by).powi(2) <= (br + self.px(6.0)).powi(2)
+        };
+        let in_zone = (y >= bar.top - self.px(6.0)
+            && y <= bar.bottom + self.px(6.0)
+            && x >= bar.left + (bar.right - bar.left) * 0.55
+            && x <= gx + gr + self.px(6.0))
+            || near(BEAD_HISTORY)
+            || near(BEAD_GEAR);
+        self.in_zone = in_zone;
+        if in_zone {
+            self.leave_since = None;
+            if !self.beads_out && self.hover_since.is_none() {
+                self.hover_since = Some(Instant::now());
+            }
+        } else {
+            self.hover_since = None;
+            if self.hover == Hit::None {
+                if self.beads_out && self.leave_since.is_none() {
+                    self.leave_since = Some(Instant::now());
+                }
+            } else {
+                self.leave_since = None;
+            }
+        }
+        // Windows는 커서가 가만히 있어도 이동 메시지를 보냄 (띄운 뒤, 입력·스크롤 뒤)
+        // 진짜 움직였을 때만 줄을 호버함, 아니면 선택이 커서 아래로 되돌아감
+        let pos = (x as i32, y as i32);
+        if self.last_mouse.replace(pos) == Some(pos) {
+            return;
+        }
+        if self.view == View::Exclude {
+            self.exclude_focus = None;
+        }
+        if let Hit::Row(i) = self.hover {
+            // 스크롤 중 목록 밖으로 나가는 줄엔 강조 자리가 없음, 고를 수 없는 줄은 호버해도 그대로
+            if i != self.selected && self.rows()[i].selectable() && (self.scroll..self.scroll + self.page()).contains(&i) {
+                self.selected = i;
+                // 아래 칸이 높아져 보이는 줄이 줄면 고른 줄이 가려질 수 있음
+                self.fit_scroll();
+                self.retarget_selection(false);
+            }
+        }
+    }
+
+    /// 왼쪽 버튼을 누른 자리의 동작
+    fn on_click(&mut self, x: f32, y: f32) -> Action {
+        let hit = self.hit(x, y);
+        // 새 단축키를 기다리는 중 누르면 기다림을 끝냄, 단축키 버튼을 다시 누른 거면 그걸로 끝
+        if self.hotkey_wait.is_some() {
+            self.end_hotkey_wait();
+            if hit == Hit::Hotkey {
+                return Action::None;
+            }
+        }
+        match hit {
+            Hit::Text => {
+                // 조합 중인 글자는 확정하고, Shift를 누른 채면 선택을 넓힘
+                // 고른 줄은 풂, 커서를 안 움직이고 누르면 이동 메시지로는 안 풀려서 Space가 줄을 토글함
+                self.exclude_focus = None;
+                self.complete_composition();
+                let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+                self.edit.move_to(self.text_index(x), shift);
+                self.input_changed();
+                self.dragging = true;
+                unsafe {
+                    SetCapture(self.hwnd);
+                }
+                Action::None
+            }
+            Hit::Gear => {
+                self.toggle_settings();
+                Action::None
+            }
+            Hit::History => {
+                self.toggle_history();
+                Action::None
+            }
+            Hit::ModeSeg(i) => {
+                self.set_mode(Mode::ALL[i]);
+                self.kb_focus = None;
+                Action::Choice
+            }
+            Hit::DiffSeg(i) => {
+                self.diff_choice = Diff::ALL[i];
+                self.kb_focus = None;
+                Action::Choice
+            }
+            Hit::Exclude => {
+                self.kb_focus = None;
+                self.open_exclude();
+                Action::None
+            }
+            Hit::DoneExclude => {
+                self.close_exclude();
+                Action::None
+            }
+            Hit::ExcludeTab(tab) => {
+                self.set_exclude_tab(tab);
+                Action::None
+            }
+            Hit::ExcludeRow(i) | Hit::ExcludeButton(i) if self.exclude_tab == ExcludeTab::Dlc || hit == Hit::ExcludeButton(i) => {
+                self.exclude_focus = None;
+                self.exclude_down = Some(i);
+                // 곡 줄은 버튼이라 토글 노브 눌림이 없음
+                if matches!(self.exclude_rows[i].kind, ExcludeKind::Dlc(_)) {
+                    self.exclude_rows[i].motion.press.go(PRESS_Y, PRESS_SECS, PRESS_EASE);
+                }
+                unsafe { SetCapture(self.hwnd); }
+                Action::None
+            }
+            Hit::Rescan => Action::Scan,
+            Hit::CardButton => self.card_action(),
+            Hit::Hotkey => {
+                self.kb_focus = None;
+                self.start_hotkey_wait();
+                Action::None
+            }
+            // 누르는 동안 노브가 눌리고, 토글 위에서 떼면 바뀜
+            Hit::Toggle(toggle) => {
+                self.kb_focus = None;
+                self.toggle_down = Some(toggle);
+                self.toggles[toggle as usize].press.go(PRESS_Y, PRESS_SECS, PRESS_EASE);
+                unsafe {
+                    SetCapture(self.hwnd);
+                }
+                Action::None
+            }
+            Hit::Favorite => {
+                self.toggle_sheet_favorite();
+                Action::None
+            }
+            Hit::Tab(tab) => {
+                self.set_history_tab(tab);
+                Action::None
+            }
+            Hit::Done => {
+                self.close_keywords();
+                Action::None
+            }
+            Hit::ClearRolls => {
+                self.clear_rolls();
+                Action::None
+            }
+            Hit::DoneRolls => {
+                self.close_rolls();
+                Action::None
+            }
+            Hit::RemoveKeyword(i) => {
+                self.delete_keyword(i);
+                Action::None
+            }
+            // 예전 검색어 결과가 보이던 줄을 누르면 대신 지금 결과를 띄움
+            Hit::Row(_) if self.search_now() => Action::None,
+            Hit::Row(i) if self.rows()[i].selectable() => {
+                self.selected = i;
+                self.choose(i)
+            }
+            Hit::None => Action::Hide,
+            _ => Action::None,
         }
     }
 
@@ -5063,6 +5078,243 @@ impl Popup {
         unsafe { g.dc.FillRoundedRectangle(&slot, &g.brush(white(FILL_HOVER))?) };
         let r = slot.rect;
         g.fill_icon(icon, (r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0, self.px(lay::ICON), &g.brush(TEXT)?)
+    }
+
+    /// 키워드·뽑은 기록 시트의 라벨·빈 칸 문구·안내 문구는 줄 높이 안 가운데, 잉크가 16 정렬선에 맞음
+    /// `l0`·`r0`은 패널 안쪽 16 정렬선
+    fn text_line(&self, text: &str, font: &IDWriteTextFormat, top: f32, h: f32, b: &ID2D1SolidColorBrush, (l0, r0): (f32, f32)) -> Result<()> {
+        let g = self.gfx.as_ref().unwrap();
+        let l = g.layout(text, font, r0 - l0, h)?;
+        unsafe {
+            l.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+            g.dc.DrawTextLayout(gfx::pt(l0 - BEARING, top), &l, b, D2D1_DRAW_TEXT_OPTIONS_NONE);
+        }
+        Ok(())
+    }
+
+    /// 설정 시트 (다 편 시트 자리), `l0`·`r0`은 패널 안쪽 16 정렬선
+    fn draw_settings(&self, (l0, r0): (f32, f32)) -> Result<()> {
+        let (g, f) = (self.gfx.as_ref().unwrap(), self.fonts.as_ref().unwrap());
+        let dc = &g.dc;
+        let s = self.scale;
+        let (text_b, sub_b) = (g.brush(TEXT)?, g.brush(SUB)?);
+        let l0t = l0 - BEARING; // 글자 x, 잉크가 16 정렬선에 맞음
+        let sl = self.settings_layout();
+        unsafe {
+            let t = g.layout("검색 설정", &f.title, self.px(200.0), self.px(19.0))?;
+            dc.DrawTextLayout(gfx::pt(l0t, sl.title), &t, &text_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
+            // 머리 줄 오른쪽: 곡 데이터 상태, 새 버전이 있으면 그 안내를 조금 밝게
+            // 오른쪽 정렬선에 붙이고 제목 오른쪽 12 앞에서 말줄임, 글자 기준선은 제목과 같음
+            if let Some((line, bright)) = &self.status_line {
+                let left = l0t + self.measure("검색 설정", |f| &f.title) + self.px(12.0);
+                let st = g.layout(line, &f.sub, (r0 - left).max(0.0), self.px(18.0))?;
+                st.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)?;
+                let sb = g.brush(if *bright { SUB } else { FAINT })?;
+                dc.DrawTextLayout(gfx::pt(left, sl.title + baseline(&t) - baseline(&st)), &st, &sb, D2D1_DRAW_TEXT_OPTIONS_NONE);
+            }
+            // 화살표로 바꾸는 컨트롤은 (한 번 쓴 뒤로) 테두리 없이 라벨 밝기로만 표시
+            for (focus, label, y) in [(FOCUS_MODE, "버튼 모드", sl.labels[0]), (FOCUS_DIFF, "난이도", sl.labels[1])] {
+                let ll = g.layout(label, &f.sub, self.px(200.0), self.px(18.0))?;
+                let lb = if self.kb_focus == Some(focus) { &text_b } else { &sub_b };
+                dc.DrawTextLayout(gfx::pt(l0t, y), &ll, lb, D2D1_DRAW_TEXT_OPTIONS_NONE);
+            }
+            let thumb = |k: usize| {
+                let at = self.seg[k].value();
+                (at, at + 1.0)
+            };
+            draw_segments(g, f, sl.mode, &Mode::ALL.map(Mode::label), thumb(SEG_MODE), lay::SEG_R, s)?;
+            draw_segments(g, f, sl.diff, &Diff::ALL.map(Diff::label), thumb(SEG_DIFF), lay::SEG_R, s)?;
+            let note_b = g.brush(FAINT)?;
+            let lt = g.layout("내 곡 목록", &f.item_bold, self.px(200.0), self.px(20.0))?;
+            dc.DrawTextLayout(gfx::pt(l0t, sl.list_title), &lt, &text_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
+            let label = if self.owned.is_some() { "다시 인식" } else { "목록 인식" };
+            draw_button(g, &f.item, sl.rescan, label, matches!(self.hover, Hit::Rescan) || self.kb_focus == Some(FOCUS_RESCAN), s)?;
+            if self.owned.is_some() {
+                draw_button(g, &f.item, sl.exclude, "검색 제외", self.hover == Hit::Exclude || self.kb_focus == Some(FOCUS_EXCLUDE), s)?;
+            } else {
+                draw_button_off(g, &f.item, sl.exclude, "검색 제외", s)?;
+            }
+            let nl2 = g.layout(&self.exclude_note(), &f.sub, sl.exclude.left - self.px(12.0) - l0, self.px(18.0))?;
+            dc.DrawTextLayout(gfx::pt(l0t, sl.list_note), &nl2, &note_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
+            // 단축키: 새 조합을 기다리는 동안 버튼이 눌린 채, 못 받으면 아랫줄에 잠깐 이유
+            let ht = g.layout("검색창 단축키", &f.item_bold, self.px(200.0), self.px(20.0))?;
+            dc.DrawTextLayout(gfx::pt(l0t, sl.hotkey_title), &ht, &text_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
+            let waiting = self.hotkey_wait.is_some();
+            draw_button(g, &f.item, sl.hotkey, &self.hotkey_text(), waiting || self.hover == Hit::Hotkey || self.kb_focus == Some(FOCUS_HOTKEY), s)?;
+            let (note, nb) = match self.hotkey_note.filter(|(_, at)| at.elapsed().as_secs_f32() < HOTKEY_NOTE_SECS) {
+                Some((why, _)) => (why, &text_b),
+                None if waiting => ("Esc를 누르면 취소돼요", &note_b),
+                None => ("선곡 화면에서 이 키로 검색창을 열어요", &note_b),
+            };
+            let nl3 = g.layout(note, &f.sub, sl.hotkey.left - self.px(12.0) - l0, self.px(18.0))?;
+            dc.DrawTextLayout(gfx::pt(l0t, sl.hotkey_note), &nl3, nb, D2D1_DRAW_TEXT_OPTIONS_NONE);
+            // 토글 줄은 같은 모양: 제목, 토글 왼쪽 12까지 설명, 버튼 줄 가운데 토글
+            for (title, note, title_y, note_y, r, toggle, focus) in [
+                ("검색어 유지", "다시 열면 마지막 검색어가 남아 있어요", sl.keep_title, sl.keep_note, sl.keep, Toggle::KeepQuery, FOCUS_KEEP),
+                ("DLC 표시", "작곡가 옆에 DLC 이름을 표시해요", sl.dlc_title, sl.dlc_note, sl.dlc, Toggle::ShowDlc, FOCUS_DLC),
+                ("유리 효과", self.glass_unavailable().unwrap_or("검색창 뒤로 게임 화면이 은은하게 비쳐요"), sl.glass_title, sl.glass_note, sl.glass, Toggle::Glass, FOCUS_GLASS),
+            ] {
+                let tl = g.layout(title, &f.item_bold, self.px(200.0), self.px(20.0))?;
+                dc.DrawTextLayout(gfx::pt(l0t, title_y), &tl, &text_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                let nl = g.layout(note, &f.sub, r.left - self.px(12.0) - l0, self.px(18.0))?;
+                dc.DrawTextLayout(gfx::pt(l0t, note_y), &nl, &note_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                let m = &self.toggles[toggle as usize];
+                if toggle == Toggle::Glass && self.glass_unavailable().is_some() {
+                    draw_toggle_off(g, r, s)?;
+                } else {
+                    draw_toggle(g, r, (m.knob.value(), m.tint.value(), m.press.value()), self.hover == Hit::Toggle(toggle) || self.kb_focus == Some(focus), s)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 키워드 시트 (다 편 시트 자리): 곡 줄과 별·완료 버튼, 라벨, 칩, 안내 문구
+    /// `jacket`은 곡 재킷, `l0`·`r0`은 패널 안쪽 16 정렬선
+    fn draw_keywords(&self, song: &Song, jacket: Option<&ID2D1Bitmap1>, (l0, r0): (f32, f32)) -> Result<()> {
+        let (g, f) = (self.gfx.as_ref().unwrap(), self.fonts.as_ref().unwrap());
+        let dc = &g.dc;
+        let s = self.scale;
+        let (text_b, sub_b) = (g.brush(TEXT)?, g.brush(SUB)?);
+        let icon_box = self.px(lay::ICON);
+        let ct = self.panel_top();
+        let kl = self.keyword_layout();
+        unsafe {
+            // 곡 줄: 결과 줄과 같은 재킷·제목·아랫줄 (선택 강조 없음), 레벨 칸 자리에 별과 완료 버튼
+            let y = ct + self.px(lay::PAD);
+            if let Some(bmp) = jacket {
+                draw_jacket(g, bmp, &self.jacket_slot(y), 1.0)?;
+            }
+            self.draw_row_text(y, kl.fav.left - self.px(8.0), &song.name, &song.composer, self.sub_tail(song, false).as_deref(), (&text_b, &sub_b))?;
+            draw_button(g, &f.item, kl.done, "완료", self.hover == Hit::Done, s)?;
+            // 별 버튼: 완료와 같은 바탕에 별, 꺼지면 테두리만 글자색, 켜지면 테두리도 노랑으로 바뀌고 노랑 채움을 겹침 (`StarMotion`)
+            // 켤 땐 가운데를 중심으로 눌렸다 돌아오고 버튼 가운데에서 점이 튐
+            draw_button_fill(g, kl.fav, self.hover == Hit::Favorite, s)?;
+            let (sx, sy) = ((kl.fav.left + kl.fav.right) / 2.0, (kl.fav.top + kl.fav.bottom) / 2.0);
+            let (on, pop) = self.star_now();
+            let on = alpha_step(on);
+            let mix = |a: f32, b: f32| a + (b - a) * on;
+            let ink = color(mix(TEXT.r, FAVORITE.r), mix(TEXT.g, FAVORITE.g), mix(TEXT.b, FAVORITE.b), mix(TEXT.a, FAVORITE.a));
+            g.fill_icon(Icon::StarOff, sx, sy, icon_box * pop, &g.brush(ink)?)?;
+            if on > 0.0 {
+                g.fill_icon(Icon::StarOn, sx, sy, icon_box * pop, &g.brush(with_alpha(FAVORITE, on))?)?;
+            }
+            if let Some(m) = &self.star {
+                let t = m.elapsed();
+                for sp in &m.sparks {
+                    let Some((reach, scale, a)) = sp.at(t) else { continue };
+                    let (dx, dy) = (sp.angle.cos() * sp.dist * reach * s, sp.angle.sin() * sp.dist * reach * s);
+                    dc.FillEllipse(&circle(sx + dx, sy + dy, sp.size / 2.0 * scale * s), &g.brush(with_alpha(FAVORITE, alpha_step(a)))?);
+                }
+            }
+
+            let faint_b = g.brush(FAINT)?;
+            self.text_line("내 키워드", &f.sub, kl.label, self.px(16.0), &sub_b, (l0, r0))?;
+            if song.user_keys.is_empty() {
+                self.text_line("아직 없어요", &f.item_regular, kl.chips_top, self.px(28.0), &faint_b, (l0, r0))?;
+            }
+            // 한 번 더 Backspace를 누르면 지울 칩은 진하게, ×는 호버하거나 지울 칩이면 밝게
+            let mark = self.keyword_remove_mark();
+            for (i, ((c, b), word)) in kl.chips.iter().zip(&song.user_keys).enumerate() {
+                let marked = mark == Some(i);
+                dc.FillRoundedRectangle(&rounded(*c, self.px(8.0)), &g.brush(white(if marked { FILL_STRONG } else { FILL_HOVER }))?);
+                let wx = c.left + self.px(10.0);
+                let wl = g.layout(word, &f.item, b.left - self.px(4.0) - wx, c.bottom - c.top)?;
+                wl.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+                dc.DrawTextLayout(gfx::pt(wx, c.top), &wl, &text_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+                let xb = if marked || self.hover == Hit::RemoveKeyword(i) { &text_b } else { &faint_b };
+                g.fill_icon(Icon::Remove, (b.left + b.right) / 2.0, (b.top + b.bottom) / 2.0, self.px(lay::CHIP_X), xb)?;
+            }
+            if let Some(note) = self.keyword_note() {
+                self.text_line(note, &f.sub, kl.note, self.px(16.0), &sub_b, (l0, r0))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 검색 바 입력 칸의 안내 글이나 입력한 글, 선택, 캐럿
+    /// 캐럿이 칸 안에 오게 민 거리를 돌려줌, 부르는 쪽이 `text_scroll`에 넣음
+    fn draw_input(&self, bar: D2D_RECT_F, now: Instant) -> Result<f32> {
+        let (g, f) = (self.gfx.as_ref().unwrap(), self.fonts.as_ref().unwrap());
+        let dc = &g.dc;
+        let s = self.scale;
+        let text_b = g.brush(TEXT)?;
+        let bar_h = bar.bottom - bar.top;
+        let cy = (bar.top + bar.bottom) / 2.0;
+        unsafe {
+            let (tx, _) = self.text_origin();
+            let tw = (self.text_right() - tx).max(10.0);
+            let q = self.query();
+            if q.is_empty() {
+                let ph = g.brush(FAINT)?;
+                let l = g.layout(self.input_hint(), &f.placeholder, tw, bar_h)?;
+                l.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+                // 커서가 첫 글자를 파고들지 않게 살짝 오른쪽에
+                dc.DrawTextLayout(gfx::pt(tx + self.px(2.0), bar.top), &l, &ph, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+            }
+            // 글은 가로로 자르지 않고 입력 칸 밖을 잘라 그림, 조합 중인 글자는 캐럿 자리에 밑줄
+            let l = g.layout_fresh(&q, &f.input, 100_000.0, bar_h)?;
+            l.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+            let c = self.edit.caret();
+            if !self.preedit.is_empty() {
+                let range = DWRITE_TEXT_RANGE { startPosition: s_to_u16(&q[..c]) as u32, length: s_to_u16(&self.preedit) as u32 };
+                l.SetUnderline(true, range)?;
+            }
+            // 캐럿 (조합 중이면 조합 글자 뒤)이 입력 칸 안에 오게 가로로 밈
+            // 버튼이 들어가는 동안엔 바와 같이 돌아오고 (`return_scroll`), 다 들어가 멈추면 원래대로
+            let caret_x = text_x(&l, &q, c + self.preedit.len());
+            let end = text_x(&l, &q, q.len());
+            let room = tw - self.px(3.0);
+            let text_scroll = match self.text_return {
+                Some((s0, r0)) => return_scroll(s0, r0, self.bar_reveal(), caret_x, room),
+                None => {
+                    let mut scroll = self.text_scroll;
+                    if caret_x - scroll > room {
+                        scroll = caret_x - room;
+                    } else if caret_x < scroll {
+                        scroll = caret_x;
+                    }
+                    scroll.clamp(0.0, (end - room).max(0.0))
+                }
+            };
+            let ox = tx - text_scroll;
+            let field = rect(tx - self.px(2.0), bar.top, tx + tw, bar.bottom);
+            dc.PushAxisAlignedClip(&field, D2D1_ANTIALIAS_MODE_ALIASED);
+            // 글이 가려진 쪽 가장자리는 잘린 끝 대신 흐리게, 캐럿은 빼고
+            let (fl, fr) = edge_fades((field.left, field.right), (ox, ox + end), (ox + text_x(&l, &q, c), ox + caret_x), self.px(lay::TEXT_FADE));
+            // 레이어 브러시 참조, 있으면 레이어를 넣은 것
+            // PopLayer 뒤 이 함수가 끝날 때 해제
+            let edge_brush = if fl > 0.0 || fr > 0.0 {
+                let w = field.right - field.left;
+                let edge = |f: f32| if f > 0.0 { 0.0 } else { 1.0 };
+                let stops = [(0.0, edge(fl)), (fl / w, 1.0), (1.0 - fr / w, 1.0), (1.0, edge(fr))]
+                    .map(|(position, a)| D2D1_GRADIENT_STOP { position, color: white(a) });
+                let ob = gfx::gradient(&g.dc, &stops, gfx::pt(field.left, 0.0), gfx::pt(field.right, 0.0))?;
+                let mut lp = D2D1_LAYER_PARAMETERS1 { contentBounds: field, opacityBrush: std::mem::ManuallyDrop::new(Some(ob.into())), ..gfx::layer(1.0, None) };
+                dc.PushLayer(&lp, None);
+                std::mem::ManuallyDrop::into_inner(std::mem::replace(&mut lp.opacityBrush, std::mem::ManuallyDrop::new(None)))
+            } else {
+                None
+            };
+            let selection = self.edit.selection().filter(|_| self.preedit.is_empty());
+            if let Some((a, b)) = selection {
+                let sb = g.brush(white(FILL_STRONG))?;
+                let (x0, x1) = (ox + text_x(&l, &q, a), ox + text_x(&l, &q, b));
+                dc.FillRoundedRectangle(&rrect(x0, cy - self.px(11.0), x1, cy + self.px(11.0), self.px(3.0)), &sb);
+            }
+            dc.DrawTextLayout(gfx::pt(ox, bar.top), &l, &text_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+            if edge_brush.is_some() {
+                dc.PopLayer();
+            }
+            let blink_on = ((now - self.caret_t0).as_millis() / CARET_BLINK_MS as u128).is_multiple_of(2);
+            if blink_on && self.preedit.is_empty() && selection.is_none() && !self.closing {
+                let cx = ox + caret_x + self.px(1.0);
+                let caret = g.brush(CARET)?;
+                dc.FillRectangle(&rect(cx, cy - self.px(10.0), cx + (1.5 * s).round(), cy + self.px(10.0)), &caret);
+            }
+            dc.PopAxisAlignedClip();
+            Ok(text_scroll)
+        }
     }
 
     fn draw_frame(&mut self) -> Result<()> {
@@ -5338,136 +5590,17 @@ impl Popup {
                 }
                 Ok(())
             };
-            // 키워드·뽑은 기록 시트의 라벨·빈 칸 문구·안내 문구는 줄 높이 안 가운데, 잉크가 16 정렬선에 맞음
-            let text_line = |text: &str, font: &IDWriteTextFormat, top: f32, h: f32, b: &ID2D1SolidColorBrush| -> Result<()> {
-                let l = g.layout(text, font, r0 - l0, h)?;
-                l.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
-                dc.DrawTextLayout(gfx::pt(l0t, top), &l, b, D2D1_DRAW_TEXT_OPTIONS_NONE);
-                Ok(())
-            };
             // 시트 내용 (다 편 시트 자리), 히스토리·검색 제외는 제자리 탭 아래에 겹쳐 바꾸는 줄 목록 `list`
             let draw_sheet = |list: Option<&ID2D1Image>| -> Result<()> {
                 if self.sheet == Sheet::Settings {
-                    let sl = self.settings_layout();
-                    let t = g.layout("검색 설정", &f.title, self.px(200.0), self.px(19.0))?;
-                    dc.DrawTextLayout(gfx::pt(l0t, sl.title), &t, &text_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
-                    // 머리 줄 오른쪽: 곡 데이터 상태, 새 버전이 있으면 그 안내를 조금 밝게
-                    // 오른쪽 정렬선에 붙이고 제목 오른쪽 12 앞에서 말줄임, 글자 기준선은 제목과 같음
-                    if let Some((line, bright)) = &self.status_line {
-                        let left = l0t + self.measure("검색 설정", |f| &f.title) + self.px(12.0);
-                        let st = g.layout(line, &f.sub, (r0 - left).max(0.0), self.px(18.0))?;
-                        st.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)?;
-                        let sb = g.brush(if *bright { SUB } else { FAINT })?;
-                        dc.DrawTextLayout(gfx::pt(left, sl.title + baseline(&t) - baseline(&st)), &st, &sb, D2D1_DRAW_TEXT_OPTIONS_NONE);
-                    }
-                    // 화살표로 바꾸는 컨트롤은 (한 번 쓴 뒤로) 테두리 없이 라벨 밝기로만 표시
-                    for (focus, label, y) in [(FOCUS_MODE, "버튼 모드", sl.labels[0]), (FOCUS_DIFF, "난이도", sl.labels[1])] {
-                        let ll = g.layout(label, &f.sub, self.px(200.0), self.px(18.0))?;
-                        let lb = if self.kb_focus == Some(focus) { &text_b } else { &sub_b };
-                        dc.DrawTextLayout(gfx::pt(l0t, y), &ll, lb, D2D1_DRAW_TEXT_OPTIONS_NONE);
-                    }
-                    let thumb = |k: usize| {
-                        let at = self.seg[k].value();
-                        (at, at + 1.0)
-                    };
-                    draw_segments(g, f, sl.mode, &Mode::ALL.map(Mode::label), thumb(SEG_MODE), lay::SEG_R, s)?;
-                    draw_segments(g, f, sl.diff, &Diff::ALL.map(Diff::label), thumb(SEG_DIFF), lay::SEG_R, s)?;
-                    let note_b = g.brush(FAINT)?;
-                    let lt = g.layout("내 곡 목록", &f.item_bold, self.px(200.0), self.px(20.0))?;
-                    dc.DrawTextLayout(gfx::pt(l0t, sl.list_title), &lt, &text_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
-                    let label = if self.owned.is_some() { "다시 인식" } else { "목록 인식" };
-                    draw_button(g, &f.item, sl.rescan, label, matches!(self.hover, Hit::Rescan) || self.kb_focus == Some(FOCUS_RESCAN), s)?;
-                    if self.owned.is_some() {
-                        draw_button(g, &f.item, sl.exclude, "검색 제외", self.hover == Hit::Exclude || self.kb_focus == Some(FOCUS_EXCLUDE), s)?;
-                    } else {
-                        draw_button_off(g, &f.item, sl.exclude, "검색 제외", s)?;
-                    }
-                    let nl2 = g.layout(&self.exclude_note(), &f.sub, sl.exclude.left - self.px(12.0) - l0, self.px(18.0))?;
-                    dc.DrawTextLayout(gfx::pt(l0t, sl.list_note), &nl2, &note_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
-                    // 단축키: 새 조합을 기다리는 동안 버튼이 눌린 채, 못 받으면 아랫줄에 잠깐 이유
-                    let ht = g.layout("검색창 단축키", &f.item_bold, self.px(200.0), self.px(20.0))?;
-                    dc.DrawTextLayout(gfx::pt(l0t, sl.hotkey_title), &ht, &text_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
-                    let waiting = self.hotkey_wait.is_some();
-                    draw_button(g, &f.item, sl.hotkey, &self.hotkey_text(), waiting || self.hover == Hit::Hotkey || self.kb_focus == Some(FOCUS_HOTKEY), s)?;
-                    let (note, nb) = match self.hotkey_note.filter(|(_, at)| at.elapsed().as_secs_f32() < HOTKEY_NOTE_SECS) {
-                        Some((why, _)) => (why, &text_b),
-                        None if waiting => ("Esc를 누르면 취소돼요", &note_b),
-                        None => ("선곡 화면에서 이 키로 검색창을 열어요", &note_b),
-                    };
-                    let nl3 = g.layout(note, &f.sub, sl.hotkey.left - self.px(12.0) - l0, self.px(18.0))?;
-                    dc.DrawTextLayout(gfx::pt(l0t, sl.hotkey_note), &nl3, nb, D2D1_DRAW_TEXT_OPTIONS_NONE);
-                    // 토글 줄은 같은 모양: 제목, 토글 왼쪽 12까지 설명, 버튼 줄 가운데 토글
-                    for (title, note, title_y, note_y, r, toggle, focus) in [
-                        ("검색어 유지", "다시 열면 마지막 검색어가 남아 있어요", sl.keep_title, sl.keep_note, sl.keep, Toggle::KeepQuery, FOCUS_KEEP),
-                        ("DLC 표시", "작곡가 옆에 DLC 이름을 표시해요", sl.dlc_title, sl.dlc_note, sl.dlc, Toggle::ShowDlc, FOCUS_DLC),
-                        ("유리 효과", self.glass_unavailable().unwrap_or("검색창 뒤로 게임 화면이 은은하게 비쳐요"), sl.glass_title, sl.glass_note, sl.glass, Toggle::Glass, FOCUS_GLASS),
-                    ] {
-                        let tl = g.layout(title, &f.item_bold, self.px(200.0), self.px(20.0))?;
-                        dc.DrawTextLayout(gfx::pt(l0t, title_y), &tl, &text_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
-                        let nl = g.layout(note, &f.sub, r.left - self.px(12.0) - l0, self.px(18.0))?;
-                        dc.DrawTextLayout(gfx::pt(l0t, note_y), &nl, &note_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
-                        let m = &self.toggles[toggle as usize];
-                        if toggle == Toggle::Glass && self.glass_unavailable().is_some() {
-                            draw_toggle_off(g, r, s)?;
-                        } else {
-                            draw_toggle(g, r, (m.knob.value(), m.tint.value(), m.press.value()), self.hover == Hit::Toggle(toggle) || self.kb_focus == Some(focus), s)?;
-                        }
-                    }
+                    self.draw_settings((l0, r0))?;
                 } else if self.sheet == Sheet::Exclude {
                     self.draw_exclude_head()?;
                     if let Some(list) = list {
                         dc.DrawImage(list, None, None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
                     }
                 } else if let (Sheet::Keywords, Some(song)) = (self.sheet, self.keyword_song()) {
-                    let kl = self.keyword_layout();
-                    // 곡 줄: 결과 줄과 같은 재킷·제목·아랫줄 (선택 강조 없음), 레벨 칸 자리에 별과 완료 버튼
-                    let y = ct + self.px(lay::PAD);
-                    if let Some(bmp) = &kw_jacket {
-                        draw_jacket(g, bmp, &self.jacket_slot(y), 1.0)?;
-                    }
-                    self.draw_row_text(y, kl.fav.left - self.px(8.0), &song.name, &song.composer, self.sub_tail(song, false).as_deref(), (&text_b, &sub_b))?;
-                    draw_button(g, &f.item, kl.done, "완료", self.hover == Hit::Done, s)?;
-                    // 별 버튼: 완료와 같은 바탕에 별, 꺼지면 테두리만 글자색, 켜지면 테두리도 노랑으로 바뀌고 노랑 채움을 겹침 (`StarMotion`)
-                    // 켤 땐 가운데를 중심으로 눌렸다 돌아오고 버튼 가운데에서 점이 튐
-                    draw_button_fill(g, kl.fav, self.hover == Hit::Favorite, s)?;
-                    let (sx, sy) = ((kl.fav.left + kl.fav.right) / 2.0, (kl.fav.top + kl.fav.bottom) / 2.0);
-                    let (on, pop) = self.star_now();
-                    let on = alpha_step(on);
-                    let mix = |a: f32, b: f32| a + (b - a) * on;
-                    let ink = color(mix(TEXT.r, FAVORITE.r), mix(TEXT.g, FAVORITE.g), mix(TEXT.b, FAVORITE.b), mix(TEXT.a, FAVORITE.a));
-                    g.fill_icon(Icon::StarOff, sx, sy, icon_box * pop, &g.brush(ink)?)?;
-                    if on > 0.0 {
-                        g.fill_icon(Icon::StarOn, sx, sy, icon_box * pop, &g.brush(with_alpha(FAVORITE, on))?)?;
-                    }
-                    if let Some(m) = &self.star {
-                        let t = m.elapsed();
-                        for sp in &m.sparks {
-                            let Some((reach, scale, a)) = sp.at(t) else { continue };
-                            let (dx, dy) = (sp.angle.cos() * sp.dist * reach * s, sp.angle.sin() * sp.dist * reach * s);
-                            dc.FillEllipse(&circle(sx + dx, sy + dy, sp.size / 2.0 * scale * s), &g.brush(with_alpha(FAVORITE, alpha_step(a)))?);
-                        }
-                    }
-
-                    let faint_b = g.brush(FAINT)?;
-                    text_line("내 키워드", &f.sub, kl.label, self.px(16.0), &sub_b)?;
-                    if song.user_keys.is_empty() {
-                        text_line("아직 없어요", &f.item_regular, kl.chips_top, self.px(28.0), &faint_b)?;
-                    }
-                    // 한 번 더 Backspace를 누르면 지울 칩은 진하게, ×는 호버하거나 지울 칩이면 밝게
-                    let mark = self.keyword_remove_mark();
-                    for (i, ((c, b), word)) in kl.chips.iter().zip(&song.user_keys).enumerate() {
-                        let marked = mark == Some(i);
-                        dc.FillRoundedRectangle(&rounded(*c, self.px(8.0)), &g.brush(white(if marked { FILL_STRONG } else { FILL_HOVER }))?);
-                        let wx = c.left + self.px(10.0);
-                        let wl = g.layout(word, &f.item, b.left - self.px(4.0) - wx, c.bottom - c.top)?;
-                        wl.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
-                        dc.DrawTextLayout(gfx::pt(wx, c.top), &wl, &text_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
-                        let xb = if marked || self.hover == Hit::RemoveKeyword(i) { &text_b } else { &faint_b };
-                        g.fill_icon(Icon::Remove, (b.left + b.right) / 2.0, (b.top + b.bottom) / 2.0, self.px(lay::CHIP_X), xb)?;
-                    }
-                    if let Some(note) = self.keyword_note() {
-                        text_line(note, &f.sub, kl.note, self.px(16.0), &sub_b)?;
-                    }
+                    self.draw_keywords(song, kw_jacket.as_ref(), (l0, r0))?;
                 } else if self.sheet == Sheet::Rolls {
                     let rl = self.roll_layout();
                     // 무작위 줄: 결과의 무작위 줄과 같은 모양 (선택 강조 없음), 레벨 칸 자리에 초기화와 완료
@@ -5479,7 +5612,7 @@ impl Popup {
                     }
                     draw_button(g, &f.item, rl.done, "완료", self.hover == Hit::DoneRolls, s)?;
                     // 라벨은 키워드 시트 라벨과 같은 줄, 곡 수는 같은 줄 오른쪽 16 정렬선에 한 단계 흐리게
-                    text_line("이 목록에서 나온 곡", &f.sub, rl.label, self.px(16.0), &sub_b)?;
+                    self.text_line("이 목록에서 나온 곡", &f.sub, rl.label, self.px(16.0), &sub_b, (l0, r0))?;
                     let cl = g.layout(&self.roll_count_text(), &f.sub, r0 - l0, self.px(16.0))?;
                     cl.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)?;
                     cl.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
@@ -5567,80 +5700,11 @@ impl Popup {
                 dc.DrawTextLayout(gfx::pt(cr.left, cr.top), &cl_, &sub_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
             }
 
-            let (tx, _) = self.text_origin();
-            let tw = (self.text_right() - tx).max(10.0);
-            let q = self.query();
-            if q.is_empty() {
-                let ph = g.brush(FAINT)?;
-                let l = g.layout(self.input_hint(), &f.placeholder, tw, bar_h)?;
-                l.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
-                // 커서가 첫 글자를 파고들지 않게 살짝 오른쪽에
-                dc.DrawTextLayout(gfx::pt(tx + self.px(2.0), bar.top), &l, &ph, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
-            }
-            // 글은 가로로 자르지 않고 입력 칸 밖을 잘라 그림, 조합 중인 글자는 캐럿 자리에 밑줄
-            let l = g.layout_fresh(&q, &f.input, 100_000.0, bar_h)?;
-            l.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
-            let c = self.edit.caret();
-            if !self.preedit.is_empty() {
-                let range = DWRITE_TEXT_RANGE { startPosition: s_to_u16(&q[..c]) as u32, length: s_to_u16(&self.preedit) as u32 };
-                l.SetUnderline(true, range)?;
-            }
-            // 캐럿 (조합 중이면 조합 글자 뒤)이 입력 칸 안에 오게 가로로 밈
-            // 버튼이 들어가는 동안엔 바와 같이 돌아오고 (`return_scroll`), 다 들어가 멈추면 원래대로
-            let caret_x = text_x(&l, &q, c + self.preedit.len());
-            let end = text_x(&l, &q, q.len());
-            let room = tw - self.px(3.0);
+            // 버튼이 다 들어가 멈추면 바를 따라 돌아오던 입력 칸 글은 원래대로
             if self.reveal.iter().all(Spring::settled) {
                 self.text_return = None;
             }
-            self.text_scroll = match self.text_return {
-                Some((s0, r0)) => return_scroll(s0, r0, self.bar_reveal(), caret_x, room),
-                None => {
-                    let mut scroll = self.text_scroll;
-                    if caret_x - scroll > room {
-                        scroll = caret_x - room;
-                    } else if caret_x < scroll {
-                        scroll = caret_x;
-                    }
-                    scroll.clamp(0.0, (end - room).max(0.0))
-                }
-            };
-            let ox = tx - self.text_scroll;
-            let field = rect(tx - self.px(2.0), bar.top, tx + tw, bar.bottom);
-            dc.PushAxisAlignedClip(&field, D2D1_ANTIALIAS_MODE_ALIASED);
-            // 글이 가려진 쪽 가장자리는 잘린 끝 대신 흐리게, 캐럿은 빼고
-            let (fl, fr) = edge_fades((field.left, field.right), (ox, ox + end), (ox + text_x(&l, &q, c), ox + caret_x), self.px(lay::TEXT_FADE));
-            // 레이어 브러시 참조, 있으면 레이어를 넣은 것
-            // PopLayer 뒤 이 블록이 끝날 때 해제
-            let edge_brush = if fl > 0.0 || fr > 0.0 {
-                let w = field.right - field.left;
-                let edge = |f: f32| if f > 0.0 { 0.0 } else { 1.0 };
-                let stops = [(0.0, edge(fl)), (fl / w, 1.0), (1.0 - fr / w, 1.0), (1.0, edge(fr))]
-                    .map(|(position, a)| D2D1_GRADIENT_STOP { position, color: white(a) });
-                let ob = gfx::gradient(&g.dc, &stops, gfx::pt(field.left, 0.0), gfx::pt(field.right, 0.0))?;
-                let mut lp = D2D1_LAYER_PARAMETERS1 { contentBounds: field, opacityBrush: std::mem::ManuallyDrop::new(Some(ob.into())), ..gfx::layer(1.0, None) };
-                dc.PushLayer(&lp, None);
-                std::mem::ManuallyDrop::into_inner(std::mem::replace(&mut lp.opacityBrush, std::mem::ManuallyDrop::new(None)))
-            } else {
-                None
-            };
-            let selection = self.edit.selection().filter(|_| self.preedit.is_empty());
-            if let Some((a, b)) = selection {
-                let sb = g.brush(white(FILL_STRONG))?;
-                let (x0, x1) = (ox + text_x(&l, &q, a), ox + text_x(&l, &q, b));
-                dc.FillRoundedRectangle(&rrect(x0, cy - self.px(11.0), x1, cy + self.px(11.0), self.px(3.0)), &sb);
-            }
-            dc.DrawTextLayout(gfx::pt(ox, bar.top), &l, &text_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
-            if edge_brush.is_some() {
-                dc.PopLayer();
-            }
-            let blink_on = ((now - self.caret_t0).as_millis() / CARET_BLINK_MS as u128).is_multiple_of(2);
-            if blink_on && self.preedit.is_empty() && selection.is_none() && !self.closing {
-                let cx = ox + caret_x + self.px(1.0);
-                let caret = g.brush(CARET)?;
-                dc.FillRectangle(&rect(cx, cy - self.px(10.0), cx + (1.5 * s).round(), cy + self.px(10.0)), &caret);
-            }
-            dc.PopAxisAlignedClip();
+            self.text_scroll = self.draw_input(bar, now)?;
 
             // 6) 히스토리·톱니 버튼, 아이콘은 버튼마다 따로 나타남 (`bead_shown`)
             // 그 보기가 열려 있으면 눌린 채 (`bead_view`), 아니면 호버할 때 밝아짐
