@@ -97,7 +97,7 @@ dependencies = [
 
 [[package]]
 name = "dmpicker-app"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "dmpicker-engine",
  "dmpicker-nav",
@@ -115,7 +115,7 @@ dependencies = [
 
 [[package]]
 name = "dmpicker-engine"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "image",
  "sha2",
@@ -124,11 +124,11 @@ dependencies = [
 
 [[package]]
 name = "dmpicker-nav"
-version = "1.2.0"
+version = "1.2.1"
 
 [[package]]
 name = "dmpicker-search"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "dmpicker-nav",
  "dmpicker-update",
@@ -137,7 +137,7 @@ dependencies = [
 
 [[package]]
 name = "dmpicker-update"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "flate2",
  "serde_json",
