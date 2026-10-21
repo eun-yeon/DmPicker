@@ -3920,7 +3920,7 @@ impl Popup {
         random.into_iter().chain(hits.into_iter().map(row)).collect()
     }
 
-    /// 히스토리 줄: 고른 탭에서 지금 목록에 있는 곡과 플레이리스트
+    /// 히스토리 줄: 고른 탭에서 지금 목록에 있는 곡과 플레이리스트, 즐겨찾기는 곡이 있으면 맨 위에 무작위 줄
     /// 히스토리 보기에선 그중 입력한 글에 맞는 줄만
     fn fill_history(&mut self) {
         let owned = self.owned.as_ref();
@@ -3938,7 +3938,9 @@ impl Popup {
             }
             HistoryTab::Favorites => {
                 self.history_entries.clear();
-                self.library.favorites.iter().filter_map(|&id| self.catalog.pick(id, owned).map(Row::Song)).collect()
+                let songs: Vec<Row> = self.library.favorites.iter().filter_map(|&id| self.catalog.pick(id, owned).map(Row::Song)).collect();
+                let random = (!songs.is_empty()).then_some(Row::Random);
+                random.into_iter().chain(songs).collect()
             }
         };
         self.history_query = if self.view == View::History { self.query() } else { String::new() };
@@ -5764,17 +5766,20 @@ impl Popup {
             eprintln!("glass: {e:?}");
         }
         if let Some(b) = &self.beams {
-            // 목록 인식 카드 (첫 인식·다시 인식), 결과에서 선택된 무작위로 고르기 줄 (시트 내용과 같이 비켜나고 바뀌면 새 내용과 같이 나타남)
+            // 목록 인식 카드 (첫 인식·다시 인식), 결과·히스토리에서 선택된 무작위로 고르기 줄 (시트 내용과 같이 비켜나고 바뀌면 새 내용과 같이 나타남)
             let content_a = panel_a * alpha_step(self.sheet_swap.shown.value());
             let scan_card = matches!(self.card(), Some(Card::Scan | Card::Stale));
             let card = (self.sheet == Sheet::Card && scan_card && has_panel).then_some((panel, content_a));
             let list_top = self.panel_top() + sg.dy + self.list_top(self.sheet);
             let list_bottom = (list_top + pitch * n_page as f32).min(panel.bottom);
-            let random = (self.sheet == Sheet::Results && has_panel && listed && self.rows_of(self.sheet).get(self.selected) == Some(&Row::Random))
+            let random_sheet = matches!(self.sheet, Sheet::Results | Sheet::History);
+            let random = (random_sheet && has_panel && listed && self.rows_of(self.sheet).get(self.selected) == Some(&Row::Random))
                 .then(|| {
                     let inset = self.px(lay::PAD);
                     let y = list_top + pitch * self.selected as f32 - off;
-                    (rect(panel.left + inset, y, panel.right - inset, y + pitch), content_a)
+                    // 히스토리 탭을 바꾸는 동안엔 새 줄 목록과 같이 섞여 나타남
+                    let list_a = alpha_step(self.list_swap.shown.value());
+                    (rect(panel.left + inset, y, panel.right - inset, y + pitch), content_a * list_a)
                 })
                 .filter(|(at, _)| at.top >= list_top - 0.5 && at.bottom <= list_bottom + 0.5);
             if let Err(e) = self.place_beams(b, &shrink, bar, open_t, card, random) {
