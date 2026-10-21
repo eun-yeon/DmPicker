@@ -102,11 +102,15 @@ mod lay {
     pub const LEVEL_W: f32 = 60.0; // 줄 오른쪽 끝의 레벨 칸
     pub const PLAYLIST_LEVEL_W: f32 = 72.0; // 플레이리스트 결과·뽑은 기록은 모드까지, 가장 긴 "8B · MX 15"가 약 66
     pub const SETTINGS_H: f32 = 402.0; // 맨 아래 줄(버튼 높이 30) 아래 16 (= 오른쪽 여백)
-    /// DLC 시트 줄 목록 위쪽, 제목·요약 두 줄 아래
-    pub const DLC_TOP: f32 = 64.0;
+    /// 제목·요약·탭 아래부터 목록
+    pub const EXCLUDE_TOP: f32 = 108.0;
     pub const DLC_ROW_H: f32 = 40.0;
-    /// DLC 시트에 다 보이는 줄 수 (8)
-    pub const DLC_ROWS: usize = ((SETTINGS_H - DLC_TOP - PAD * 2.0) / DLC_ROW_H) as usize;
+    /// 검색 제외 목록 최대 높이, DLC 6줄 = 곡 5줄이라 어느 탭에서도 반 줄이 걸쳐 보이지 않음
+    pub const EXCLUDE_LIST_H: f32 = 240.0;
+    /// 줄이 없을 때 목록 자리, 문구는 이 띠 가운데
+    pub const EXCLUDE_EMPTY_H: f32 = 120.0;
+    /// 설정·검색 제외 세그먼트 트랙 모서리, 히스토리 탭은 줄 강조와 같은 12
+    pub const SEG_R: f32 = 9.0;
     pub const TOGGLE_W: f32 = 42.0;
     pub const TOGGLE_H: f32 = 24.0;
     pub const KNOB: f32 = 18.0; // 둘레 3
@@ -176,14 +180,21 @@ pub enum Action {
 enum View {
     Results,
     Settings,
-    /// 검색에서 뺄 DLC, 설정의 DLC 설정 버튼으로 엶
-    Dlcs,
+    /// 설정에서 팩·곡별 검색을 켜거나 끔
+    Exclude,
     /// 최근 고른 곡·플레이리스트와 즐겨찾기, 히스토리 버튼으로 엶
     History,
     /// 곡 하나의 내 키워드, 결과·히스토리 줄을 우클릭하거나 F2로 엶
     Keywords,
     /// 무작위 줄로 나온 곡, 결과·히스토리의 무작위 줄을 우클릭하거나 F2로 엶
     Rolls,
+}
+
+impl View {
+    /// 입력 칸으로 시트 목록을 찾는 보기, 원래 입력·검색어는 `list_edit`에 보관
+    fn searches_sheet(self) -> bool {
+        matches!(self, Self::History | Self::Exclude)
+    }
 }
 
 /// 히스토리 맨 위 탭, 세그먼트 칸 순서대로
@@ -193,12 +204,39 @@ enum HistoryTab {
     Favorites,
 }
 
+impl HistoryTab {
+    const ALL: [Self; 2] = [Self::Recent, Self::Favorites];
+}
+
+/// 검색 제외 시트 탭, 세그먼트 칸 순서대로
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ExcludeTab {
+    Dlc,
+    Songs,
+}
+
+impl ExcludeTab {
+    const ALL: [Self; 2] = [Self::Dlc, Self::Songs];
+
+    fn row_height(self) -> f32 {
+        match self {
+            Self::Dlc => lay::DLC_ROW_H,
+            Self::Songs => lay::ROW_H,
+        }
+    }
+
+    /// 목록 최대 높이에 다 들어가는 줄 수
+    fn visible_rows(self) -> usize {
+        (lay::EXCLUDE_LIST_H / self.row_height()) as usize
+    }
+}
+
 /// 시트에 그리는 내용, 보이거나 나타나는 중에만 바뀌고 사라지는 동안엔 그대로 (`retarget_panel`)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Sheet {
     Settings,
-    /// 팩 줄과 토글
-    Dlcs,
+    /// 팩·곡 줄과 토글
+    Exclude,
     Card,
     /// 검색 결과 줄
     Results,
@@ -242,9 +280,9 @@ struct KeywordEdit {
     note: Option<&'static str>,
 }
 
-/// 히스토리·뽑은 기록에서 찾는 동안 원래 검색어와 결과 선택을 보관
-struct HistoryEdit {
-    /// 열기 전 입력, 히스토리에선 입력 칸으로 그 탭을 찾음
+/// 시트 안에서 찾는 동안 원래 검색어와 결과 선택을 보관
+struct SavedQuery {
+    /// 열기 전 입력, 시트에선 입력 칸으로 그 시트 목록을 찾음
     edit: Editor,
     /// 원래 결과의 검색어, 그사이 키워드·모드·곡 목록이 바뀌면 비워서 돌아갈 때 다시 찾음
     searched: String,
@@ -256,7 +294,7 @@ struct HistoryEdit {
 struct RollEdit {
     from: View,
     /// 열기 전 입력·검색어와 무작위 줄 자리, 닫으면 무작위 줄을 다시 고름
-    saved: HistoryEdit,
+    saved: SavedQuery,
     /// 연 곳 목록의 줄, 이 안에서 나온 곡만 보여 줌
     /// 검색으로 좁혀도 초기화 범위는 이 목록 전체
     scope: Vec<Row>,
@@ -600,12 +638,10 @@ enum Hit {
     ModeSeg(usize),
     DiffSeg(usize),
     Rescan,
-    /// 설정의 DLC 설정 버튼, 첫 인식 전엔 안 걸림
-    Dlcs,
-    /// DLC 시트의 i번째 줄
-    DlcRow(usize),
-    /// DLC 시트의 완료 버튼
-    DoneDlcs,
+    /// 설정의 검색 제외 버튼, 첫 인식 전엔 안 걸림
+    Exclude,
+    ExcludeRow(usize),
+    DoneExclude,
     Hotkey,
     Toggle(Toggle),
     CardButton,
@@ -614,6 +650,8 @@ enum Hit {
     Tab(HistoryTab),
     /// 키워드 시트의 별 (즐겨찾기) 버튼
     Favorite,
+    /// 검색 제외 시트 탭의 한 칸
+    ExcludeTab(ExcludeTab),
     /// 키워드 시트의 완료 버튼
     Done,
     /// 뽑은 기록 시트의 초기화 버튼, 지울 기록이 있을 때만
@@ -680,7 +718,7 @@ struct SettingsLayout {
     diff: D2D_RECT_F,
     list_title: f32,
     rescan: D2D_RECT_F,
-    dlcs: D2D_RECT_F,
+    exclude: D2D_RECT_F,
     list_note: f32,
     hotkey_title: f32,
     hotkey: D2D_RECT_F, // 글 너비에 맞춘 버튼
@@ -713,9 +751,22 @@ struct RollLayout {
     label: f32,
 }
 
-/// DLC 시트 줄 하나와 그 토글 모션
-struct DlcRow {
-    pack: DlcPack,
+enum ExcludeKind {
+    Dlc(DlcPack),
+    Song(usize),
+}
+
+impl ExcludeKind {
+    fn song(&self) -> Option<usize> {
+        match self {
+            Self::Song(i) => Some(*i),
+            Self::Dlc(_) => None,
+        }
+    }
+}
+
+struct ExcludeRow {
+    kind: ExcludeKind,
     motion: ToggleMotion,
 }
 
@@ -777,8 +828,8 @@ pub struct Popup {
     history_entries: Vec<Recent>,
     /// 히스토리 줄을 찾은 글, 히스토리를 나가 시트가 사라지는 동안에도 그대로
     history_query: String,
-    /// 히스토리 보기 (거기서 연 키워드·뽑은 기록 시트 포함)에서만 Some
-    history_edit: Option<HistoryEdit>,
+    /// 히스토리·검색 제외 보기에서만 Some, 히스토리에서 연 시트도 포함
+    list_edit: Option<SavedQuery>,
     /// `selected`·`scroll`이 가리키는 목록 (결과, 히스토리, 뽑은 기록), 보이는 목록이 바뀔 때만 첫 줄로
     sel_of: Sheet,
     rng: Rng,
@@ -796,13 +847,18 @@ pub struct Popup {
     wheel_acc: i32, // 아직 줄로 안 바꾼 휠 값 (정밀 휠, 터치패드)
     view: View,
     sheet: Sheet,
-    kb_focus: Option<usize>, // 설정 키보드 포커스: 0 모드, 1 난이도, 2 DLC 설정, 3 다시 인식, 4 단축키, 5 검색어 유지, 6 DLC 표시
+    kb_focus: Option<usize>, // 설정 키보드 포커스: 0 모드, 1 난이도, 2 검색 제외, 3 다시 인식, 4 단축키, 5 검색어 유지, 6 DLC 표시
     toggle_down: Option<Toggle>, // 누른 토글 (떼면 바뀜)
-    dlcs: Vec<DlcRow>, // DLC 시트 줄, 열 때마다 새로 채움
-    dlc_focus: Option<usize>, // 화살표로 고른 DLC 줄, 마우스를 움직이면 풀림
-    dlc_down: Option<usize>, // 누른 DLC 줄 (떼면 바뀜)
-    dlc_scroll: usize, // 처음 보이는 DLC 줄
-    dlc_scroll_s: Spring, // DLC 목록 오프셋 px, dlc_scroll x 줄 간격을 따라감
+    exclude_rows: Vec<ExcludeRow>,
+    exclude_tab: ExcludeTab,
+    /// 닫히는 동안 원래 검색어로 돌아가도 빈 목록 문구는 유지함
+    exclude_filtered: bool,
+    /// 탭을 연 뒤 숨김을 풀어도 줄을 남겨 바로 되돌릴 수 있게 함
+    exclude_songs: HashSet<u32>,
+    exclude_focus: Option<usize>, // 화살표로 고른 줄, 마우스를 움직이면 풀림
+    exclude_down: Option<usize>, // 누른 줄 (떼면 바뀜)
+    exclude_scroll: usize, // 처음 보이는 줄
+    exclude_scroll_s: Spring, // 목록 오프셋 px, exclude_scroll x 줄 간격을 따라감
     keyword_edit: Option<KeywordEdit>,
     roll_edit: Option<RollEdit>,
     hover: Hit,
@@ -817,9 +873,9 @@ pub struct Popup {
     close: Tween,           // 닫는 동안 0에서 1로
     sel_y: Spring,          // 선택 강조 위쪽, 패널 px (높이는 한 줄)
     scroll_s: Spring,       // 목록 오프셋 px, scroll x 줄 간격을 따라감
-    seg: [Tween; 3],        // 세그먼트 손잡이 [모드, 난이도, 히스토리 탭]: 왼쪽 끝, 칸 단위
+    seg: [Tween; 4],        // 세그먼트 손잡이 [모드, 난이도, 히스토리 탭, 검색 제외 탭]: 왼쪽 끝, 칸 단위
     sheet_swap: Crossfade,  // 시트 내용, 보기나 카드가 바뀌면 겹쳐 바꿈
-    list_swap: Crossfade,   // 히스토리 줄 목록, 탭이 바뀌면 겹쳐 바꿈 (탭은 제자리)
+    list_swap: Crossfade,   // 히스토리·검색 제외 줄 목록, 탭이 바뀌면 겹쳐 바꿈 (탭은 제자리)
     star: Option<StarMotion>, // 키워드 시트 별 버튼 모션, 시트를 닫으면 버림
     toggles: [ToggleMotion; 2], // 검색어 유지, DLC 표시
     hover_since: Option<Instant>,
@@ -951,9 +1007,9 @@ fn inside(r: &D2D_RECT_F, x: f32, y: f32) -> bool {
     x >= r.left && x <= r.right && y >= r.top && y <= r.bottom
 }
 
-/// 세그먼트 컨트롤 `r`의 4칸 중 `x`에 있는 칸
-fn segment_at(r: &D2D_RECT_F, x: f32) -> usize {
-    (((x - r.left) / (r.right - r.left)) * 4.0).clamp(0.0, 3.0) as usize
+/// 세그먼트 컨트롤 `r`의 `n`칸 중 `x`에 있는 칸
+fn segment_at(r: &D2D_RECT_F, x: f32, n: usize) -> usize {
+    (((x - r.left) / (r.right - r.left)) * n as f32).clamp(0.0, (n - 1) as f32) as usize
 }
 
 impl Popup {
@@ -993,7 +1049,7 @@ impl Popup {
             history: Vec::new(),
             history_entries: Vec::new(),
             history_query: String::new(),
-            history_edit: None,
+            list_edit: None,
             sel_of: Sheet::Results,
             rng: Rng::new(),
             rolls: Rolls::default(),
@@ -1007,11 +1063,14 @@ impl Popup {
             sheet: Sheet::Results,
             kb_focus: None,
             toggle_down: None,
-            dlcs: Vec::new(),
-            dlc_focus: None,
-            dlc_down: None,
-            dlc_scroll: 0,
-            dlc_scroll_s: Spring::new(0.0, 600.0, 46.0),
+            exclude_rows: Vec::new(),
+            exclude_tab: ExcludeTab::Dlc,
+            exclude_filtered: false,
+            exclude_songs: HashSet::new(),
+            exclude_focus: None,
+            exclude_down: None,
+            exclude_scroll: 0,
+            exclude_scroll_s: Spring::new(0.0, 600.0, 46.0),
             keyword_edit: None,
             roll_edit: None,
             hover: Hit::None,
@@ -1025,7 +1084,7 @@ impl Popup {
             close: Tween::new(0.0),
             sel_y: SEL_SPRING,
             scroll_s: Spring::new(0.0, 600.0, 46.0),
-            seg: [Tween::new(0.0); 3],
+            seg: [Tween::new(0.0); 4],
             sheet_swap: Crossfade::new(),
             list_swap: Crossfade::new(),
             star: None,
@@ -1114,15 +1173,16 @@ impl Popup {
         self.kept_row = None;
         self.rolls = Rolls::default();
         self.jackets.clear();
-        // 히스토리 뒤에 숨은 원래 검색도 돌아갈 때 새 목록으로 다시 찾음
-        if let Some(h) = &mut self.history_edit {
+        // 히스토리·검색 제외 시트 뒤에 숨은 원래 검색도 돌아갈 때 새 목록으로 다시 찾음
+        if let Some(h) = &mut self.list_edit {
             h.searched.clear();
         }
         self.fill_history();
         self.searched.clear();
-        self.search_now();
-        if self.view == View::Dlcs {
-            self.open_dlcs();
+        if self.view == View::Exclude {
+            self.fill_exclude();
+        } else {
+            self.search_now();
         }
         self.retarget_panel();
     }
@@ -1199,8 +1259,8 @@ impl Popup {
                 || self.list_swap.animating()
                 || self.star.as_ref().is_some_and(|m| !m.done(m.elapsed()))
                 || self.toggles.iter().any(|t| !t.done())
-                || !self.dlc_scroll_s.settled()
-                || self.dlcs.iter().any(|r| !r.motion.done())
+                || !self.exclude_scroll_s.settled()
+                || self.exclude_rows.iter().any(|r| !r.motion.done())
                 || self.hover_since.is_some()
                 || self.leave_since.is_some())
     }
@@ -1616,7 +1676,7 @@ impl Popup {
         match self.view {
             View::Rolls => Sheet::Rolls,
             View::Settings => Sheet::Settings,
-            View::Dlcs => Sheet::Dlcs,
+            View::Exclude => Sheet::Exclude,
             View::History => Sheet::History,
             View::Keywords => Sheet::Keywords,
             View::Results if self.card().is_some() => Sheet::Card,
@@ -1651,7 +1711,7 @@ impl Popup {
         match self.view {
             View::Keywords | View::Rolls => false,
             View::Results => playlist::id(self.edit.text()).is_none(),
-            View::Settings | View::Dlcs | View::History => true,
+            View::Settings | View::Exclude | View::History => true,
         }
     }
 
@@ -1679,7 +1739,7 @@ impl Popup {
             diff: rect(l, y(138.0), r, y(170.0)),
             list_title: y(192.0),
             rescan: rect(r - self.px(88.0), y(194.0), r, y(224.0)), // 두 줄 묶음의 가운데
-            dlcs: rect(r - self.px(184.0), y(194.0), r - self.px(96.0), y(224.0)),
+            exclude: rect(r - self.px(184.0), y(194.0), r - self.px(96.0), y(224.0)),
             list_note: y(212.0),
             // 단축키도 따로 묶음 (목록에서 24), 버튼은 글 좌우로 14, 다시 인식 버튼보다 좁진 않게
             hotkey_title: y(246.0),
@@ -1861,7 +1921,9 @@ impl Popup {
     /// 지금 보기의 패널 높이, 보여 줄 게 없으면 0 (줄이 없으면 문구 한 줄)
     fn panel_target(&self) -> f32 {
         match self.sheet_now() {
-            Sheet::Settings | Sheet::Dlcs => self.px(lay::SETTINGS_H),
+            Sheet::Settings => self.px(lay::SETTINGS_H),
+            // 줄 자리를 그리기·판정과 같은 식으로 더해야 다 편 패널 아래 끝이 마지막 줄 아래 8에 딱 맞음
+            Sheet::Exclude => self.px(lay::EXCLUDE_TOP) + self.px(lay::PAD) + self.exclude_list_h() + self.px(lay::PAD),
             Sheet::Keywords => self.keyword_layout().height,
             Sheet::Card => self.px(lay::CARD_H),
             Sheet::Results if self.playlist_waiting() => 0.0,
@@ -1967,11 +2029,15 @@ impl Popup {
             return Hit::Inside;
         }
         let y = y - sg.dy;
-        if self.view == View::Dlcs {
-            if inside(&self.dlc_done(), x, y) {
-                return Hit::DoneDlcs;
+        if self.view == View::Exclude {
+            if inside(&self.exclude_done(), x, y) {
+                return Hit::DoneExclude;
             }
-            return self.dlc_at(x, y).map_or(Hit::Inside, Hit::DlcRow);
+            let r = self.exclude_tabs_rect();
+            if inside(&r, x, y) {
+                return Hit::ExcludeTab(ExcludeTab::ALL[segment_at(&r, x, ExcludeTab::ALL.len())]);
+            }
+            return self.exclude_at(x, y).map_or(Hit::Inside, Hit::ExcludeRow);
         }
         if self.view == View::Keywords {
             let kl = self.keyword_layout();
@@ -2000,13 +2066,13 @@ impl Popup {
         if self.view == View::Settings {
             let sl = self.settings_layout();
             if inside(&sl.mode, x, y) {
-                return Hit::ModeSeg(segment_at(&sl.mode, x));
+                return Hit::ModeSeg(segment_at(&sl.mode, x, Mode::ALL.len()));
             }
             if inside(&sl.diff, x, y) {
-                return Hit::DiffSeg(segment_at(&sl.diff, x));
+                return Hit::DiffSeg(segment_at(&sl.diff, x, Diff::ALL.len()));
             }
-            if self.owned.is_some() && inside(&sl.dlcs, x, y) {
-                return Hit::Dlcs;
+            if self.owned.is_some() && inside(&sl.exclude, x, y) {
+                return Hit::Exclude;
             }
             if inside(&sl.rescan, x, y) {
                 return Hit::Rescan;
@@ -2028,11 +2094,10 @@ impl Popup {
             }
             return Hit::Inside;
         }
-        // 히스토리 탭은 칸마다 반씩
         if self.view == View::History {
             let r = self.tabs_rect();
             if inside(&r, x, y) {
-                return Hit::Tab(if x < (r.left + r.right) / 2.0 { HistoryTab::Recent } else { HistoryTab::Favorites });
+                return Hit::Tab(HistoryTab::ALL[segment_at(&r, x, HistoryTab::ALL.len())]);
             }
         }
         // 검색어를 지운 뒤 사라지는 줄은 호버·클릭 대상 아님
@@ -2094,7 +2159,7 @@ impl Popup {
         self.roll_edit = Some(RollEdit {
             from: self.view,
             scope: self.rows().to_vec(),
-            saved: HistoryEdit {
+            saved: SavedQuery {
                 edit: std::mem::take(&mut self.edit),
                 searched: std::mem::take(&mut self.searched),
                 row: Some((Row::Random, self.scroll)),
@@ -2326,7 +2391,7 @@ impl Popup {
         let saved = self.catalog.save_keywords(k.song, words);
         // 히스토리 뒤에 숨은 원래 검색도 돌아갈 때 다시 찾음
         // 플레이리스트 결과는 키워드와 상관없어서 다시 받지 않음
-        if let Some(h) = self.history_edit.as_mut().filter(|h| saved.is_ok() && playlist::id(h.edit.text()).is_none()) {
+        if let Some(h) = self.list_edit.as_mut().filter(|h| saved.is_ok() && playlist::id(h.edit.text()).is_none()) {
             h.searched.clear();
         }
         self.set_keyword_note(saved.err());
@@ -2443,8 +2508,8 @@ impl Popup {
     /// 히스토리는 열 때마다 고른 탭으로 다시 채움, 키워드·뽑은 기록 시트는 닫고 넘어감
     /// 히스토리에선 입력 칸으로 그 탭을 찾고, 나가면 원래 입력·결과·고른 줄로 돌아감
     fn set_view(&mut self, v: View) {
-        if self.view == View::Dlcs && v != View::Dlcs {
-            self.release_dlc();
+        if self.view == View::Exclude && v != View::Exclude {
+            self.release_exclude();
         }
         if self.view == View::Rolls {
             self.close_rolls();
@@ -2455,23 +2520,23 @@ impl Popup {
         if self.view == v {
             return;
         }
-        let from_history = self.view == View::History;
-        let restore = if from_history {
+        let from_list = self.view.searches_sheet();
+        let restore = if from_list {
             // 찾던 글의 조합 중인 글자는 원래 검색어에 안 붙게 버림
             self.preedit.clear();
             self.notify_composition(CPS_CANCEL);
-            self.restore_history_query()
+            self.restore_list_query()
         } else {
             None
         };
-        if v == View::History {
-            self.begin_history_search();
+        if v.searches_sheet() {
+            self.begin_list_search(restore);
         }
         self.view = v;
         self.end_hotkey_wait();
         if v == View::History {
             self.fill_history();
-        } else if from_history {
+        } else if from_list {
             self.search_now();
         }
         if v == View::Results {
@@ -2484,7 +2549,7 @@ impl Popup {
         self.retarget_panel();
         // 설정으로 가도 고르던 결과 줄이 남게 선택을 결과 목록 기준으로 되돌림
         // 히스토리 시트가 사라지기만 하면 강조가 탭 위로 튀지 않게 그대로 둠, 결과가 다시 나올 때 맞춤
-        if from_history && self.panel_target() > 0.0 {
+        if from_list && !v.searches_sheet() && self.panel_target() > 0.0 {
             self.sel_of = Sheet::Results;
             self.reset_rows();
             if let Some((row, scroll)) = restore {
@@ -2512,13 +2577,25 @@ impl Popup {
         self.refresh_available();
     }
 
+    pub fn hidden_songs(&self) -> &HashSet<u32> {
+        self.catalog.hidden_songs()
+    }
+
+    pub fn set_hidden_songs(&mut self, hidden: HashSet<u32>) {
+        if self.catalog.hidden_songs() == &hidden {
+            return;
+        }
+        self.catalog.set_hidden_songs(hidden);
+        self.refresh_available();
+    }
+
     /// 검색어가 같아도 후보를 다시 계산함
     /// 플레이리스트는 다시 받지 않고 받아 둔 내용으로 줄만 다시 만듦
     fn refresh_available(&mut self) {
         let selected = self.rows().get(self.selected).copied();
         let scroll = self.scroll;
         let query = self.query();
-        let result_query = self.history_edit.as_ref().map_or(query.as_str(), |h| h.edit.text());
+        let result_query = self.list_edit.as_ref().map_or(query.as_str(), |h| h.edit.text());
         self.results = if result_query.trim().is_empty() {
             Vec::new()
         } else if playlist::id(result_query).is_some() {
@@ -2528,7 +2605,7 @@ impl Popup {
         };
         self.bpm_rows = self.catalog.parse_filter(result_query).is_some_and(|f| f.bpm.is_some());
         self.fill_history();
-        if self.view != View::History {
+        if !self.view.searches_sheet() {
             self.searched = query;
         }
         self.reset_rows();
@@ -2538,23 +2615,41 @@ impl Popup {
         self.retarget_panel();
     }
 
-    /// 내 곡 목록 아랫줄, 지금 목록에 보이는 팩 중 꺼 둔 게 있으면 그 수
-    fn dlc_note(&self) -> String {
-        let packs = self.owned.as_ref().map(|ids| self.catalog.dlc_packs(ids)).unwrap_or_default();
+    /// 고를 수 있는 곡이 든 팩, 첫 인식 전엔 없음
+    fn owned_packs(&self) -> Vec<DlcPack> {
+        self.owned.as_ref().map(|ids| self.catalog.dlc_packs(ids)).unwrap_or_default()
+    }
+
+    /// (지금 목록의 팩 수, 그중 꺼 둔 팩 수, 숨긴 곡 수), 찾는 글과 상관없이 전체 목록 기준
+    /// 데이터에서 사라진 팩·곡은 설정에만 남기고 안내 숫자에선 뺌
+    fn exclude_counts(&self) -> (usize, usize, usize) {
+        let packs = self.owned_packs();
         let off = packs.iter().filter(|p| self.hidden_dlc().contains(&p.code)).count();
-        if off == 0 {
+        let songs = self.catalog.songs.iter().filter(|s| self.hidden_songs().contains(&s.id)).count();
+        (packs.len(), off, songs)
+    }
+
+    fn exclude_note(&self) -> String {
+        let (packs, off, songs) = self.exclude_counts();
+        if self.owned.is_none() || (off == 0 && songs == 0) {
             "DLC 구매나 곡 해금 후 다시 인식해 주세요".into()
-        } else if off == packs.len() {
+        } else if off > 0 && off == packs {
             "DLC를 모두 검색에서 뺐어요".into()
+        } else if off > 0 && songs > 0 {
+            format!("DLC {off}개와 곡 {songs}개를 검색에서 뺐어요")
+        } else if songs > 0 {
+            format!("곡 {songs}개를 검색에서 뺐어요")
         } else {
             format!("DLC {off}개를 검색에서 뺐어요")
         }
     }
 
-    /// DLC 시트 제목 아래 요약
-    fn dlc_summary(&self) -> String {
-        let total = self.dlcs.len();
-        let on = self.dlcs.iter().filter(|r| !self.hidden_dlc().contains(&r.pack.code)).count();
+    fn exclude_summary(&self) -> String {
+        let (total, off, songs) = self.exclude_counts();
+        if self.exclude_tab == ExcludeTab::Songs {
+            return if songs == 0 { "검색에서 뺀 곡이 없어요".into() } else { format!("곡 {songs}개를 검색에서 뺐어요") };
+        }
+        let on = total - off;
         if on == total {
             format!("{total}개 모두 검색해요")
         } else if on == 0 {
@@ -2564,43 +2659,168 @@ impl Popup {
         }
     }
 
-    /// 고를 수 있는 곡의 팩으로 DLC 시트를 엶, 첫 인식 전엔 안 열림
-    fn open_dlcs(&mut self) {
-        let Some(owned) = &self.owned else { return };
-        self.dlcs = self.catalog.dlc_packs(owned).into_iter().map(|pack| {
-            let mut motion = ToggleMotion::new();
-            motion.snap(!self.hidden_dlc().contains(&pack.code));
-            DlcRow { pack, motion }
-        }).collect();
-        self.dlc_focus = None;
-        self.dlc_scroll = 0;
-        self.dlc_scroll_s.snap(0.0);
-        self.wheel_acc = 0;
-        // 기다리던 검색을 먼저 끝내야 토글 뒤 다시 만드는 결과가 지금 글 기준
+    fn exclude_empty_text(&self) -> Option<(&'static str, Option<&'static str>)> {
+        if !self.exclude_rows.is_empty() {
+            return None;
+        }
+        match (self.exclude_tab, self.exclude_filtered) {
+            (ExcludeTab::Songs, false) => Some(("숨긴 곡이 없어요", Some("위 검색창에서 곡을 찾아 숨길 수 있어요"))),
+            (ExcludeTab::Songs, true) => Some(("일치하는 곡이 없어요", None)),
+            (ExcludeTab::Dlc, true) => Some(("일치하는 DLC가 없어요", None)),
+            _ => None,
+        }
+    }
+
+    /// 기다리던 검색을 끝내야 보관한 입력과 결과가 일치함
+    fn open_exclude(&mut self) {
+        if self.owned.is_none() || self.view == View::Exclude {
+            return;
+        }
         self.finish_input();
         self.search_now();
-        self.set_view(View::Dlcs);
+        self.set_view(View::Exclude);
+        self.reset_exclude_rows();
         self.hover = Hit::None;
     }
 
-    /// 설정으로 돌아감, 키로 열었으면 포커스는 DLC 설정 버튼에 그대로
-    fn close_dlcs(&mut self) {
+    /// 키로 열었으면 설정의 검색 제외 버튼에 포커스가 남음
+    fn close_exclude(&mut self) {
         self.set_view(View::Settings);
         self.hover = Hit::None;
         self.wheel_acc = 0;
     }
 
-    /// i번째 팩을 켜거나 끄고 결과를 다시 만듦
-    fn toggle_dlc(&mut self, i: usize) -> Action {
-        let Some(row) = self.dlcs.get(i) else { return Action::None };
-        let code = row.pack.code.clone();
-        let on = self.catalog.toggle_dlc(&code);
-        self.dlcs[i].motion.go(on);
+    /// 검색 제외 시트에서 화살표로 고른 줄이 있으면 Space는 그 줄 토글, 없으면 찾는 글의 공백
+    fn space_toggles_row(&self) -> bool {
+        self.view == View::Exclude && self.exclude_focus.is_some()
+    }
+
+    /// 처리하지 않은 편집 키는 입력 칸의 공통 처리로 넘김
+    fn exclude_key(&mut self, vk: VIRTUAL_KEY, repeat: bool) -> Option<Action> {
+        if self.view != View::Exclude {
+            return None;
+        }
+        if matches!(vk, VK_UP | VK_DOWN | VK_RETURN | VK_SPACE) {
+            self.search_now();
+        }
+        Some(match vk {
+            VK_ESCAPE => {
+                self.close_exclude();
+                Action::None
+            }
+            VK_UP | VK_DOWN => {
+                self.move_exclude(if vk == VK_UP { -1 } else { 1 });
+                Action::None
+            }
+            VK_RETURN | VK_SPACE if vk == VK_RETURN || self.space_toggles_row() => {
+                if repeat {
+                    Action::None
+                } else if let Some(i) = self.exclude_focus {
+                    self.toggle_exclude(i)
+                } else {
+                    self.move_exclude(0);
+                    Action::None
+                }
+            }
+            VK_PRIOR | VK_NEXT => Action::None,
+            _ => return None,
+        })
+    }
+
+    /// 두 칸 탭이 있는 보기 (히스토리, 검색 제외)에서 ←는 첫 칸, →는 둘째 칸으로, 탭이 없는 보기면 false
+    fn arrow_tab(&mut self, right: bool) -> bool {
+        match self.view {
+            View::History => self.set_history_tab(HistoryTab::ALL[right as usize]),
+            View::Exclude => self.set_exclude_tab(ExcludeTab::ALL[right as usize]),
+            _ => return false,
+        }
+        true
+    }
+
+    /// 탭은 제자리, 요약과 줄 목록만 겹쳐 바꾸고 높이는 같이 움직임 (히스토리 탭과 같음)
+    fn set_exclude_tab(&mut self, tab: ExcludeTab) {
+        if self.exclude_tab == tab {
+            return;
+        }
+        self.preedit.clear();
+        self.notify_composition(CPS_CANCEL);
+        self.clear_input();
+        self.exclude_tab = tab;
+        self.list_swap.swap();
+        self.reset_exclude_rows();
+    }
+
+    /// 숨긴 곡 탭에 남길 곡을 지금 숨긴 곡으로 다시 잡고 줄을 채움, 시트나 탭을 새로 열 때
+    fn reset_exclude_rows(&mut self) {
+        self.exclude_songs = self.hidden_songs().clone();
+        self.fill_exclude();
+    }
+
+    fn exclude_on(&self, kind: &ExcludeKind) -> bool {
+        match kind {
+            ExcludeKind::Dlc(pack) => !self.hidden_dlc().contains(&pack.code),
+            ExcludeKind::Song(i) => !self.hidden_songs().contains(&self.catalog.songs[*i].id),
+        }
+    }
+
+    fn fill_exclude(&mut self) {
+        self.release_exclude();
+        let query = self.query();
+        let q = query.trim();
+        self.exclude_filtered = !q.is_empty();
+        let kinds: Vec<_> = match self.exclude_tab {
+            ExcludeTab::Dlc => {
+                let q = q.to_lowercase();
+                self.owned_packs().into_iter().filter(|p| p.name.to_lowercase().contains(&q)).map(ExcludeKind::Dlc).collect()
+            }
+            ExcludeTab::Songs => {
+                let songs = if q.is_empty() {
+                    let mut songs: Vec<_> = self.catalog.songs.iter().enumerate()
+                        .filter(|(_, s)| self.exclude_songs.contains(&s.id)).map(|(i, _)| i).collect();
+                    songs.sort_by_cached_key(|&i| self.catalog.songs[i].name.to_lowercase());
+                    songs
+                } else {
+                    self.catalog.search_owned(q, LIMIT, self.owned.as_ref())
+                };
+                songs.into_iter().map(ExcludeKind::Song).collect()
+            }
+        };
+        self.exclude_rows = kinds.into_iter().map(|kind| {
+            let mut motion = ToggleMotion::new();
+            motion.snap(self.exclude_on(&kind));
+            ExcludeRow { kind, motion }
+        }).collect();
+        self.searched = query;
+        self.exclude_focus = None;
+        self.exclude_scroll = 0;
+        self.exclude_scroll_s.snap(0.0);
+        self.wheel_acc = 0;
+        self.retarget_panel();
+    }
+
+    fn toggle_exclude(&mut self, i: usize) -> Action {
+        // 입력이 아직 목록에 반영되지 않았으면 지난 줄을 바꾸지 않음
+        if self.search_now() {
+            return Action::None;
+        }
+        let Some(row) = self.exclude_rows.get(i) else { return Action::None };
+        let on = match &row.kind {
+            ExcludeKind::Dlc(pack) => self.catalog.toggle_dlc(&pack.code),
+            ExcludeKind::Song(song) => {
+                let id = self.catalog.songs[*song].id;
+                let on = self.catalog.toggle_song(id);
+                if !on {
+                    self.exclude_songs.insert(id);
+                }
+                on
+            }
+        };
+        self.exclude_rows[i].motion.go(on);
         self.refresh_available();
         Action::Choice
     }
 
-    /// 설정 포커스 이동, 처음 누른 화살표는 첫 컨트롤로, 첫 인식 전엔 DLC 설정 버튼을 건너뜀
+    /// 설정 포커스 이동, 처음 누른 화살표는 첫 컨트롤로, 첫 인식 전엔 검색 제외 버튼을 건너뜀
     fn move_settings(&mut self, d: i32) {
         let mut next = self.kb_focus.map_or(0, |i| (i as i32 + d).clamp(0, 6) as usize);
         if next == 2 && self.owned.is_none() {
@@ -2609,171 +2829,239 @@ impl Popup {
         self.kb_focus = Some(next);
     }
 
-    /// DLC 줄 포커스 이동, 고른 줄이 보이게 스크롤
-    fn move_dlc(&mut self, d: i32) {
-        if self.dlcs.is_empty() {
+    /// 고른 줄이 보이게 스크롤
+    fn move_exclude(&mut self, d: i32) {
+        if self.exclude_rows.is_empty() {
             return;
         }
-        let i = self.dlc_focus.map_or(0, |i| (i as i32 + d).clamp(0, self.dlcs.len() as i32 - 1) as usize);
-        self.dlc_focus = Some(i);
+        let i = self.exclude_focus.map_or(0, |i| (i as i32 + d).clamp(0, self.exclude_rows.len() as i32 - 1) as usize);
+        self.exclude_focus = Some(i);
         self.hover = Hit::Inside;
-        let scroll = self.dlc_scroll.min(i).max((i + 1).saturating_sub(lay::DLC_ROWS));
-        self.scroll_dlcs(scroll as i32 - self.dlc_scroll as i32);
+        let scroll = self.exclude_scroll.min(i).max((i + 1).saturating_sub(self.exclude_tab.visible_rows()));
+        self.scroll_exclude(scroll as i32 - self.exclude_scroll as i32);
     }
 
-    fn scroll_dlcs(&mut self, d: i32) {
-        let max = self.dlcs.len().saturating_sub(lay::DLC_ROWS) as i32;
-        self.dlc_scroll = (self.dlc_scroll as i32 + d).clamp(0, max) as usize;
-        self.dlc_scroll_s.target = self.px(lay::DLC_ROW_H) * self.dlc_scroll as f32;
+    fn scroll_exclude(&mut self, d: i32) {
+        let max = self.exclude_rows.len().saturating_sub(self.exclude_tab.visible_rows()) as i32;
+        self.exclude_scroll = (self.exclude_scroll as i32 + d).clamp(0, max) as usize;
+        self.exclude_scroll_s.target = self.px(self.exclude_tab.row_height()) * self.exclude_scroll as f32;
     }
 
     /// 목록이 스크롤로 움직이면 커서 아래 줄을 다시 호버 (화살표로 고른 동안은 그대로)
-    fn refresh_dlc_hover(&mut self) {
-        if self.view == View::Dlcs && self.dlc_focus.is_none() {
+    fn refresh_exclude_hover(&mut self) {
+        if self.view == View::Exclude && self.exclude_focus.is_none() {
             if let Some((x, y)) = self.last_mouse.filter(|_| self.tracking) {
                 self.hover = self.hit(x as f32, y as f32);
             }
         }
     }
 
-    fn release_dlc(&mut self) {
-        if let Some(i) = self.dlc_down.take() {
-            self.dlcs[i].motion.press.go(1.0, QUICK_SECS, QUICK_EASE);
+    fn release_exclude(&mut self) {
+        if let Some(i) = self.exclude_down.take() {
+            self.exclude_rows[i].motion.press.go(1.0, QUICK_SECS, QUICK_EASE);
             unsafe { let _ = ReleaseCapture(); }
         }
     }
 
     /// 완료 버튼, 폭은 다른 시트와 같고 세로는 제목·요약 두 줄 묶음 가운데
-    fn dlc_done(&self) -> D2D_RECT_F {
+    fn exclude_done(&self) -> D2D_RECT_F {
         let r = self.done_button();
         rect(r.left, self.panel_top() + self.px(22.0), r.right, self.panel_top() + self.px(52.0))
     }
 
-    /// 줄 목록 자리, 제목 아래부터 패널 끝까지 (위아래 8은 흐림)
-    fn dlc_clip(&self) -> D2D_RECT_F {
-        rect(self.px(lay::MARGIN + lay::PAD), self.panel_top() + self.px(lay::DLC_TOP),
-            self.px(lay::MARGIN + lay::W - lay::PAD), self.panel_top() + self.px(lay::SETTINGS_H))
+    /// 탭 (세그먼트): 16 정렬선 사이, 요약 글줄 아래 16에 높이 32, 바로 아래부터 줄 목록
+    fn exclude_tabs_rect(&self) -> D2D_RECT_F {
+        let top = self.panel_top();
+        rect(self.px(lay::MARGIN + lay::INSET), top + self.px(lay::EXCLUDE_TOP - 32.0),
+            self.px(lay::MARGIN + lay::W - lay::INSET), top + self.px(lay::EXCLUDE_TOP))
     }
 
-    /// 판정(`dlc_at`)·스크롤과 같은 식, 한꺼번에 반올림하면 4/3 배율에서 아래 줄로 몇 px씩 밀림
-    fn dlc_row_rect(&self, i: usize) -> D2D_RECT_F {
-        let clip = self.dlc_clip();
-        let top = clip.top + self.px(lay::PAD) + self.px(lay::DLC_ROW_H) * i as f32 - self.dlc_scroll_s.value;
-        rect(clip.left, top, clip.right, top + self.px(lay::DLC_ROW_H))
+    /// 줄 칸, 탭 아래 8부터 다 편 목록 높이까지 (결과 목록처럼 멈추면 딱 보이는 줄만)
+    /// 패널이 그보다 짧은 동안엔 지금 패널 아래 끝까지라 패널 밖으로 나간 줄은 안 그리고 안 눌림
+    fn exclude_clip(&self) -> D2D_RECT_F {
+        let top = self.panel_top() + self.px(lay::EXCLUDE_TOP) + self.px(lay::PAD);
+        rect(self.px(lay::MARGIN) + self.px(lay::PAD), top, self.px(lay::MARGIN + lay::W) - self.px(lay::PAD),
+            (top + self.exclude_list_h()).min(self.panel_top() + self.panel_h.value))
     }
 
-    fn dlc_at(&self, x: f32, y: f32) -> Option<usize> {
-        if !inside(&self.dlc_clip(), x, y) {
+    /// 다 편 패널에서 줄이 차지하는 높이, 최대 높이를 넘으면 스크롤 (줄이 없으면 빈 목록 문구 띠)
+    fn exclude_list_h(&self) -> f32 {
+        match self.exclude_rows.len().min(self.exclude_tab.visible_rows()) {
+            0 => self.px(lay::EXCLUDE_EMPTY_H),
+            n => self.px(self.exclude_tab.row_height()) * n as f32,
+        }
+    }
+
+    /// 판정(`exclude_at`)·스크롤·패널 높이와 같은 식, 한꺼번에 반올림하면 4/3 배율에서 아래 줄로 몇 px씩 밀림
+    fn exclude_row_rect(&self, i: usize) -> D2D_RECT_F {
+        let clip = self.exclude_clip();
+        let h = self.px(self.exclude_tab.row_height());
+        let top = clip.top + h * i as f32 - self.exclude_scroll_s.value;
+        rect(clip.left, top, clip.right, top + h)
+    }
+
+    fn exclude_at(&self, x: f32, y: f32) -> Option<usize> {
+        let clip = self.exclude_clip();
+        // 아래 경계는 안 그린 다음 줄의 첫 픽셀이라 뺌
+        if !inside(&clip, x, y) || y >= clip.bottom {
             return None;
         }
-        let offset = y - self.dlc_clip().top - self.px(lay::PAD) + self.dlc_scroll_s.value;
-        if offset < 0.0 {
-            return None;
-        }
-        let i = (offset / self.px(lay::DLC_ROW_H)).floor() as usize;
-        (i < self.dlcs.len()).then_some(i)
+        let offset = y - clip.top + self.exclude_scroll_s.value;
+        let i = (offset / self.px(self.exclude_tab.row_height())).floor() as usize;
+        (i < self.exclude_rows.len()).then_some(i)
     }
 
-    /// DLC 시트: 제목·요약·완료 버튼, 위아래가 흐려지는 팩 줄 목록
-    fn draw_dlcs(&self) -> Result<()> {
+    /// 목록 자리에 걸치는 줄
+    fn exclude_shown(&self) -> Vec<usize> {
+        let clip = self.exclude_clip();
+        (0..self.exclude_rows.len())
+            .filter(|&i| {
+                let r = self.exclude_row_rect(i);
+                r.bottom > clip.top && r.top < clip.bottom
+            })
+            .collect()
+    }
+
+    /// 머리: 제목·완료 버튼과 탭, 탭마다 바뀌는 요약과 줄 목록은 따로 그림 (`draw_exclude_list`)
+    /// 16 정렬선의 글자는 설정 시트처럼 잉크를 맞춤, 설정과 겹쳐 바꿀 때 같은 "검색" 글자가 안 번짐
+    fn draw_exclude_head(&self) -> Result<()> {
+        let (g, f) = (self.gfx.as_ref().unwrap(), self.fonts.as_ref().unwrap());
+        let done = self.exclude_done();
+        let left = self.px(lay::MARGIN + lay::INSET);
+        let title = g.layout("검색 제외", &f.head, done.left - left, self.px(22.0))?;
+        unsafe {
+            g.dc.DrawTextLayout(gfx::pt(left - BEARING, self.panel_top() + self.px(18.0)), &title, &g.brush(TEXT)?, D2D1_DRAW_TEXT_OPTIONS_NONE);
+        }
+        draw_button(g, &f.item, done, "완료", self.hover == Hit::DoneExclude, self.scale)?;
+        let at = self.seg[3].value();
+        draw_segments(g, f, self.exclude_tabs_rect(), &["DLC", "숨긴 곡"], (at, at + 1.0), lay::SEG_R, self.scale)
+    }
+
+    /// 탭마다 바뀌는 요약과 줄 목록, 줄이 없으면 빈 목록 띠 가운데에 문구
+    /// `shown`은 목록 자리에 걸치는 줄과 그 곡 재킷 (`exclude_shown`)
+    fn draw_exclude_list(&self, shown: &[(usize, Option<ID2D1Bitmap1>)]) -> Result<()> {
         let (g, f) = (self.gfx.as_ref().unwrap(), self.fonts.as_ref().unwrap());
         let dc = &g.dc;
         let left = self.px(lay::MARGIN + lay::INSET);
-        let right = self.px(lay::MARGIN + lay::W - lay::INSET);
-        let top = self.panel_top();
-        let text = g.brush(TEXT)?;
-        let faint = g.brush(FAINT)?;
-        let hover = g.brush(white(FILL_HOVER))?;
-        let title = g.layout("DLC", &f.head, self.dlc_done().left - left, self.px(22.0))?;
-        let summary = g.layout(&self.dlc_summary(), &f.sub, self.dlc_done().left - left - self.px(12.0), self.px(18.0))?;
+        let summary = g.layout(&self.exclude_summary(), &f.sub, self.exclude_done().left - left - self.px(12.0), self.px(18.0))?;
         unsafe {
-            dc.DrawTextLayout(gfx::pt(left, top + self.px(18.0)), &title, &text, D2D1_DRAW_TEXT_OPTIONS_NONE);
-            dc.DrawTextLayout(gfx::pt(left, top + self.px(42.0)), &summary, &faint, D2D1_DRAW_TEXT_OPTIONS_NONE);
+            dc.DrawTextLayout(gfx::pt(left - BEARING, self.panel_top() + self.px(42.0)), &summary, &g.brush(FAINT)?, D2D1_DRAW_TEXT_OPTIONS_NONE);
         }
-        draw_button(g, &f.item, self.dlc_done(), "완료", self.hover == Hit::DoneDlcs, self.scale)?;
-        let clip = self.dlc_clip();
-        let fade = self.px(8.0) / (clip.bottom - clip.top);
-        let stops = [(0.0, 0.0), (fade, 1.0), (1.0 - fade, 1.0), (1.0, 0.0)]
-            .map(|(position, a)| D2D1_GRADIENT_STOP { position, color: white(a) });
-        let brush = gfx::gradient(dc, &stops, gfx::pt(0.0, clip.top), gfx::pt(0.0, clip.bottom))?;
-        let mut layer = D2D1_LAYER_PARAMETERS1 {
-            contentBounds: clip,
-            opacityBrush: std::mem::ManuallyDrop::new(Some(brush.into())),
-            ..gfx::layer(1.0, None)
-        };
-        unsafe {
-            dc.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_ALIASED);
-            dc.PushLayer(&layer, None);
-        }
-        let opacity = std::mem::ManuallyDrop::into_inner(std::mem::replace(&mut layer.opacityBrush, std::mem::ManuallyDrop::new(None)));
+        let clip = self.exclude_clip();
+        unsafe { dc.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_ALIASED) };
         let result = (|| -> Result<()> {
-            for (i, row) in self.dlcs.iter().enumerate() {
-                let r = self.dlc_row_rect(i);
-                if r.bottom <= clip.top || r.top >= clip.bottom {
-                    continue;
-                }
-                let lit = self.dlc_focus.map_or(self.hover == Hit::DlcRow(i), |focus| focus == i);
-                let cy = (r.top + r.bottom) / 2.0;
-                let toggle = rect(right - self.px(lay::TOGGLE_W), cy - self.px(lay::TOGGLE_H / 2.0),
-                    right, cy + self.px(lay::TOGGLE_H / 2.0));
-                let count = format!("{}곡", row.pack.count);
-                let count_w = self.measure(&count, |f| &f.sub).ceil();
-                let name_w = self.measure(&row.pack.name, |f| &f.item_bold).ceil()
-                    .min((toggle.left - self.px(24.0) - count_w - left).max(0.0));
-                let name = g.layout(&row.pack.name, &f.item_bold, name_w, r.bottom - r.top)?;
-                let count = g.layout(&count, &f.sub, count_w, r.bottom - r.top)?;
-                unsafe {
-                    if lit {
-                        dc.FillRoundedRectangle(&rounded(r, self.px(12.0)), &hover);
-                    }
-                    name.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
-                    count.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
-                    let ink = if self.hidden_dlc().contains(&row.pack.code) { &faint } else { &text };
-                    dc.DrawTextLayout(gfx::pt(left, r.top), &name, ink, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
-                    dc.DrawTextLayout(gfx::pt(left + name_w + self.px(8.0), r.top), &count, &faint, D2D1_DRAW_TEXT_OPTIONS_NONE);
-                }
-                let m = &row.motion;
-                draw_toggle(g, toggle, (m.knob.value(), m.tint.value(), m.press.value()), lit, self.scale)?;
+            if self.exclude_rows.is_empty() {
+                return self.draw_exclude_empty(clip);
+            }
+            for (i, jacket) in shown {
+                self.draw_exclude_row(*i, jacket.as_ref())?;
             }
             Ok(())
         })();
-        unsafe {
-            dc.PopLayer();
-            dc.PopAxisAlignedClip();
-        }
-        drop(opacity);
+        unsafe { dc.PopAxisAlignedClip() };
         result
     }
 
+    /// 빈 목록 띠 가운데에 문구, 아랫줄이 있으면 두 줄 묶음을 가운데에 두고 사이 6
+    fn draw_exclude_empty(&self, clip: D2D_RECT_F) -> Result<()> {
+        let Some((title, sub)) = self.exclude_empty_text() else { return Ok(()) };
+        let (g, f) = (self.gfx.as_ref().unwrap(), self.fonts.as_ref().unwrap());
+        let (w, h) = (clip.right - clip.left, self.px(lay::EXCLUDE_EMPTY_H));
+        let gap = self.px(6.0);
+        let lines = [Some((title, &f.item, SUB)), sub.map(|s| (s, &f.sub, FAINT))];
+        let mut placed = Vec::new();
+        for (text, font, ink) in lines.into_iter().flatten() {
+            let l = g.layout(text, font, w, h)?;
+            let mut m = DWRITE_TEXT_METRICS::default();
+            unsafe {
+                l.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+                l.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR)?;
+                l.GetMetrics(&mut m)?;
+            }
+            placed.push((l, m.height, ink));
+        }
+        let total = placed.iter().map(|(_, lh, _)| lh).sum::<f32>() + gap * (placed.len() - 1) as f32;
+        let mut y = clip.top + ((h - total) / 2.0).round();
+        for (l, lh, ink) in placed {
+            unsafe { g.dc.DrawTextLayout(gfx::pt(clip.left, y), &l, &g.brush(ink)?, D2D1_DRAW_TEXT_OPTIONS_NONE) };
+            y += lh + gap;
+        }
+        Ok(())
+    }
+
+    /// 줄 하나: 호버·포커스면 채움, 팩은 이름과 곡 수, 곡은 결과 줄과 같은 재킷·제목·아랫줄, 오른쪽 16 정렬선에 토글
+    /// 켜진 줄은 결과 줄과 같은 색, 꺼 둔 줄은 글이 다 흐리고 곡 재킷은 반투명, 그 사이는 토글 색을 따라 섞음
+    fn draw_exclude_row(&self, i: usize, jacket: Option<&ID2D1Bitmap1>) -> Result<()> {
+        let (g, f) = (self.gfx.as_ref().unwrap(), self.fonts.as_ref().unwrap());
+        let dc = &g.dc;
+        let row = &self.exclude_rows[i];
+        let r = self.exclude_row_rect(i);
+        let lit = self.exclude_focus.map_or(self.hover == Hit::ExcludeRow(i), |focus| focus == i);
+        let on = alpha_step(row.motion.tint.value());
+        let ink = |c: D2D1_COLOR_F| g.brush(white(FAINT.a + (c.a - FAINT.a) * on));
+        let (title_b, sub_b, faint) = (ink(TEXT)?, ink(SUB)?, g.brush(FAINT)?);
+        let right = self.px(lay::MARGIN + lay::W - lay::INSET);
+        let cy = (r.top + r.bottom) / 2.0;
+        let toggle = rect(right - self.px(lay::TOGGLE_W), cy - self.px(lay::TOGGLE_H / 2.0), right, cy + self.px(lay::TOGGLE_H / 2.0));
+        if lit {
+            unsafe { dc.FillRoundedRectangle(&rounded(r, self.px(12.0)), &g.brush(white(FILL_HOVER))?) };
+        }
+        match &row.kind {
+            ExcludeKind::Dlc(pack) => {
+                let left = self.px(lay::MARGIN + lay::INSET);
+                let count = format!("{}곡", pack.count);
+                let count_w = self.measure(&count, |f| &f.sub).ceil();
+                let name_w = self.measure(&pack.name, |f| &f.item_bold).ceil()
+                    .min((toggle.left - self.px(24.0) - count_w - left).max(0.0));
+                let name = g.layout(&pack.name, &f.item_bold, name_w, r.bottom - r.top)?;
+                let count = g.layout(&count, &f.sub, count_w, r.bottom - r.top)?;
+                unsafe {
+                    name.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+                    count.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+                    dc.DrawTextLayout(gfx::pt(left - BEARING, r.top), &name, &title_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+                    dc.DrawTextLayout(gfx::pt(left - BEARING + name_w + self.px(8.0), r.top), &count, &faint, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                }
+            }
+            ExcludeKind::Song(s) => {
+                let song = &self.catalog.songs[*s];
+                if let Some(bmp) = jacket {
+                    draw_jacket(g, bmp, &self.jacket_slot(r.top), 0.5 + 0.5 * on)?;
+                }
+                self.draw_row_text(r.top, toggle.left - self.px(16.0), &song.name, &song.composer, self.sub_tail(song, false).as_deref(), (&title_b, &sub_b))?;
+            }
+        }
+        let m = &row.motion;
+        draw_toggle(g, toggle, (m.knob.value(), m.tint.value(), m.press.value()), lit, self.scale)
+    }
+
     fn toggle_settings(&mut self) {
-        self.set_view(if matches!(self.view, View::Settings | View::Dlcs) { View::Results } else { View::Settings });
+        self.set_view(if matches!(self.view, View::Settings | View::Exclude) { View::Results } else { View::Settings });
     }
 
     fn toggle_history(&mut self) {
         self.set_view(if self.view == View::History { View::Results } else { View::History });
     }
 
-    /// 히스토리 안에서 찾기 시작: 지금 입력·검색어·고른 결과 줄을 보관하고 입력 칸을 비움
+    /// 히스토리·검색 제외 시트 안에서 찾기 시작: 지금 입력·검색어·고른 결과 줄을 보관하고 입력 칸을 비움
     /// 조합 중인 글자는 원래 검색어에 넣어 둠
-    fn begin_history_search(&mut self) {
+    fn begin_list_search(&mut self, restore: Option<(Row, usize)>) {
         self.finish_input();
-        self.history_edit = Some(HistoryEdit {
+        self.list_edit = Some(SavedQuery {
             edit: std::mem::take(&mut self.edit),
             searched: std::mem::take(&mut self.searched),
+            // 다른 목록 시트로 넘어가도 처음 고른 결과 줄을 이어 감
             // 사본 없이 응답을 기다리는 플레이리스트면 응답 뒤에 고르려던 줄
-            row: self
-                .playlist
-                .as_ref()
-                .and_then(|p| p.restore)
+            row: restore
+                .or_else(|| self.playlist.as_ref().and_then(|p| p.restore))
                 .or_else(|| self.results.get(self.selected).copied().map(|row| (row, self.scroll))),
         });
         self.clear_input();
     }
 
-    /// 히스토리를 열기 전 입력과 검색어로 되돌리고 그때 고르던 결과 줄을 돌려줌, 찾던 글은 버림
+    /// 시트를 열기 전 입력·검색어·결과 선택으로 돌아감
     /// 검색창을 닫거나 다시 열 때도 불림, 찾던 글이 검색어로 남지 않게
-    fn restore_history_query(&mut self) -> Option<(Row, usize)> {
-        let h = self.history_edit.take()?;
+    fn restore_list_query(&mut self) -> Option<(Row, usize)> {
+        let h = self.list_edit.take()?;
         self.restore_saved_query(h)
     }
 
@@ -2782,11 +3070,11 @@ impl Popup {
         // 히스토리에서 연 시트가 보관한 건 히스토리에서 찾던 글이라 먼저 되돌려야 원래 검색어가 남음
         self.restore_roll_query();
         self.restore_keyword_query();
-        self.restore_history_query();
+        self.restore_list_query();
     }
 
     /// 보관한 입력·검색어로 되돌리고 그때 고르던 줄을 돌려줌
-    fn restore_saved_query(&mut self, saved: HistoryEdit) -> Option<(Row, usize)> {
+    fn restore_saved_query(&mut self, saved: SavedQuery) -> Option<(Row, usize)> {
         self.clear_input();
         self.edit = saved.edit;
         self.seen = self.edit.text().to_owned();
@@ -2808,7 +3096,7 @@ impl Popup {
 
     /// 버튼이 눌린 채 보이는 보기, 히스토리에서 연 키워드·뽑은 기록 시트는 히스토리 안의 한 단계라 히스토리
     fn bead_view(&self) -> View {
-        if self.view == View::Dlcs {
+        if self.view == View::Exclude {
             return View::Settings;
         }
         if let Some(r) = &self.roll_edit {
@@ -2900,7 +3188,10 @@ impl Popup {
             }
             _ => self.seen != was,
         };
-        if typing && matches!(self.view, View::Settings | View::Dlcs) {
+        if typing && self.view == View::Exclude {
+            self.exclude_focus = None;
+        }
+        if typing && self.view == View::Settings {
             // 설정에서 입력하면 그 글로 결과 화면으로 돌아감
             // 설정이 쓰는 키로 확정된 글자나 아직 기다리는 검색이면 그대로 둠
             self.search_now();
@@ -2946,6 +3237,8 @@ impl Popup {
         // 검색어를 지우면 사라지는 동안 지난 결과를 시트에 남겨 둠
         if self.view == View::Rolls {
             self.fill_rolls();
+        } else if self.view == View::Exclude {
+            self.fill_exclude();
         } else if self.view == View::History {
             self.fill_history();
         } else if !q.trim().is_empty() {
@@ -3006,6 +3299,7 @@ impl Popup {
             .entries
             .iter()
             .enumerate()
+            .filter(|(_, e)| !self.hidden_songs().contains(&e.pattern.title))
             .map(|(i, e)| self.pattern_row(e.pattern).unwrap_or(Row::Unavailable(i)))
             .collect();
         let random = rows.iter().any(|r| r.selectable()).then_some(Row::Random);
@@ -3029,8 +3323,8 @@ impl Popup {
             }
             Err(_) => {}
         }
-        // 히스토리나 키워드·뽑은 기록 시트 뒤에 숨은 검색도 이 플레이리스트면 결과를 바꿔 둠, 돌아갈 때 고르던 줄을 다시 고름
-        let query = self.history_edit.as_ref().map(|h| &h.edit)
+        // 히스토리·검색 제외나 키워드·뽑은 기록 시트 뒤에 숨은 검색도 이 플레이리스트면 결과를 바꿔 둠, 돌아갈 때 고르던 줄을 다시 고름
+        let query = self.list_edit.as_ref().map(|h| &h.edit)
             .or_else(|| self.keyword_edit.as_ref().map(|k| &k.edit))
             .or_else(|| self.roll_edit.as_ref().map(|r| &r.saved.edit))
             .map_or_else(|| self.query(), |edit| edit.text().to_owned());
@@ -3074,7 +3368,7 @@ impl Popup {
         let Some(Recent::Playlist { id, last }) = self.history_entries.get(i).cloned() else { return };
         self.complete_composition();
         // 보관한 원래 입력은 버리고 이 플레이리스트 주소로 바꿈
-        self.history_edit = None;
+        self.list_edit = None;
         self.clear_input();
         self.edit.insert(&playlist::url(&id));
         self.seen = self.query();
@@ -3340,7 +3634,7 @@ impl Popup {
 
     /// 결과 줄을 고를 수 있음: 검색 결과·히스토리·뽑은 기록, 검색어를 지운 뒤 사라지는 중인 줄은 아님
     fn listing(&self) -> bool {
-        !matches!(self.view, View::Keywords | View::Dlcs) && (!self.searched.trim().is_empty() || matches!(self.view, View::History | View::Rolls))
+        !matches!(self.view, View::Keywords | View::Exclude) && (!self.searched.trim().is_empty() || matches!(self.view, View::History | View::Rolls))
     }
 
     /// 고르는 목록 (`sel_of`)의 `i`번째 줄 자리 위쪽, 패널 위에서
@@ -3470,7 +3764,7 @@ impl Popup {
 
     /// 토글에서 손을 뗌, 노브가 원으로 돌아옴
     fn release_toggle(&mut self) {
-        self.release_dlc();
+        self.release_exclude();
         if let Some(toggle) = self.toggle_down.take() {
             self.toggles[toggle as usize].press.go(1.0, QUICK_SECS, QUICK_EASE);
             unsafe {
@@ -3479,9 +3773,9 @@ impl Popup {
         }
     }
 
-    /// 세그먼트마다 고른 칸: 모드, 난이도, 히스토리 탭
-    fn segment_choices(&self) -> [usize; 3] {
-        [self.mode_choice.index(), self.diff_choice.index(), self.history_tab as usize]
+    /// 세그먼트마다 고른 칸: 모드, 난이도, 히스토리 탭, 검색 제외 탭
+    fn segment_choices(&self) -> [usize; 4] {
+        [self.mode_choice.index(), self.diff_choice.index(), self.history_tab as usize, self.exclude_tab as usize]
     }
 
     fn snap_segments(&mut self) {
@@ -3511,8 +3805,8 @@ impl Popup {
     fn set_mode(&mut self, m: Mode) {
         self.mode_choice = m;
         let uses_mode = |q: &str| self.catalog.parse_filter(q).is_some_and(|f| f.uses_mode_setting());
-        // 히스토리 뒤에 숨은 원래 검색은 돌아갈 때 다시 찾음
-        if let Some(h) = self.history_edit.as_mut().filter(|h| uses_mode(&h.searched)) {
+        // 히스토리·검색 제외 시트 뒤에 숨은 원래 검색은 돌아갈 때 다시 찾음
+        if let Some(h) = self.list_edit.as_mut().filter(|h| uses_mode(&h.searched)) {
             h.searched.clear();
         }
         if uses_mode(&self.searched) {
@@ -3533,6 +3827,10 @@ impl Popup {
 
     fn input_hint(&self) -> &'static str {
         match self.view {
+            View::Exclude => match self.exclude_tab {
+                ExcludeTab::Dlc => "DLC 찾기",
+                ExcludeTab::Songs => "숨길 곡 찾기",
+            },
             View::Rolls => "나온 곡에서 찾기",
             View::Keywords => "추가할 키워드를 입력해 주세요",
             View::History if self.history_tab == HistoryTab::Favorites => "즐겨찾기에서 찾기",
@@ -3657,7 +3955,7 @@ impl Popup {
             WM_CHAR => {
                 // BMP 밖 글자 (이모지)는 UTF-16 두 조각으로 옴, 앞 조각을 들고 있다가 합침 (짝이 안 맞으면 버림)
                 let c = wp.0 as u32;
-                if self.view == View::Dlcs && c == 0x20 {
+                if c == 0x20 && self.space_toggles_row() {
                     return Some((0, Action::None));
                 }
                 let ch = match c {
@@ -3711,7 +4009,7 @@ impl Popup {
                     let real = unsafe { ImmGetVirtualKey(self.hwnd) };
                     vk = VIRTUAL_KEY(real as u16);
                     if matches!(vk, VK_RETURN | VK_UP | VK_DOWN | VK_LEFT | VK_RIGHT | VK_HOME | VK_END | VK_DELETE | VK_ESCAPE | VK_PRIOR | VK_NEXT | VK_TAB)
-                        || (self.view == View::Dlcs && vk == VK_SPACE) {
+                        || (vk == VK_SPACE && self.space_toggles_row()) {
                         // 한국어 Windows 관례: Enter·화살표는 글자를 확정하고 동작도 함
                         self.complete_composition();
                     } else {
@@ -3734,9 +4032,8 @@ impl Popup {
                     self.cycle_diff(if vk == VK_LEFT { -1 } else { 1 });
                     return Some((0, Action::Choice));
                 }
-                // 히스토리 탭은 왼쪽·오른쪽 방향키로 바꿈, 입력 중엔 캐럿을 옮기니 안 바꿈
-                if self.view == View::History && !self.typed() && matches!(vk, VK_LEFT | VK_RIGHT) {
-                    self.set_history_tab(if vk == VK_LEFT { HistoryTab::Recent } else { HistoryTab::Favorites });
+                // 히스토리·검색 제외 탭은 왼쪽·오른쪽 방향키로 바꿈, 입력 중엔 캐럿을 옮기니 안 바꿈
+                if !self.typed() && matches!(vk, VK_LEFT | VK_RIGHT) && self.arrow_tab(vk == VK_RIGHT) {
                     return Some((0, Action::None));
                 }
                 if vk == VK_TAB {
@@ -3762,27 +4059,10 @@ impl Popup {
                     }
                     return Some((0, Action::None));
                 }
-                let act = if self.view == View::Dlcs {
-                    match vk {
-                        VK_ESCAPE => {
-                            self.close_dlcs();
-                            Action::None
-                        }
-                        VK_UP | VK_DOWN => {
-                            self.move_dlc(if vk == VK_UP { -1 } else { 1 });
-                            Action::None
-                        }
-                        VK_SPACE | VK_RETURN if lp.0 & (1 << 30) == 0 => match self.dlc_focus {
-                            Some(i) => self.toggle_dlc(i),
-                            // 고른 줄이 없으면 첫 줄을 고르기만 함
-                            None => {
-                                self.move_dlc(0);
-                                Action::None
-                            }
-                        },
-                        _ => Action::None,
-                    }
-                } else if self.view == View::Settings {
+                if let Some(action) = self.exclude_key(vk, lp.0 & (1 << 30) != 0) {
+                    return Some((0, action));
+                }
+                let act = if self.view == View::Settings {
                     let f = self.kb_focus.unwrap_or(0);
                     match vk {
                         VK_ESCAPE => {
@@ -3823,7 +4103,7 @@ impl Popup {
                             }
                         }
                         VK_RETURN if f == 2 => {
-                            self.open_dlcs();
+                            self.open_exclude();
                             Action::None
                         }
                         VK_RETURN if f == 3 => Action::Scan,
@@ -3959,8 +4239,8 @@ impl Popup {
                 if self.last_mouse.replace(pos) == Some(pos) {
                     return Some((0, Action::None));
                 }
-                if self.view == View::Dlcs {
-                    self.dlc_focus = None;
+                if self.view == View::Exclude {
+                    self.exclude_focus = None;
                 }
                 if let Hit::Row(i) = self.hover {
                     // 스크롤 중 목록 밖으로 나가는 줄엔 강조 자리가 없음, 고를 수 없는 줄은 호버해도 그대로
@@ -3986,7 +4266,7 @@ impl Popup {
             WM_MOUSEWHEEL => {
                 // 한 칸에 한 줄, 정밀 휠과 터치패드는 모아서 칸으로 셈
                 let d = ((wp.0 >> 16) as i16) as i32;
-                if matches!(self.view, View::Results | View::History | View::Rolls | View::Dlcs) {
+                if matches!(self.view, View::Results | View::History | View::Rolls | View::Exclude) {
                     if d.signum() != self.wheel_acc.signum() {
                         self.wheel_acc = 0; // 방향 바뀜
                     }
@@ -3996,11 +4276,11 @@ impl Popup {
                     if rows != 0 {
                         let mut p = POINT { x: lp.0 as i16 as i32, y: (lp.0 >> 16) as i16 as i32 }; // 화면 좌표
                         let _ = unsafe { windows::Win32::Graphics::Gdi::ScreenToClient(self.hwnd, &mut p) };
-                        if self.view == View::Dlcs {
-                            self.dlc_focus = None;
+                        if self.view == View::Exclude {
+                            self.exclude_focus = None;
                             self.last_mouse = Some((p.x, p.y));
-                            self.scroll_dlcs(-rows);
-                            self.refresh_dlc_hover();
+                            self.scroll_exclude(-rows);
+                            self.refresh_exclude_hover();
                             return Some((0, Action::None));
                         }
                         self.search_now();
@@ -4029,6 +4309,8 @@ impl Popup {
                 let act = match hit {
                     Hit::Text => {
                         // 조합 중인 글자는 확정하고, Shift를 누른 채면 선택을 넓힘
+                        // 고른 줄은 풂, 커서를 안 움직이고 누르면 이동 메시지로는 안 풀려서 Space가 줄을 토글함
+                        self.exclude_focus = None;
                         self.complete_composition();
                         let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
                         self.edit.move_to(self.text_index(x), shift);
@@ -4057,19 +4339,23 @@ impl Popup {
                         self.kb_focus = None;
                         Action::Choice
                     }
-                    Hit::Dlcs => {
+                    Hit::Exclude => {
                         self.kb_focus = None;
-                        self.open_dlcs();
+                        self.open_exclude();
                         Action::None
                     }
-                    Hit::DoneDlcs => {
-                        self.close_dlcs();
+                    Hit::DoneExclude => {
+                        self.close_exclude();
                         Action::None
                     }
-                    Hit::DlcRow(i) => {
-                        self.dlc_focus = None;
-                        self.dlc_down = Some(i);
-                        self.dlcs[i].motion.press.go(PRESS_Y, PRESS_SECS, PRESS_EASE);
+                    Hit::ExcludeTab(tab) => {
+                        self.set_exclude_tab(tab);
+                        Action::None
+                    }
+                    Hit::ExcludeRow(i) => {
+                        self.exclude_focus = None;
+                        self.exclude_down = Some(i);
+                        self.exclude_rows[i].motion.press.go(PRESS_Y, PRESS_SECS, PRESS_EASE);
                         unsafe { SetCapture(self.hwnd); }
                         Action::None
                     }
@@ -4129,12 +4415,12 @@ impl Popup {
                 self.end_drag();
                 Some((0, Action::None))
             }
-            WM_LBUTTONUP if self.dlc_down.is_some() => {
+            WM_LBUTTONUP if self.exclude_down.is_some() => {
                 let (x, y) = (lp.0 as i16 as f32, (lp.0 >> 16) as i16 as f32);
-                let i = self.dlc_down.unwrap();
-                let over = self.hit(x, y) == Hit::DlcRow(i);
-                self.release_dlc();
-                Some((0, if over { self.toggle_dlc(i) } else { Action::None }))
+                let i = self.exclude_down.unwrap();
+                let over = self.hit(x, y) == Hit::ExcludeRow(i);
+                self.release_exclude();
+                Some((0, if over { self.toggle_exclude(i) } else { Action::None }))
             }
             WM_LBUTTONUP if self.toggle_down.is_some() => {
                 let (x, y) = (lp.0 as i16 as f32, (lp.0 >> 16) as i16 as f32);
@@ -4149,8 +4435,8 @@ impl Popup {
             }
             WM_CAPTURECHANGED => {
                 self.dragging = false;
-                if let Some(i) = self.dlc_down.take() {
-                    self.dlcs[i].motion.press.go(1.0, QUICK_SECS, QUICK_EASE);
+                if let Some(i) = self.exclude_down.take() {
+                    self.exclude_rows[i].motion.press.go(1.0, QUICK_SECS, QUICK_EASE);
                 }
                 // 다른 데로 캡처를 뺏기면 안 바꾸고 놓음
                 if let Some(toggle) = self.toggle_down.take() {
@@ -4333,21 +4619,42 @@ impl Popup {
         Ok(l)
     }
 
+    /// 위쪽이 `y`인 줄의 재킷 자리: 줄 강조 안쪽 8에 32 x 32로 세로 가운데, 모서리는 줄 강조와 동심
+    fn jacket_slot(&self, y: f32) -> D2D1_ROUNDED_RECT {
+        let size = self.px(32.0);
+        let (x, top) = (self.px(lay::MARGIN) + self.px(lay::PAD) + self.px(8.0), y + (self.px(lay::ROW_H) - size) / 2.0);
+        rrect(x, top, x + size, top + size, self.px(lay::PANEL_R - lay::PAD - 8.0))
+    }
+
+    /// 위쪽이 `y`인 줄의 제목과 아랫줄, 재킷 자리 오른쪽 10부터 `right`까지 (넘치면 말줄임)
+    /// 결과·히스토리·뽑은 기록·키워드·검색 제외의 곡 줄과 무작위 줄이 같이 씀
+    /// 레벨 칸이 맞추게 제목·아랫줄의 글자 기준선 y를 돌려줌
+    fn draw_row_text(&self, y: f32, right: f32, title: &str, sub: &str, tail: Option<&str>, (title_b, sub_b): (&ID2D1SolidColorBrush, &ID2D1SolidColorBrush)) -> Result<(f32, f32)> {
+        let (g, f) = (self.gfx.as_ref().unwrap(), self.fonts.as_ref().unwrap());
+        let x = self.jacket_slot(y).rect.right + self.px(10.0);
+        let (title_y, sub_y) = (y + self.px(6.67), y + self.px(26.67));
+        let tl = g.layout(title, &f.title, right - x, self.px(19.0))?;
+        unsafe { g.dc.DrawTextLayout(gfx::pt(x, title_y), &tl, title_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT) };
+        let sl = self.draw_sub(x, sub_y, right - x, sub, tail, sub_b)?;
+        Ok((title_y + baseline(&tl), sub_y + baseline(&sl)))
+    }
+
     /// 위쪽이 `y`인 무작위로 고르기 줄: 재킷 자리에 셔플 아이콘, 제목과 아랫줄 `note`는 `right` 왼쪽 8까지
     /// 결과·히스토리 목록의 무작위 줄과 뽑은 기록 맨 위 줄이 같이 씀
     fn draw_random_row(&self, y: f32, right: f32, note: &str) -> Result<()> {
-        let (g, f) = (self.gfx.as_ref().unwrap(), self.fonts.as_ref().unwrap());
-        let text_b = g.brush(TEXT)?;
-        let jsz = self.px(32.0);
-        let (jx, jy) = (self.px(lay::MARGIN) + self.px(lay::PAD) + self.px(8.0), y + (self.px(lay::ROW_H) - jsz) / 2.0);
-        unsafe { g.dc.FillRoundedRectangle(&rrect(jx, jy, jx + jsz, jy + jsz, self.px(lay::PANEL_R - lay::PAD - 8.0)), &g.brush(white(FILL_HOVER))?) };
-        g.fill_icon(Icon::Random, jx + jsz / 2.0, jy + jsz / 2.0, self.px(lay::ICON), &text_b)?;
-        let tx = jx + jsz + self.px(10.0);
-        let tw = right - self.px(8.0) - tx;
-        let tl = g.layout("무작위로 고르기", &f.title, tw, self.px(19.0))?;
-        unsafe { g.dc.DrawTextLayout(gfx::pt(tx, y + self.px(6.67)), &tl, &text_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT) };
-        self.draw_sub(tx, y + self.px(26.67), tw, note, None, &g.brush(SUB)?)?;
+        let g = self.gfx.as_ref().unwrap();
+        self.draw_slot_icon(y, Icon::Random)?;
+        self.draw_row_text(y, right - self.px(8.0), "무작위로 고르기", note, None, (&g.brush(TEXT)?, &g.brush(SUB)?))?;
         Ok(())
+    }
+
+    /// 재킷 자리에 곡 대신 아이콘: 옅은 채움 가운데에 글자색 아이콘 (무작위 줄, 히스토리의 플레이리스트 줄)
+    fn draw_slot_icon(&self, y: f32, icon: Icon) -> Result<()> {
+        let g = self.gfx.as_ref().unwrap();
+        let slot = self.jacket_slot(y);
+        unsafe { g.dc.FillRoundedRectangle(&slot, &g.brush(white(FILL_HOVER))?) };
+        let r = slot.rect;
+        g.fill_icon(icon, (r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0, self.px(lay::ICON), &g.brush(TEXT)?)
     }
 
     fn draw_frame(&mut self) -> Result<()> {
@@ -4361,11 +4668,11 @@ impl Popup {
         self.update_reveal(now);
         self.sel_y.step(dt);
         self.scroll_s.step(dt);
-        self.dlc_scroll_s.step(dt);
-        if self.dlc_scroll_s.settled() {
-            self.dlc_scroll_s.snap(self.dlc_scroll_s.target);
+        self.exclude_scroll_s.step(dt);
+        if self.exclude_scroll_s.settled() {
+            self.exclude_scroll_s.snap(self.exclude_scroll_s.target);
         }
-        self.refresh_dlc_hover();
+        self.refresh_exclude_hover();
         if self.scroll_s.settled() {
             self.scroll_s.snap(self.scroll_s.target); // 정수 픽셀에서 멈춰야 글자가 선명함
         }
@@ -4406,6 +4713,13 @@ impl Popup {
             .collect();
         let jackets: Vec<Option<ID2D1Bitmap1>> = ids.iter().map(|id| id.and_then(|id| self.jacket(id))).collect();
         let kw_jacket = self.keyword_song().map(|s| s.id).and_then(|id| self.jacket(id));
+        // 검색 제외 목록 자리에 걸치는 줄과 곡 줄 재킷
+        let exclude_ids: Vec<(usize, Option<u32>)> = if self.sheet == Sheet::Exclude {
+            self.exclude_shown().into_iter().map(|i| (i, self.exclude_rows[i].kind.song().map(|s| self.catalog.songs[s].id))).collect()
+        } else {
+            Vec::new()
+        };
+        let exclude_shown: Vec<_> = exclude_ids.into_iter().map(|(i, id)| (i, id.and_then(|id| self.jacket(id)))).collect();
 
         let g = self.gfx.as_ref().unwrap();
         let f = self.fonts.as_ref().unwrap();
@@ -4505,8 +4819,6 @@ impl Popup {
 
                 let floor_b = g.brush(FAINT)?;
                 let off_b = g.brush(DISABLED)?;
-                let jsz = self.px(32.0);
-                let jr = self.px(lay::PANEL_R - lay::PAD - 8.0);
                 let lvl_w = self.px(self.level_w());
                 let lvl_r = panel.right - inset - self.px(8.0);
                 // 줄은 줄 영역 안에서 미끄러짐 (멈추면 딱 보이는 줄만이라 잘림 없음)
@@ -4544,32 +4856,21 @@ impl Popup {
                             (Cow::Borrowed(song.name.as_str()), Cow::Borrowed(song.composer.as_str()), tail)
                         }
                     };
-                    let jx = panel.left + inset + self.px(8.0);
-                    let jy = y + (self.px(lay::ROW_H) - jsz) / 2.0;
+                    let slot = self.jacket_slot(y);
                     // 고를 수 없는 줄은 제자리에 흐리게
                     let dim = matches!(row, Row::Unavailable(_));
                     match row {
                         // 재킷 자리에 아이콘: 히스토리의 플레이리스트는 목록
-                        Row::Playlist(_) => {
-                            dc.FillRoundedRectangle(&rrect(jx, jy, jx + jsz, jy + jsz, jr), &g.brush(white(FILL_HOVER))?);
-                            g.fill_icon(Icon::Playlist, jx + jsz / 2.0, jy + jsz / 2.0, icon_box, &text_b)?;
-                        }
+                        Row::Playlist(_) => self.draw_slot_icon(y, Icon::Playlist)?,
                         _ => match &jackets[k] {
-                            Some(bmp) => draw_jacket(g, bmp, jx, jy, jsz, jr, if dim { DISABLED.a } else { 1.0 })?,
+                            Some(bmp) => draw_jacket(g, bmp, &slot, if dim { DISABLED.a } else { 1.0 })?,
                             // 곡 데이터에 없는 곡은 빈 재킷 자리
-                            None if dim && ids[k].is_none() => {
-                                dc.FillRoundedRectangle(&rrect(jx, jy, jx + jsz, jy + jsz, jr), &g.brush(white(FILL_TRACK))?);
-                            }
+                            None if dim && ids[k].is_none() => dc.FillRoundedRectangle(&slot, &g.brush(white(FILL_TRACK))?),
                             None => {}
                         },
                     }
                     let (title_b, line_b) = if dim { (&off_b, &off_b) } else { (&text_b, &sub_b) };
-                    let tx = jx + jsz + self.px(10.0);
-                    let tw = lvl_r - lvl_w - self.px(8.0) - tx;
-                    let (title_y, sub_y) = (y + self.px(6.67), y + self.px(26.67));
-                    let tl = g.layout(&title, &f.title, tw, self.px(19.0))?;
-                    dc.DrawTextLayout(gfx::pt(tx, title_y), &tl, title_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
-                    let sl_ = self.draw_sub(tx, sub_y, tw, &sub, tail.as_deref(), line_b)?;
+                    let (title_base, sub_base) = self.draw_row_text(y, lvl_r - lvl_w - self.px(8.0), &title, &sub, tail.as_deref(), (title_b, line_b))?;
 
                     // 레벨 칸: 레벨 "HD 11"은 곡 이름과, 서열표 "13.4"는 아랫줄과 같은 글자 기준선
                     // 그 모드·난이도 패턴이 없는 곡은 비우고 (플레이리스트·뽑은 기록은 채보만), 서열표가 없는 패턴은 아래만 비움
@@ -4578,12 +4879,12 @@ impl Popup {
                     let lx = lvl_r - lvl_w;
                     let ll = g.layout(&label, &f.item_bold, lvl_w, self.px(20.0))?;
                     ll.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)?;
-                    dc.DrawTextLayout(gfx::pt(lx, title_y + baseline(&tl) - baseline(&ll)), &ll, title_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                    dc.DrawTextLayout(gfx::pt(lx, title_base - baseline(&ll)), &ll, title_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
                     if let Some(fl) = floor {
                         let fl = g.layout(&format!("{fl:.1}"), &f.sub, lvl_w, self.px(16.0))?;
                         fl.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)?;
                         let fb = if dim { &off_b } else { &floor_b };
-                        dc.DrawTextLayout(gfx::pt(lx, sub_y + baseline(&sl_) - baseline(&fl)), &fl, fb, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                        dc.DrawTextLayout(gfx::pt(lx, sub_base - baseline(&fl)), &fl, fb, D2D1_DRAW_TEXT_OPTIONS_NONE);
                     }
                 }
                 dc.PopAxisAlignedClip();
@@ -4632,7 +4933,7 @@ impl Popup {
                 dc.DrawTextLayout(gfx::pt(l0t, top), &l, b, D2D1_DRAW_TEXT_OPTIONS_NONE);
                 Ok(())
             };
-            // 시트 내용 (다 편 시트 자리), 히스토리는 제자리 탭 아래에 겹쳐 바꾸는 줄 목록 `list`
+            // 시트 내용 (다 편 시트 자리), 히스토리·검색 제외는 제자리 탭 아래에 겹쳐 바꾸는 줄 목록 `list`
             let draw_sheet = |list: Option<&ID2D1Image>| -> Result<()> {
                 if self.sheet == Sheet::Settings {
                     let sl = self.settings_layout();
@@ -4657,19 +4958,19 @@ impl Popup {
                         let at = self.seg[k].value();
                         (at, at + 1.0)
                     };
-                    draw_segments(g, f, sl.mode, &Mode::ALL.map(Mode::label), thumb(0), 9.0, s)?;
-                    draw_segments(g, f, sl.diff, &Diff::ALL.map(Diff::label), thumb(1), 9.0, s)?;
+                    draw_segments(g, f, sl.mode, &Mode::ALL.map(Mode::label), thumb(0), lay::SEG_R, s)?;
+                    draw_segments(g, f, sl.diff, &Diff::ALL.map(Diff::label), thumb(1), lay::SEG_R, s)?;
                     let note_b = g.brush(FAINT)?;
                     let lt = g.layout("내 곡 목록", &f.item_bold, self.px(200.0), self.px(20.0))?;
                     dc.DrawTextLayout(gfx::pt(l0t, sl.list_title), &lt, &text_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
                     let label = if self.owned.is_some() { "다시 인식" } else { "목록 인식" };
                     draw_button(g, &f.item, sl.rescan, label, matches!(self.hover, Hit::Rescan) || self.kb_focus == Some(3), s)?;
                     if self.owned.is_some() {
-                        draw_button(g, &f.item, sl.dlcs, "DLC 설정", self.hover == Hit::Dlcs || self.kb_focus == Some(2), s)?;
+                        draw_button(g, &f.item, sl.exclude, "검색 제외", self.hover == Hit::Exclude || self.kb_focus == Some(2), s)?;
                     } else {
-                        draw_button_off(g, &f.item, sl.dlcs, "DLC 설정", s)?;
+                        draw_button_off(g, &f.item, sl.exclude, "검색 제외", s)?;
                     }
-                    let nl2 = g.layout(&self.dlc_note(), &f.sub, sl.dlcs.left - self.px(12.0) - l0, self.px(18.0))?;
+                    let nl2 = g.layout(&self.exclude_note(), &f.sub, sl.exclude.left - self.px(12.0) - l0, self.px(18.0))?;
                     dc.DrawTextLayout(gfx::pt(l0t, sl.list_note), &nl2, &note_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
                     // 단축키: 새 조합을 기다리는 동안 버튼이 눌린 채, 못 받으면 아랫줄에 잠깐 이유
                     let ht = g.layout("검색창 단축키", &f.item_bold, self.px(200.0), self.px(20.0))?;
@@ -4695,22 +4996,19 @@ impl Popup {
                         let m = &self.toggles[toggle as usize];
                         draw_toggle(g, r, (m.knob.value(), m.tint.value(), m.press.value()), self.hover == Hit::Toggle(toggle) || self.kb_focus == Some(focus), s)?;
                     }
-                } else if self.sheet == Sheet::Dlcs {
-                    self.draw_dlcs()?;
+                } else if self.sheet == Sheet::Exclude {
+                    self.draw_exclude_head()?;
+                    if let Some(list) = list {
+                        dc.DrawImage(list, None, None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
+                    }
                 } else if let (Sheet::Keywords, Some(song)) = (self.sheet, self.keyword_song()) {
                     let kl = self.keyword_layout();
                     // 곡 줄: 결과 줄과 같은 재킷·제목·아랫줄 (선택 강조 없음), 레벨 칸 자리에 별과 완료 버튼
                     let y = ct + self.px(lay::PAD);
-                    let jsz = self.px(32.0);
-                    let (jx, jy) = (panel.left + self.px(lay::PAD) + self.px(8.0), y + (self.px(lay::ROW_H) - jsz) / 2.0);
                     if let Some(bmp) = &kw_jacket {
-                        draw_jacket(g, bmp, jx, jy, jsz, self.px(lay::PANEL_R - lay::PAD - 8.0), 1.0)?;
+                        draw_jacket(g, bmp, &self.jacket_slot(y), 1.0)?;
                     }
-                    let tx = jx + jsz + self.px(10.0);
-                    let tw = kl.fav.left - self.px(8.0) - tx;
-                    let tl = g.layout(&song.name, &f.title, tw, self.px(19.0))?;
-                    dc.DrawTextLayout(gfx::pt(tx, y + self.px(6.67)), &tl, &text_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
-                    self.draw_sub(tx, y + self.px(26.67), tw, &song.composer, self.sub_tail(song, false).as_deref(), &sub_b)?;
+                    self.draw_row_text(y, kl.fav.left - self.px(8.0), &song.name, &song.composer, self.sub_tail(song, false).as_deref(), (&text_b, &sub_b))?;
                     draw_button(g, &f.item, kl.done, "완료", self.hover == Hit::Done, s)?;
                     // 별 버튼: 완료와 같은 바탕에 별, 꺼지면 테두리만 글자색, 켜지면 테두리도 노랑으로 바뀌고 노랑 채움을 겹침 (`StarMotion`)
                     // 켤 땐 가운데를 중심으로 눌렸다 돌아오고 버튼 가운데에서 점이 튐
@@ -4785,9 +5083,13 @@ impl Popup {
             };
 
             // 3) 패널 내용 기록: 바꾸는 중이면 옛 그림과 섞어서 7)에서 그리고, 다음 프레임에 보기·카드·탭이 바뀌면 이게 옛 그림이 됨 (`Crossfade`)
-            // 히스토리 줄 목록은 탭만 바뀔 때 혼자 섞으려고 먼저 따로 기록
+            // 히스토리·검색 제외 줄 목록은 탭만 바뀔 때 혼자 섞으려고 먼저 따로 기록
             if has_panel {
-                let list = if self.sheet == Sheet::History { Some(self.list_swap.compose(g, record(dc, draw_list)?)?) } else { None };
+                let list = match self.sheet {
+                    Sheet::History => Some(self.list_swap.compose(g, record(dc, draw_list)?)?),
+                    Sheet::Exclude => Some(self.list_swap.compose(g, record(dc, || self.draw_exclude_list(&exclude_shown))?)?),
+                    _ => None,
+                };
                 sheet_drawn = Some(self.sheet_swap.compose(g, record(dc, || draw_sheet(list.as_ref().map(|(l, _)| l)))?)?);
                 list_drawn = list;
             }
@@ -4989,16 +5291,17 @@ fn baseline(l: &IDWriteTextLayout) -> f32 {
     m[0].baseline
 }
 
-/// 재킷을 (`x`, `y`)에서 한 변 `size`로 줄여 둥근 사각형에 채움, 불투명도 `alpha`
-fn draw_jacket(g: &Gfx, bmp: &ID2D1Bitmap1, x: f32, y: f32, size: f32, rad: f32, alpha: f32) -> Result<()> {
+/// 재킷을 둥근 자리 `slot`에 줄여 채움, 불투명도 `alpha`
+fn draw_jacket(g: &Gfx, bmp: &ID2D1Bitmap1, slot: &D2D1_ROUNDED_RECT, alpha: f32) -> Result<()> {
     unsafe {
+        let r = slot.rect;
         let bb = g.dc.CreateBitmapBrush(bmp, None, None)?;
         let sz = bmp.GetPixelSize();
-        let sc = size / sz.width as f32;
-        bb.SetTransform(&windows_numerics::Matrix3x2 { M11: sc, M12: 0.0, M21: 0.0, M22: sc, M31: x, M32: y });
+        let sc = (r.right - r.left) / sz.width as f32;
+        bb.SetTransform(&windows_numerics::Matrix3x2 { M11: sc, M12: 0.0, M21: 0.0, M22: sc, M31: r.left, M32: r.top });
         bb.SetInterpolationMode1(D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
         bb.SetOpacity(alpha);
-        g.dc.FillRoundedRectangle(&rrect(x, y, x + size, y + size, rad), &bb);
+        g.dc.FillRoundedRectangle(slot, &bb);
     }
     Ok(())
 }

@@ -26,6 +26,7 @@ pub struct Catalog {
     keywords: Option<Keywords>,
     /// 검색에서 뺀 팩 코드, 곡 데이터를 바꿔도 이어 감
     hidden_dlc: HashSet<String>,
+    hidden_songs: HashSet<u32>,
     /// 데이터의 팩 이름 표 (코드, 이름), 표시 순서대로
     dlc_names: Vec<(String, String)>,
 }
@@ -42,6 +43,7 @@ impl Catalog {
             jacket_dir: data_dir.join(JACKETS_DIR),
             keywords: None,
             hidden_dlc: HashSet::new(),
+            hidden_songs: HashSet::new(),
             dlc_names: Vec::new(),
         }
     }
@@ -58,6 +60,7 @@ impl Catalog {
             jacket_dir: data_dir.join(JACKETS_DIR),
             keywords: None,
             hidden_dlc: HashSet::new(),
+            hidden_songs: HashSet::new(),
             dlc_names: core.dlcs.clone(),
         })
     }
@@ -67,10 +70,11 @@ impl Catalog {
         Arc::new(self.songs.iter().map(|song| (song.id, song.name.clone())).collect())
     }
 
-    /// 교체 직전 목록의 키워드·저장 경로와 꺼 둔 팩을 옮긴 뒤 새 곡에 다시 적용
+    /// 교체 직전 목록의 키워드·저장 경로와 검색 제외 설정을 옮긴 뒤 새 곡에 다시 적용
     pub fn inherit(&mut self, previous: &mut Self) {
         self.keywords = previous.keywords.take();
         self.hidden_dlc = std::mem::take(&mut previous.hidden_dlc);
+        self.hidden_songs = std::mem::take(&mut previous.hidden_songs);
         self.reindex();
     }
 
@@ -88,6 +92,24 @@ impl Catalog {
             true
         } else {
             self.hidden_dlc.insert(code.to_owned());
+            false
+        }
+    }
+
+    pub fn hidden_songs(&self) -> &HashSet<u32> {
+        &self.hidden_songs
+    }
+
+    pub fn set_hidden_songs(&mut self, hidden: HashSet<u32>) {
+        self.hidden_songs = hidden;
+    }
+
+    /// 팩 토글과 같이 검색 허용이면 true
+    pub fn toggle_song(&mut self, id: u32) -> bool {
+        if self.hidden_songs.remove(&id) {
+            true
+        } else {
+            self.hidden_songs.insert(id);
             false
         }
     }
@@ -153,15 +175,26 @@ impl Catalog {
         Ok(())
     }
 
-    /// 고를 수 있는 곡, `owned`가 없으면 전부 (첫 인식 전), 꺼 둔 팩 곡은 늘 뺌
+    /// `owned`가 없으면 전부 (첫 인식 전)
+    fn owns(&self, i: usize, owned: Option<&HashSet<u32>>) -> bool {
+        owned.is_none_or(|o| o.contains(&self.songs[i].id))
+    }
+
+    /// 고를 수 있는 곡, 꺼 둔 팩과 숨긴 곡은 늘 뺌
     fn allowed(&self, i: usize, owned: Option<&HashSet<u32>>) -> bool {
-        owned.is_none_or(|o| o.contains(&self.songs[i].id)) && !self.hidden_dlc.contains(&self.songs[i].dlc_code)
+        let song = &self.songs[i];
+        self.owns(i, owned) && !self.hidden_dlc.contains(&song.dlc_code) && !self.hidden_songs.contains(&song.id)
     }
 
     /// `songs` 인덱스를 잘 맞는 순으로, `owned`가 있으면 그 곡 id 안에서만
     /// 키 입력마다 불림 (IME 조합 중 포함)
     pub fn search(&self, query: &str, limit: usize, owned: Option<&HashSet<u32>>) -> Vec<usize> {
         self.searcher.search_where(query, limit, |i| self.allowed(i, owned)).into_iter().map(|h| h.index).collect()
+    }
+
+    /// `search`와 같지만 꺼 둔 팩·숨긴 곡도 찾음, 숨김을 풀 곡을 찾는 데 씀
+    pub fn search_owned(&self, query: &str, limit: usize, owned: Option<&HashSet<u32>>) -> Vec<usize> {
+        self.searcher.search_where(query, limit, |i| self.owns(i, owned)).into_iter().map(|h| h.index).collect()
     }
 
     /// 검색어가 조건 검색이면 그 조건, 패턴 특성 이름은 지금 곡 데이터에 있는 것만
