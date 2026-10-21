@@ -4302,12 +4302,6 @@ impl Popup {
     /// 메시지를 처리했으면 Some(action)
     pub fn handle(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<(isize, Action)> {
         match msg {
-            WM_IME_SETCONTEXT => {
-                // 조합 중인 글자는 직접 그림, 후보 창 (한자)은 남겨 둠
-                let lp = LPARAM(lp.0 & !(ISC_SHOWUICOMPOSITIONWINDOW as isize));
-                let r = unsafe { DefWindowProcW(self.hwnd, msg, wp, lp) };
-                Some((r.0, Action::None))
-            }
             WM_IME_STARTCOMPOSITION => {
                 self.set_keyword_note(None);
                 // 선택이 있으면 먼저 지우고 그 자리에서 조합 (검색은 이어 오는 조합 메시지가 함)

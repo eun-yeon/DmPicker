@@ -24,6 +24,7 @@ mod toast;
 mod tray;
 mod update;
 
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,6 +35,7 @@ use windows::core::{w, Result, HSTRING};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::UI::Input::Ime::ISC_SHOWUICOMPOSITIONWINDOW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_NOREPEAT, VIRTUAL_KEY};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -48,6 +50,8 @@ const TIMER_FOREGROUND: usize = 1; // 검색창 창의 타이머, popup.rs의 TI
 const WM_APP_STATUS: u32 = WM_APP + 1;
 /// 단축키 뒤 화면 확인이 끝남 (`request_open`)
 const WM_APP_OPEN: u32 = WM_APP + 2;
+/// 빌린 채로 받은 검색창 비활성, 기본 처리는 이미 했고 앱 처리만 뒤로 미룸
+const WM_APP_INACTIVE: u32 = WM_APP + 4;
 
 /// 작업 스레드가 올리고 UI 스레드가 알림에 띄우는 상태 문구
 struct Status {
@@ -84,10 +88,17 @@ struct App {
 /// 단축키 뒤 화면 확인 결과: 선곡 목록이 보였으면 Some(그 화면, 그 목록에서 고를 수 있는 곡, 첫 인식 전엔 None)
 type Peeked = Option<(ScreenKind, Option<HashSet<u32>>)>;
 
-static mut APP: *mut App = std::ptr::null_mut();
+thread_local! {
+    // 종료 때 앱을 해제하지 않도록 누출한 참조만 보관
+    static APP: Cell<Option<&'static RefCell<App>>> = const { Cell::new(None) };
+    static POPUP: Cell<HWND> = const { Cell::new(HWND(std::ptr::null_mut())) };
+}
 
-fn app() -> Option<&'static mut App> {
-    unsafe { APP.as_mut() }
+/// 아직 초기화 전이거나 이미 빌린 상태면 건너뜀
+fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
+    let cell = APP.with(Cell::get)?;
+    let mut guard = cell.try_borrow_mut().ok()?;
+    Some(f(&mut guard))
 }
 
 fn store_dir() -> PathBuf {
@@ -369,7 +380,10 @@ fn on_scan(a: &mut App) {
 }
 
 /// 검색창이 돌려준 동작 처리, 그 뒤 검색창을 다시 그림
-fn on_action(a: &mut App, act: Action) {
+/// 브라우저 열기는 빌림 밖에서 하게 돌려줌
+#[must_use]
+fn on_action(a: &mut App, act: Action) -> Option<After> {
+    let mut after = None;
     match act {
         Action::Pick(id, chart) => on_pick(a, id, chart, None),
         Action::PlaylistPick(id, pattern) => on_pick(a, pattern.title, Some((pattern.mode, pattern.diff)), Some(id)),
@@ -382,9 +396,7 @@ fn on_action(a: &mut App, act: Action) {
         }
         // 브라우저가 포커스를 가져가면 검색창은 평소처럼 닫힘
         Action::Release => {
-            if let Err(e) = a.updates.open_page() {
-                eprintln!("release page: {e}");
-            }
+            after = Some(After::Open(a.updates.release_url()));
         }
         Action::Hide => a.popup.hide(),
         Action::Choice => {
@@ -410,6 +422,7 @@ fn on_action(a: &mut App, act: Action) {
     }
     if !a.popup.is_open() { a.updates.closed(); }
     request_playlist(a);
+    after
 }
 
 /// 검색창이 플레이리스트 주소를 검색했으면 작업 스레드로 받아 오기 시작
@@ -579,106 +592,164 @@ fn quit(a: &mut App) {
     unsafe { PostQuitMessage(0) };
 }
 
+/// 빌림을 놓은 뒤 할 일, 둘 다 모달 루프가 돌 수 있음
+enum After {
+    Menu { tray: HWND, x: i32, y: i32, hotkey: Hotkey },
+    Open(String),
+}
+
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    if let Some(a) = app() {
-        if hwnd == a.tray.hwnd {
-            if let Some((x, y)) = a.tray.clicked(msg, wp, lp) {
-                // 메뉴가 떠 있는 동안은 메시지 루프가 멈춰 닫기 애니메이션이 안 돎
-                a.popup.hide_now();
-                a.updates.closed();
-                match a.tray.menu(x, y, a.popup.hotkey) {
-                    Some(tray::Menu::ResetHotkey) => reset_hotkey(a),
-                    Some(tray::Menu::Quit) => quit(a),
-                    None => {}
-                }
-                return LRESULT(0);
-            }
-        }
-        if msg == WM_SETCURSOR && hwnd == a.popup.hwnd && (lp.0 & 0xFFFF) as u32 == HTCLIENT && a.popup.wants_ibeam() {
-            unsafe {
-                SetCursor(LoadCursorW(None, IDC_IBEAM).ok());
-            }
-            return LRESULT(1);
-        }
-        if msg == WM_HOTKEY && wp.0 as i32 == HOTKEY_ID {
-            if a.popup.is_open() && a.popup.waiting_hotkey() {
-                // 새 단축키를 기다리는 중 지금 단축키를 누름: 검색창이 받은 조합으로 침
-                let (mods, vk) = (HOT_KEY_MODIFIERS((lp.0 & 0xFFFF) as u32), VIRTUAL_KEY((lp.0 >> 16) as u16));
-                let act = a.popup.take_hotkey(mods, vk);
-                on_action(a, act);
-                return LRESULT(0);
-            }
-            if let Some((c, _)) = a.job.as_ref().filter(|(_, h)| !h.is_finished()) {
-                c.store(true, Ordering::Relaxed); // 단축키는 돌고 있는 작업을 취소함
-                println!("CANCEL");
-                return LRESULT(0);
-            }
-            if a.popup.is_open() {
-                a.popup.hide();
-                a.updates.closed();
-            } else {
-                request_open(a);
-                request_playlist(a);
-            }
-            return LRESULT(0);
-        }
-        if msg == WM_TIMER && wp.0 == TIMER_FOREGROUND {
-            sync_hotkey(a);
-            a.popup.settle();
-            a.toast.settle();
-            update_tick(a);
-            a.toast.tick();
-            return LRESULT(0);
-        }
-        if msg == WM_APP_OPEN {
-            a.peeking = false;
-            if let Some(handle) = a.peek_job.take() { let _ = handle.join(); }
-            let found = a.peeked.lock().unwrap().take();
-            // 확인하는 동안 다른 창으로 넘어갔으면 (Alt+Tab, 트레이 메뉴) 버림
-            let game_front = capture::find_game_window().is_some_and(input::is_foreground);
-            if let (Some((kind, owned)), true) = (found, game_front) {
-                a.open_kind = Some(kind);
-                a.popup.show(owned, a.stale.load(Ordering::Relaxed));
-                // Windows가 포커스를 안 주면 바로 숨김, 보이는데 글자는 게임으로 가는 일이 없게
-                if unsafe { GetForegroundWindow() } != a.popup.hwnd {
-                    eprintln!("open: no focus, hidden");
-                    a.popup.hide_now();
-                }
-                update_opened(a);
-                show_update_notice(a);
-            }
-            request_playlist(a);
-            return LRESULT(0);
-        }
-        if msg == playlist::READY {
-            while let Some(reply) = a.playlists.take() {
-                a.popup.playlist_reply(reply);
-            }
-            on_action(a, Action::None);
-            return LRESULT(0);
-        }
-        if msg == WM_APP_STATUS {
-            if let Some(st) = a.status.lock().unwrap().take() {
-                a.toast.show(&st.text, st.badge, st.secs);
-            }
-            return LRESULT(0);
-        }
-        if msg == WM_ENDSESSION && wp.0 != 0 {
-            quit(a);
-            return LRESULT(0);
-        }
-        if hwnd == a.popup.hwnd && a.popup.is_open() {
-            if let Some((ret, act)) = a.popup.handle(msg, wp, lp) {
-                on_action(a, act);
-                return LRESULT(ret);
-            }
-        }
+    if msg == WM_IME_SETCONTEXT && hwnd == POPUP.with(Cell::get) {
+        // 조합 중인 글자는 직접 그림, 후보 창 (한자)은 남겨 둠
+        let lp = LPARAM(lp.0 & !(ISC_SHOWUICOMPOSITIONWINDOW as isize));
+        return unsafe { DefWindowProcW(hwnd, msg, wp, lp) };
     }
     if msg == WM_DESTROY {
         unsafe { PostQuitMessage(0) };
         return LRESULT(0);
     }
-    unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+    let Some(cell) = APP.with(Cell::get) else { return unsafe { DefWindowProcW(hwnd, msg, wp, lp) } };
+    let Ok(mut guard) = cell.try_borrow_mut() else { return reentered(hwnd, msg, wp, lp) };
+    let (ret, after) = on_message(&mut guard, hwnd, msg, wp, lp);
+    drop(guard);
+    match after {
+        Some(After::Menu { tray, x, y, hotkey }) => {
+            let pick = tray::Tray::menu(tray, x, y, hotkey);
+            with_app(|a| match pick {
+                Some(tray::Menu::ResetHotkey) => reset_hotkey(a),
+                Some(tray::Menu::Quit) => quit(a),
+                None => {}
+            });
+        }
+        Some(After::Open(url)) => {
+            if let Err(e) = update::open_url(&url) {
+                eprintln!("release page: {e}");
+            }
+        }
+        None => {}
+    }
+    ret.unwrap_or_else(|| unsafe { DefWindowProcW(hwnd, msg, wp, lp) })
+}
+
+/// 앱 상태를 빌린 채 부른 Win32 호출 안에서 다시 들어온 메시지, 앱 상태 없이 정해 둔 대로만 처리
+fn reentered(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    match msg {
+        // 조합 결과는 부른 쪽이 넣음, 기본 처리로 넘기면 WM_CHAR로 또 들어옴
+        // 타이머는 다음 차례에 다시 옴
+        WM_IME_STARTCOMPOSITION | WM_IME_COMPOSITION | WM_IME_ENDCOMPOSITION | WM_TIMER => LRESULT(0),
+        WM_ACTIVATE if hwnd == POPUP.with(Cell::get) && (wp.0 & 0xFFFF) as u32 == WA_INACTIVE => {
+            unsafe {
+                let _ = PostMessageW(Some(hwnd), WM_APP_INACTIVE, WPARAM(0), LPARAM(0));
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
+        }
+        // 버리면 안 되는 메시지, 빌림이 풀린 뒤 다시 받음 (WM_APP_OPEN을 잃으면 peeking이 안 풀림)
+        msg if matches!(msg, WM_HOTKEY | WM_ENDSESSION | WM_APP..=0xBFFF) || msg == tray::taskbar_created() => {
+            unsafe { let _ = PostMessageW(Some(hwnd), msg, wp, lp); }
+            LRESULT(0)
+        }
+        _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
+    }
+}
+
+fn on_message(a: &mut App, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> (Option<LRESULT>, Option<After>) {
+    if hwnd == a.tray.hwnd {
+        if let Some((x, y)) = a.tray.clicked(msg, wp, lp) {
+            // 메뉴가 떠 있는 동안은 메시지 루프가 멈춰 닫기 애니메이션이 안 돎
+            a.popup.hide_now();
+            a.updates.closed();
+            return (Some(LRESULT(0)), Some(After::Menu { tray: a.tray.hwnd, x, y, hotkey: a.popup.hotkey }));
+        }
+    }
+    if msg == WM_SETCURSOR && hwnd == a.popup.hwnd && (lp.0 & 0xFFFF) as u32 == HTCLIENT && a.popup.wants_ibeam() {
+        unsafe {
+            SetCursor(LoadCursorW(None, IDC_IBEAM).ok());
+        }
+        return (Some(LRESULT(1)), None);
+    }
+    if msg == WM_HOTKEY && wp.0 as i32 == HOTKEY_ID {
+        if a.popup.is_open() && a.popup.waiting_hotkey() {
+            // 새 단축키를 기다리는 중 지금 단축키를 누름: 검색창이 받은 조합으로 침
+            let (mods, vk) = (HOT_KEY_MODIFIERS((lp.0 & 0xFFFF) as u32), VIRTUAL_KEY((lp.0 >> 16) as u16));
+            let act = a.popup.take_hotkey(mods, vk);
+            let after = on_action(a, act);
+            return (Some(LRESULT(0)), after);
+        }
+        if let Some((c, _)) = a.job.as_ref().filter(|(_, h)| !h.is_finished()) {
+            c.store(true, Ordering::Relaxed); // 단축키는 돌고 있는 작업을 취소함
+            println!("CANCEL");
+            return (Some(LRESULT(0)), None);
+        }
+        if a.popup.is_open() {
+            a.popup.hide();
+            a.updates.closed();
+        } else {
+            request_open(a);
+            request_playlist(a);
+        }
+        return (Some(LRESULT(0)), None);
+    }
+    if msg == WM_TIMER && wp.0 == TIMER_FOREGROUND {
+        sync_hotkey(a);
+        a.popup.settle();
+        a.toast.settle();
+        update_tick(a);
+        a.toast.tick();
+        return (Some(LRESULT(0)), None);
+    }
+    if msg == WM_APP_INACTIVE {
+        if hwnd == a.popup.hwnd && a.popup.is_open() {
+            if let Some((_, act)) = a.popup.handle(WM_ACTIVATE, WPARAM(WA_INACTIVE as usize), LPARAM(0)) {
+                let after = on_action(a, act);
+                return (Some(LRESULT(0)), after);
+            }
+        }
+        return (Some(LRESULT(0)), None);
+    }
+    if msg == WM_APP_OPEN {
+        a.peeking = false;
+        if let Some(handle) = a.peek_job.take() { let _ = handle.join(); }
+        let found = a.peeked.lock().unwrap().take();
+        // 확인하는 동안 다른 창으로 넘어갔으면 (Alt+Tab, 트레이 메뉴) 버림
+        let game_front = capture::find_game_window().is_some_and(input::is_foreground);
+        if let (Some((kind, owned)), true) = (found, game_front) {
+            a.open_kind = Some(kind);
+            a.popup.show(owned, a.stale.load(Ordering::Relaxed));
+            // Windows가 포커스를 안 주면 바로 숨김, 보이는데 글자는 게임으로 가는 일이 없게
+            if unsafe { GetForegroundWindow() } != a.popup.hwnd {
+                eprintln!("open: no focus, hidden");
+                a.popup.hide_now();
+            }
+            update_opened(a);
+            show_update_notice(a);
+        }
+        request_playlist(a);
+        return (Some(LRESULT(0)), None);
+    }
+    if msg == playlist::READY {
+        while let Some(reply) = a.playlists.take() {
+            a.popup.playlist_reply(reply);
+        }
+        let after = on_action(a, Action::None);
+        return (Some(LRESULT(0)), after);
+    }
+    if msg == WM_APP_STATUS {
+        if let Some(st) = a.status.lock().unwrap().take() {
+            a.toast.show(&st.text, st.badge, st.secs);
+        }
+        return (Some(LRESULT(0)), None);
+    }
+    if msg == WM_ENDSESSION && wp.0 != 0 {
+        quit(a);
+        return (Some(LRESULT(0)), None);
+    }
+    if hwnd == a.popup.hwnd && a.popup.is_open() {
+        if let Some((ret, act)) = a.popup.handle(msg, wp, lp) {
+            let after = on_action(a, act);
+            return (Some(LRESULT(ret)), after);
+        }
+    }
+    (None, None)
 }
 
 fn main() -> Result<()> {
@@ -706,6 +777,7 @@ fn main() -> Result<()> {
 
         let ex = WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOREDIRECTIONBITMAP;
         let hwnd = sys::create_popup(w!("DmPickerPopup"), APP_NAME, ex, Some(wndproc))?;
+        POPUP.with(|c| c.set(hwnd));
         let toast = Toast::new(Some(wndproc))?;
         let tray = tray::Tray::new(Some(wndproc))?;
 
@@ -717,7 +789,7 @@ fn main() -> Result<()> {
         let refs = startup.refs.clone();
         let initial_refs = startup.active.has_data().then(|| update::start_initial(store_dir(), dir.clone()));
         let updates = update::Updater::new(store_dir(), dir.clone(), &startup);
-        let mut app_box = Box::new(App {
+        let app: &'static RefCell<App> = Box::leak(Box::new(RefCell::new(App {
             popup: Popup::new(hwnd, startup.catalog),
             toast,
             tray,
@@ -736,34 +808,38 @@ fn main() -> Result<()> {
             peeked: Arc::new(Mutex::new(None)),
             open_kind: None,
             playlists: playlist::Loader::default(),
-        });
-        load_settings(&mut app_box.popup);
-        app_box.toast.set_glass(app_box.popup.glass);
-        app_box.popup.load_history(store_dir());
-        app_box.popup.warm_up();
-        APP = Box::into_raw(app_box);
+        })));
+        {
+            let mut guard = app.borrow_mut();
+            let a = &mut *guard;
+            load_settings(&mut a.popup);
+            a.toast.set_glass(a.popup.glass);
+            a.popup.load_history(store_dir());
+            a.popup.warm_up();
+        }
+        APP.with(|c| c.set(Some(app)));
         SetTimer(Some(hwnd), TIMER_FOREGROUND, 250, None);
-        if let Some(a) = app() {
+        with_app(|a| {
             sync_hotkey(a);
             start_update(a);
             println!("ready: {} on the song list", a.popup.hotkey.label());
-        }
+        });
 
         let mut msg = MSG::default();
         const FRAME: std::time::Duration = std::time::Duration::from_micros(1_000_000 / gfx::MAX_FPS as u64);
         let mut frame_start = std::time::Instant::now();
         loop {
-            let animating = app().map(|a| a.popup.animating() || a.toast.animating()).unwrap_or(false);
+            let animating = with_app(|a| a.popup.animating() || a.toast.animating()).unwrap_or(false);
             if animating {
                 while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
                     if msg.message == WM_QUIT {
-                        if let Some(a) = app() { stop_all(a); }
+                        with_app(stop_all);
                         return Ok(());
                     }
                     let _ = TranslateMessage(&msg);
                     DispatchMessageW(&msg);
                 }
-                if let Some(a) = app() {
+                with_app(|a| {
                     if a.popup.visible && a.popup.animating() {
                         if let Err(e) = a.popup.render() {
                             eprintln!("render error: {e:?}");
@@ -772,7 +848,7 @@ fn main() -> Result<()> {
                     if a.toast.animating() {
                         a.toast.frame();
                     }
-                }
+                });
                 // Present가 이미 프레임 vblank를 기다림 (Gfx::sync), 여긴 곧장 돌아올 때 (창이 가려짐) 헛돌지 않게만 함
                 // 입력이 오면 바로 깨어남
                 let spent = frame_start.elapsed();
@@ -783,7 +859,7 @@ fn main() -> Result<()> {
                 frame_start = std::time::Instant::now();
             } else {
                 if !GetMessageW(&mut msg, None, 0, 0).as_bool() {
-                    if let Some(a) = app() { stop_all(a); }
+                    with_app(stop_all);
                     return Ok(());
                 }
                 let _ = TranslateMessage(&msg);

@@ -382,7 +382,7 @@ fn release_page(state: &UpdateState) -> String {
     exe_release(state).map_or_else(|| feed::EXE_LATEST_URL.to_owned(), |r| r.page_url())
 }
 
-fn open_url(url: &str) -> std::io::Result<()> {
+pub fn open_url(url: &str) -> std::io::Result<()> {
     use windows::core::{w, HSTRING, PCWSTR};
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
@@ -618,9 +618,9 @@ impl Updater {
         }
     }
 
-    /// 안내 카드의 릴리즈 페이지 버튼
-    pub fn open_page(&self) -> std::io::Result<()> {
-        open_url(&release_page(&self.state))
+    /// 안내 카드의 릴리즈 페이지 버튼이 여는 주소
+    pub fn release_url(&self) -> String {
+        release_page(&self.state)
     }
 
     /// 설정 시트 머리 줄 문구, 새 버전이 있으면 그 안내 (true면 조금 밝게)

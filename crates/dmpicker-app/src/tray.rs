@@ -43,10 +43,14 @@ pub struct Tray {
     icon: HICON,
 }
 
+pub fn taskbar_created() -> u32 {
+    unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) }
+}
+
 impl Tray {
     pub fn new(wndproc: WNDPROC) -> Result<Self> {
         let hwnd = sys::create_popup(w!("DmPickerTray"), APP_NAME, WS_EX_TOOLWINDOW, wndproc)?;
-        let taskbar_created = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
+        let taskbar_created = taskbar_created();
         let tray = Self { hwnd, taskbar_created, icon: load_icon().unwrap_or_default() };
         tray.add();
         Ok(tray)
@@ -100,7 +104,7 @@ impl Tray {
 
     /// 메뉴를 띄우고 시작 시 실행은 여기서 처리, 앱이 할 항목을 고르면 그 항목
     /// `hotkey`가 기본값이 아니면 되돌리기 항목을 켬 (다른 프로그램이 단축키를 가져가면 빠져나올 길)
-    pub fn menu(&self, x: i32, y: i32, hotkey: Hotkey) -> Option<Menu> {
+    pub fn menu(hwnd: HWND, x: i32, y: i32, hotkey: Hotkey) -> Option<Menu> {
         unsafe {
             let menu = CreatePopupMenu().ok()?;
             let on = autostart_on();
@@ -112,11 +116,11 @@ impl Tray {
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
             let _ = AppendMenuW(menu, MF_STRING, ID_QUIT as usize, w!("종료"));
             // 앞으로 가져와야 메뉴 밖을 눌렀을 때 닫히고, 닫은 뒤 WM_NULL을 보내야 다음 클릭에 바로 뜸
-            let _ = SetForegroundWindow(self.hwnd);
+            let _ = SetForegroundWindow(hwnd);
             let align = if GetSystemMetrics(SM_MENUDROPALIGNMENT) != 0 { TPM_RIGHTALIGN } else { TPM_LEFTALIGN };
             let flags = TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON | align;
-            let cmd = TrackPopupMenuEx(menu, flags.0, x, y, self.hwnd, None).0 as u32;
-            let _ = PostMessageW(Some(self.hwnd), WM_NULL, WPARAM(0), LPARAM(0));
+            let cmd = TrackPopupMenuEx(menu, flags.0, x, y, hwnd, None).0 as u32;
+            let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
             let _ = DestroyMenu(menu);
             match cmd {
                 ID_AUTOSTART => {
