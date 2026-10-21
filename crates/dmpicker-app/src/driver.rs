@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use dmpicker_engine::capture::{self, CaptureMethod, Hwnd};
 use dmpicker_engine::input::{self, Key as EKey, PopupKey};
 use dmpicker_engine::state::{classify, layout_kind};
-use dmpicker_engine::{features, read_window, room, sort, tabs, Candidate, Feature, ListGeom, RefSet, RowRead, ScreenKind, FEAT_LEN, RANDOM_ID};
+use dmpicker_engine::{features, read_window, room, sort, tabs, Candidate, Feature, ListGeom, RefSet, RowRead, ScreenKind, FEAT_LEN, NROWS, RANDOM_ID, SEL_ROW};
 use dmpicker_nav::{order_key, Abort, ButtonMode, Entry, GameIo, Key as NKey, ListModel, NavConfig, NavError, Navigator, Observation, OrderKey, TimingTuner};
 use dmpicker_search::Diff;
 use windows::Win32::UI::Shell::{SHQueryUserNotificationState, QUNS_RUNNING_D3D_FULL_SCREEN};
@@ -26,6 +26,7 @@ macro_rules! diagnostic {
 }
 
 const ALIGN_SIM: f32 = 0.85;
+const GOOD_READ: f32 = 0.6;
 /// 저장된 게임 내 특징이 계산 방식과 안 맞게 되면 `dmpicker_engine::features::FEATURE_VERSION`과 같이 올림
 const LEARN_MAGIC: &[u8; 8] = b"PICKLST3";
 
@@ -263,7 +264,7 @@ impl Learned {
         };
         let (best, second) = self.in_order(i, row, titles, &b);
         let best = best?;
-        (best.score >= 0.6 && best.score - second >= dmpicker_engine::read::SURE_MARGIN).then_some(best.id)
+        (best.score >= GOOD_READ && best.score - second >= dmpicker_engine::read::SURE_MARGIN).then_some(best.id)
     }
 
     /// 칸 `i`가 곡 `id`일 수 있음, 다른 칸이 그 곡이 아니고 RANDOM도 아님
@@ -545,7 +546,7 @@ fn row_matches(row: &RowRead, e: &LEntry) -> bool {
         return row.is_random;
     }
     if let Some(id) = e.id {
-        if row.cands.iter().take(3).any(|c| c.id == id && c.score >= 0.6) {
+        if row.cands.iter().take(3).any(|c| c.id == id && c.score >= GOOD_READ) {
             return true;
         }
     }
@@ -553,7 +554,7 @@ fn row_matches(row: &RowRead, e: &LEntry) -> bool {
 }
 
 /// `m[k][i]`: 화면 `k`번째 줄이 저장 목록 `i`번 칸을 보여줌
-fn match_table(rows: &[RowRead; 11], learned: &Learned) -> Vec<Vec<bool>> {
+fn match_table(rows: &[RowRead; NROWS], learned: &Learned) -> Vec<Vec<bool>> {
     rows.iter().map(|r| learned.entries.iter().map(|e| row_matches(r, e)).collect()).collect()
 }
 
@@ -579,7 +580,7 @@ fn locate(m: &[Vec<bool>]) -> (Option<usize>, usize) {
 }
 
 /// 화면 창이 저장 목록(제목 순서를 따름) 안에 자리가 있음
-fn placed(rows: &[RowRead; 11], learned: &Learned) -> bool {
+fn placed(rows: &[RowRead; NROWS], learned: &Learned) -> bool {
     locate(&match_table(rows, learned)).0.is_some()
 }
 
@@ -599,7 +600,7 @@ fn greyed(row: &RowRead, refs: &RefSet) -> bool {
 /// 온라인 화면에 목록에 없는 LOCKED 곡이 보임 (프리스타일 목록으로는 알 수 없는 안 푼 히든곡)
 /// 나머지 줄이 모두 그 줄을 기준으로 한 칸 밀린 목록과 맞을 때 찾음
 /// (넣을 위치, 화면 줄)을 돌려줌
-fn find_missing_locked(rows: &[RowRead; 11], m: &[Vec<bool>], refs: &RefSet) -> Option<(usize, usize)> {
+fn find_missing_locked(rows: &[RowRead; NROWS], m: &[Vec<bool>], refs: &RefSet) -> Option<(usize, usize)> {
     let n = m[0].len();
     if n < rows.len() {
         return None;
@@ -631,7 +632,7 @@ fn locked_entry(row: &RowRead, learned: &Learned) -> LEntry {
     let id = row
         .cands
         .first()
-        .filter(|c| c.score >= 0.6 && c.id != RANDOM_ID && learned.index_of(c.id).is_none())
+        .filter(|c| c.score >= GOOD_READ && c.id != RANDOM_ID && learned.index_of(c.id).is_none())
         .map(|c| c.id);
     LEntry { id, random: false, locked: true, feat: quant(&row.feature) }
 }
@@ -645,7 +646,7 @@ pub struct LiveIo<'a> {
     pub cancel: &'a AtomicBool,
     hands: &'a HandsOff,
     /// 멈춘 목록에서 이미 읽은 창, 첫 확인 때 새 프레임 대신 씀
-    pub first: Option<[RowRead; 11]>,
+    pub first: Option<[RowRead; NROWS]>,
     /// 온라인 목록에 없던 LOCKED 칸 (넣을 위치, 칸)
     /// 이게 생기면 `read_pos`가 [`Abort::ListChanged`]로 이동을 멈춤
     pub found: Option<(usize, LEntry)>,
@@ -662,7 +663,7 @@ pub struct LiveIo<'a> {
 impl LiveIo<'_> {
     /// 멈춘 목록의 11줄, 줄이 멈춘 자리 격자에 붙은 연속 두 프레임이 같은 위치로 읽혀야 함
     /// 스크롤 중에도 줄을 지날 때마다 격자에 잠깐 붙어서 한 프레임으로는 못 믿음
-    fn still_rows(&mut self) -> Result<Option<[RowRead; 11]>, Abort> {
+    fn still_rows(&mut self) -> Result<Option<[RowRead; NROWS]>, Abort> {
         let t0 = Instant::now();
         let mut prev: Option<Option<usize>> = None;
         let mut freeze = Freeze::default();
@@ -796,7 +797,7 @@ impl Seen {
     fn quality(&self) -> f32 {
         let top = self.cands.first().map(|c| c.score).unwrap_or(0.0);
         let margin = top - self.cands.get(1).map(|c| c.score).unwrap_or(0.0);
-        let edge = if self.row == 0 || self.row == 10 { 0.25 } else { 0.0 };
+        let edge = if self.row == 0 || self.row == NROWS - 1 { 0.25 } else { 0.0 };
         top + margin + if self.sure { 0.5 } else { 0.0 } - edge
     }
 }
@@ -844,7 +845,7 @@ fn firm(a: &Seen, b: &Seen) -> bool {
     if a.random || b.random {
         return a.random && b.random;
     }
-    matches!((a.cands.first(), b.cands.first()), (Some(x), Some(y)) if x.id == y.id && x.score >= 0.6 && y.score >= 0.6)
+    matches!((a.cands.first(), b.cands.first()), (Some(x), Some(y)) if x.id == y.id && x.score >= GOOD_READ && y.score >= GOOD_READ)
 }
 
 /// 인식 진행 단계, 토스트 표시용
@@ -1058,7 +1059,7 @@ impl HandsOff {
 /// 구간은 첫 창 위쪽 절반(한 번만 읽힘)을 건너뛰고 서로 다른 `WRAP_FIRM`곡이 잘 읽힌 곳에 둠
 /// 아무 두 구간이면 되니 어느 바퀴가 약하게 읽혀도 끝을 못 찾거나 한 바퀴 늦게 찾지 않음
 fn wrap_length(seq: &HashMap<i64, Seen>, lo: i64, hi: i64) -> Option<usize> {
-    let well_read = |p: i64| seq.get(&p).filter(|s| !s.random).and_then(|s| s.cands.first()).filter(|c| c.score >= 0.6).map(|c| c.id);
+    let well_read = |p: i64| seq.get(&p).filter(|s| !s.random).and_then(|s| s.cands.first()).filter(|c| c.score >= GOOD_READ).map(|c| c.id);
     let clear = |r: i64| (r..r + WRAP_SPAN).filter_map(well_read).collect::<HashSet<_>>().len() >= WRAP_FIRM;
     let mut stretches = Vec::new();
     let mut r = lo + READ_ONCE;
@@ -1355,7 +1356,7 @@ fn scan_timed(
             }
         }
         for (k, r) in rows.iter().enumerate() {
-            let p = pos - 5 + k as i64;
+            let p = pos - SEL_ROW as i64 + k as i64;
             let better = seq.get(&p).map(|old| r.quality() > old.quality()).unwrap_or(true);
             if better {
                 seq.insert(p, r.clone());

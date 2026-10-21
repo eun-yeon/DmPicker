@@ -85,6 +85,22 @@ const BEAD_GEAR: usize = 1;
 /// 두 버튼 시차: 나올 땐 히스토리 다음 톱니, 들어갈 땐 톱니 다음 히스토리
 const BEAD_STAGGER: Duration = Duration::from_millis(70);
 
+/// 설정 시트 키보드 포커스 (`kb_focus`), 화살표로 오가는 위에서 아래 순서
+const FOCUS_MODE: usize = 0;
+const FOCUS_DIFF: usize = 1;
+const FOCUS_EXCLUDE: usize = 2;
+const FOCUS_RESCAN: usize = 3;
+const FOCUS_HOTKEY: usize = 4;
+const FOCUS_KEEP: usize = 5;
+const FOCUS_DLC: usize = 6;
+const FOCUS_GLASS: usize = 7;
+
+/// 세그먼트 컨트롤 (`seg`) 자리
+const SEG_MODE: usize = 0;
+const SEG_DIFF: usize = 1;
+const SEG_HISTORY: usize = 2;
+const SEG_EXCLUDE: usize = 3;
+
 /// 논리 (96 dpi) 레이아웃, 검색창 전체 너비는 늘 `W`
 mod lay {
     pub const W: f32 = 540.0;
@@ -904,7 +920,7 @@ pub struct Popup {
     wheel_acc: i32, // 아직 줄로 안 바꾼 휠 값 (정밀 휠, 터치패드)
     view: View,
     sheet: Sheet,
-    kb_focus: Option<usize>, // 설정 키보드 포커스: 0 모드, 1 난이도, 2 검색 제외, 3 다시 인식, 4 단축키, 5 검색어 유지, 6 DLC 표시, 7 유리 효과
+    kb_focus: Option<usize>, // 설정 키보드 포커스 (`FOCUS_*`)
     settings_room: f32, // 패널 위에서 기준 영역 아래 16까지 px, 설정 시트가 더 길면 줄여서 스크롤
     settings_scroll_s: Spring, // 설정 내용을 올린 px, 멈추면 정수
     settings_scrolling: bool, // 스크롤이 멈춘 프레임까지 참, 그동안 커서 아래 호버를 다시 봄
@@ -1878,7 +1894,7 @@ impl Popup {
 
     /// 키보드 포커스 `focus`가 든 묶음, 다시 인식은 검색 제외와 같은 묶음
     fn settings_group(&self, focus: usize) -> (f32, f32) {
-        self.settings_groups()[if focus <= 2 { focus } else { focus - 1 }]
+        self.settings_groups()[if focus <= FOCUS_EXCLUDE { focus } else { focus - 1 }]
     }
 
     /// 다 들어가면 다 편 높이, 아니면 묶음 가운데 절반 안에서 잘라 반쯤 보이는 줄로 아래가 더 있음을 알림
@@ -2448,11 +2464,23 @@ impl Popup {
         self.keyword_song().is_some_and(|s| self.library.is_favorite(s.id))
     }
 
-    /// 키워드 시트의 곡을 즐겨찾기에 넣거나 빼고, 바뀐 상태를 돌려줌
+    /// 키워드 시트의 곡을 즐겨찾기에 넣거나 빼고 지금 상태를 돌려줌, 저장 못 하면 이유를 보여 주고 별은 그대로
     /// 별 모션은 지금 보이는 채움에서 새로 시작, 켤 때마다 점을 새로 뽑음
     fn toggle_sheet_favorite(&mut self) -> bool {
         let Some(id) = self.keyword_song().map(|s| s.id) else { return false };
-        let on = self.library.toggle_favorite(id);
+        let on = match self.library.toggle_favorite(id) {
+            Ok(on) => {
+                // 다른 안내와 지우려고 고른 칩은 그대로 둠
+                if self.keyword_note() == Some(playlist::FAVORITES_SAVE_FAILED) {
+                    self.set_keyword_note(None);
+                }
+                on
+            }
+            Err(note) => {
+                self.set_keyword_note(Some(note));
+                return self.library.is_favorite(id);
+            }
+        };
         let from = self.star.as_ref().map_or(!on as u8 as f32, |m| m.fill(m.elapsed()));
         self.star = Some(StarMotion::new(from, on, &mut self.rng));
         on
@@ -3019,12 +3047,12 @@ impl Popup {
     /// 설정 포커스 이동, 처음 누른 화살표는 첫 컨트롤로, 첫 인식 전엔 검색 제외 버튼을 건너뜀
     /// 유리 효과를 못 쓰면 그 토글엔 안 감
     fn move_settings(&mut self, d: i32) {
-        let mut next = self.kb_focus.map_or(0, |i| (i as i32 + d).clamp(0, 7) as usize);
-        if next == 2 && self.owned.is_none() {
-            next = if d > 0 { 3 } else { 1 };
+        let mut next = self.kb_focus.map_or(FOCUS_MODE, |i| (i as i32 + d).clamp(FOCUS_MODE as i32, FOCUS_GLASS as i32) as usize);
+        if next == FOCUS_EXCLUDE && self.owned.is_none() {
+            next = if d > 0 { FOCUS_RESCAN } else { FOCUS_DIFF };
         }
-        if next == 7 && self.glass_unavailable().is_some() {
-            next = 6;
+        if next == FOCUS_GLASS && self.glass_unavailable().is_some() {
+            next = FOCUS_DLC;
         }
         self.focus_settings(next);
     }
@@ -3271,7 +3299,7 @@ impl Popup {
             g.dc.DrawTextLayout(gfx::pt(left - BEARING, self.panel_top() + self.px(lay::PAD + 6.67)), &title, &g.brush(TEXT)?, D2D1_DRAW_TEXT_OPTIONS_NONE);
         }
         draw_button(g, &f.item, done, "완료", self.hover == Hit::DoneExclude, self.scale)?;
-        let at = self.seg[3].value();
+        let at = self.seg[SEG_EXCLUDE].value();
         draw_segments(g, f, self.exclude_tabs_rect(), &["DLC", "숨긴 곡"], (at, at + 1.0), lay::PANEL_R - lay::PAD, self.scale)
     }
 
@@ -3731,6 +3759,7 @@ impl Popup {
         self.edit.insert(&playlist::url(&id));
         self.seen = self.query();
         self.view = View::Results;
+        self.kb_focus = None;
         // 커서가 버튼 영역 밖이면 떠날 때처럼 두 버튼이 들어감 (`set_view`와 같음)
         if !self.in_zone && self.leave_since.is_none() {
             self.leave_since = Some(Instant::now());
@@ -4429,7 +4458,7 @@ impl Popup {
                     return Some((0, action));
                 }
                 let act = if self.view == View::Settings {
-                    let f = self.kb_focus.unwrap_or(0);
+                    let f = self.kb_focus.unwrap_or(FOCUS_MODE);
                     match vk {
                         VK_ESCAPE => {
                             self.set_view(View::Results);
@@ -4448,48 +4477,48 @@ impl Popup {
                             let d = if vk == VK_LEFT { -1 } else { 1 };
                             self.focus_settings(f);
                             match f {
-                                0 => {
+                                FOCUS_MODE => {
                                     self.cycle_mode(d);
                                     Action::Choice
                                 }
-                                1 => {
+                                FOCUS_DIFF => {
                                     self.cycle_diff(d);
                                     Action::Choice
                                 }
                                 // 토글은 왼쪽이 끔, 오른쪽이 켬
-                                5 if (d > 0) != self.keep_query => {
+                                FOCUS_KEEP if (d > 0) != self.keep_query => {
                                     self.set_toggle(Toggle::KeepQuery, d > 0);
                                     Action::Choice
                                 }
-                                6 if (d > 0) != self.show_dlc => {
+                                FOCUS_DLC if (d > 0) != self.show_dlc => {
                                     self.set_toggle(Toggle::ShowDlc, d > 0);
                                     Action::Choice
                                 }
-                                7 if self.glass_unavailable().is_none() && (d > 0) != self.glass => {
+                                FOCUS_GLASS if self.glass_unavailable().is_none() && (d > 0) != self.glass => {
                                     self.set_toggle(Toggle::Glass, d > 0);
                                     Action::Choice
                                 }
                                 _ => Action::None,
                             }
                         }
-                        VK_RETURN if f == 2 => {
+                        VK_RETURN if f == FOCUS_EXCLUDE => {
                             self.open_exclude();
                             Action::None
                         }
-                        VK_RETURN if f == 3 => Action::Scan,
-                        VK_RETURN if f == 4 => {
+                        VK_RETURN if f == FOCUS_RESCAN => Action::Scan,
+                        VK_RETURN if f == FOCUS_HOTKEY => {
                             self.start_hotkey_wait();
                             Action::None
                         }
-                        VK_RETURN if f == 5 => {
+                        VK_RETURN if f == FOCUS_KEEP => {
                             self.set_toggle(Toggle::KeepQuery, !self.keep_query);
                             Action::Choice
                         }
-                        VK_RETURN if f == 6 => {
+                        VK_RETURN if f == FOCUS_DLC => {
                             self.set_toggle(Toggle::ShowDlc, !self.show_dlc);
                             Action::Choice
                         }
-                        VK_RETURN if f == 7 && self.glass_unavailable().is_none() => {
+                        VK_RETURN if f == FOCUS_GLASS && self.glass_unavailable().is_none() => {
                             self.set_toggle(Toggle::Glass, !self.glass);
                             Action::Choice
                         }
@@ -5338,24 +5367,24 @@ impl Popup {
                         dc.DrawTextLayout(gfx::pt(left, sl.title + baseline(&t) - baseline(&st)), &st, &sb, D2D1_DRAW_TEXT_OPTIONS_NONE);
                     }
                     // 화살표로 바꾸는 컨트롤은 (한 번 쓴 뒤로) 테두리 없이 라벨 밝기로만 표시
-                    for (k, (label, y)) in [("버튼 모드", sl.labels[0]), ("난이도", sl.labels[1])].into_iter().enumerate() {
+                    for (focus, label, y) in [(FOCUS_MODE, "버튼 모드", sl.labels[0]), (FOCUS_DIFF, "난이도", sl.labels[1])] {
                         let ll = g.layout(label, &f.sub, self.px(200.0), self.px(18.0))?;
-                        let lb = if self.kb_focus == Some(k) { &text_b } else { &sub_b };
+                        let lb = if self.kb_focus == Some(focus) { &text_b } else { &sub_b };
                         dc.DrawTextLayout(gfx::pt(l0t, y), &ll, lb, D2D1_DRAW_TEXT_OPTIONS_NONE);
                     }
                     let thumb = |k: usize| {
                         let at = self.seg[k].value();
                         (at, at + 1.0)
                     };
-                    draw_segments(g, f, sl.mode, &Mode::ALL.map(Mode::label), thumb(0), lay::SEG_R, s)?;
-                    draw_segments(g, f, sl.diff, &Diff::ALL.map(Diff::label), thumb(1), lay::SEG_R, s)?;
+                    draw_segments(g, f, sl.mode, &Mode::ALL.map(Mode::label), thumb(SEG_MODE), lay::SEG_R, s)?;
+                    draw_segments(g, f, sl.diff, &Diff::ALL.map(Diff::label), thumb(SEG_DIFF), lay::SEG_R, s)?;
                     let note_b = g.brush(FAINT)?;
                     let lt = g.layout("내 곡 목록", &f.item_bold, self.px(200.0), self.px(20.0))?;
                     dc.DrawTextLayout(gfx::pt(l0t, sl.list_title), &lt, &text_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
                     let label = if self.owned.is_some() { "다시 인식" } else { "목록 인식" };
-                    draw_button(g, &f.item, sl.rescan, label, matches!(self.hover, Hit::Rescan) || self.kb_focus == Some(3), s)?;
+                    draw_button(g, &f.item, sl.rescan, label, matches!(self.hover, Hit::Rescan) || self.kb_focus == Some(FOCUS_RESCAN), s)?;
                     if self.owned.is_some() {
-                        draw_button(g, &f.item, sl.exclude, "검색 제외", self.hover == Hit::Exclude || self.kb_focus == Some(2), s)?;
+                        draw_button(g, &f.item, sl.exclude, "검색 제외", self.hover == Hit::Exclude || self.kb_focus == Some(FOCUS_EXCLUDE), s)?;
                     } else {
                         draw_button_off(g, &f.item, sl.exclude, "검색 제외", s)?;
                     }
@@ -5365,7 +5394,7 @@ impl Popup {
                     let ht = g.layout("검색창 단축키", &f.item_bold, self.px(200.0), self.px(20.0))?;
                     dc.DrawTextLayout(gfx::pt(l0t, sl.hotkey_title), &ht, &text_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
                     let waiting = self.hotkey_wait.is_some();
-                    draw_button(g, &f.item, sl.hotkey, &self.hotkey_text(), waiting || self.hover == Hit::Hotkey || self.kb_focus == Some(4), s)?;
+                    draw_button(g, &f.item, sl.hotkey, &self.hotkey_text(), waiting || self.hover == Hit::Hotkey || self.kb_focus == Some(FOCUS_HOTKEY), s)?;
                     let (note, nb) = match self.hotkey_note.filter(|(_, at)| at.elapsed().as_secs_f32() < HOTKEY_NOTE_SECS) {
                         Some((why, _)) => (why, &text_b),
                         None if waiting => ("Esc를 누르면 취소돼요", &note_b),
@@ -5375,9 +5404,9 @@ impl Popup {
                     dc.DrawTextLayout(gfx::pt(l0t, sl.hotkey_note), &nl3, nb, D2D1_DRAW_TEXT_OPTIONS_NONE);
                     // 토글 줄은 같은 모양: 제목, 토글 왼쪽 12까지 설명, 버튼 줄 가운데 토글
                     for (title, note, title_y, note_y, r, toggle, focus) in [
-                        ("검색어 유지", "다시 열면 마지막 검색어가 남아 있어요", sl.keep_title, sl.keep_note, sl.keep, Toggle::KeepQuery, 5),
-                        ("DLC 표시", "작곡가 옆에 DLC 이름을 표시해요", sl.dlc_title, sl.dlc_note, sl.dlc, Toggle::ShowDlc, 6),
-                        ("유리 효과", self.glass_unavailable().unwrap_or("검색창 뒤로 게임 화면이 은은하게 비쳐요"), sl.glass_title, sl.glass_note, sl.glass, Toggle::Glass, 7),
+                        ("검색어 유지", "다시 열면 마지막 검색어가 남아 있어요", sl.keep_title, sl.keep_note, sl.keep, Toggle::KeepQuery, FOCUS_KEEP),
+                        ("DLC 표시", "작곡가 옆에 DLC 이름을 표시해요", sl.dlc_title, sl.dlc_note, sl.dlc, Toggle::ShowDlc, FOCUS_DLC),
+                        ("유리 효과", self.glass_unavailable().unwrap_or("검색창 뒤로 게임 화면이 은은하게 비쳐요"), sl.glass_title, sl.glass_note, sl.glass, Toggle::Glass, FOCUS_GLASS),
                     ] {
                         let tl = g.layout(title, &f.item_bold, self.px(200.0), self.px(20.0))?;
                         dc.DrawTextLayout(gfx::pt(l0t, title_y), &tl, &text_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
@@ -5463,7 +5492,7 @@ impl Popup {
                     dc.DrawTextLayout(gfx::pt(l0, rl.label), &cl, &g.brush(FAINT)?, D2D1_DRAW_TEXT_OPTIONS_NONE);
                     draw_list()?;
                 } else if self.sheet == Sheet::History {
-                    let at = self.seg[2].value();
+                    let at = self.seg[SEG_HISTORY].value();
                     draw_segments(g, f, self.tabs_rect(), &["최근", "즐겨찾기"], (at, at + 1.0), lay::PANEL_R - lay::PAD, s)?;
                     if let Some(list) = list {
                         dc.DrawImage(list, None, None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);

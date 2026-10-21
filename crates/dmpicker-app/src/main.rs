@@ -61,7 +61,7 @@ struct App {
     toast: Toast,
     tray: tray::Tray,
     hotkey_on: bool,
-    refs: Arc<Mutex<Option<Arc<dmpicker_engine::RefSet>>>>,
+    refs: Option<Arc<dmpicker_engine::RefSet>>,
     titles: Arc<HashMap<u32, String>>,
     store: PathBuf,
     status: Arc<Mutex<Option<Status>>>,
@@ -291,7 +291,7 @@ fn hand_over(a: &mut App) -> Option<driver::Ctx> {
     if let Some(game) = capture::find_game_window() {
         input::request_foreground(game);
     }
-    let Some(refs) = a.refs.lock().unwrap().clone() else {
+    let Some(refs) = a.refs.clone() else {
         a.toast.show("준비 중이에요\n잠시 뒤 다시 시도해 주세요", Badge::None, Some(2.0));
         return None;
     };
@@ -376,7 +376,7 @@ fn on_action(a: &mut App, act: Action) {
         Action::Scan => on_scan(a),
         Action::Retry => {
             let busy = jobs_busy(a);
-            let refs = a.refs.lock().ok().and_then(|slot| slot.clone());
+            let refs = a.refs.clone();
             a.updates.retry(busy, refs);
             sync_notices(a);
         }
@@ -444,7 +444,7 @@ fn reap_jobs(a: &mut App) {
         if let Some(handle) = a.initial_refs.take() {
             if let Ok(startup) = handle.join() {
                 if let Some(refs) = a.updates.initial_loaded(startup) {
-                    if let Ok(mut slot) = a.refs.lock() { *slot = Some(refs); }
+                    a.refs = Some(refs);
                 }
             }
         }
@@ -474,7 +474,7 @@ fn apply_ready(a: &mut App) {
     } else {
         None
     };
-    if let Ok(mut slot) = a.refs.lock() { *slot = active.has_data().then_some(refs); }
+    a.refs = active.has_data().then_some(refs);
     a.titles = titles;
     if !had_data && active.has_data() {
         driver::ensure_both(&a.store, &|id| a.titles.get(&id).cloned().unwrap_or_default());
@@ -521,7 +521,7 @@ fn sync_notices(a: &mut App) {
 
 fn start_update(a: &mut App) {
     let busy = jobs_busy(a);
-    let refs = a.refs.lock().ok().and_then(|slot| slot.clone());
+    let refs = a.refs.clone();
     a.updates.started(busy, refs);
 }
 
@@ -535,7 +535,7 @@ fn update_opened(a: &mut App) {
         a.updates.schema_notice_shown();
     }
     let busy = jobs_busy(a);
-    let refs = a.refs.lock().ok().and_then(|slot| slot.clone());
+    let refs = a.refs.clone();
     a.updates.opened(busy, refs);
     sync_notices(a);
 }
@@ -714,7 +714,7 @@ fn main() -> Result<()> {
         if startup.active.has_data() {
             driver::ensure_both(&store_dir(), &|id| titles.get(&id).cloned().unwrap_or_default());
         }
-        let refs = Arc::new(Mutex::new(startup.refs.clone()));
+        let refs = startup.refs.clone();
         let initial_refs = startup.active.has_data().then(|| update::start_initial(store_dir(), dir.clone()));
         let updates = update::Updater::new(store_dir(), dir.clone(), &startup);
         let mut app_box = Box::new(App {

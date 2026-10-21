@@ -14,6 +14,8 @@ pub const READY: u32 = WM_APP + 3;
 pub const NOT_FOUND: &str = "볼 수 없는 플레이리스트예요";
 const LATER: &str = "잠시 뒤 다시 시도해 주세요";
 const FAILED: &str = "플레이리스트를 불러오지 못했어요";
+const FAVORITES_UNREADABLE: &str = "즐겨찾기 파일을 읽지 못해서 저장할 수 없어요";
+pub const FAVORITES_SAVE_FAILED: &str = "즐겨찾기를 저장하지 못했어요";
 /// 히스토리에 남기는 곡·플레이리스트 수
 const RECENT_MAX: usize = 6;
 
@@ -243,15 +245,27 @@ impl Library {
     }
 
     /// 없으면 맨 앞에 넣고 있으면 뺀 뒤 저장, 바뀐 뒤 즐겨찾기인지 돌려줌
-    pub fn toggle_favorite(&mut self, id: u32) -> bool {
-        let added = !self.is_favorite(id);
-        if added {
-            self.favorites.insert(0, id);
-        } else {
-            self.favorites.retain(|&i| i != id);
+    /// 저장 실패 때 기존 목록을 유지하도록 파일에 쓴 뒤에만 메모리를 바꿈
+    pub fn toggle_favorite(&mut self, id: u32) -> Result<bool, &'static str> {
+        if self.favorites_unreadable {
+            return Err(FAVORITES_UNREADABLE);
         }
-        self.save_favorites();
-        added
+        let added = !self.is_favorite(id);
+        let mut favorites = self.favorites.clone();
+        if added {
+            favorites.insert(0, id);
+        } else {
+            favorites.retain(|&i| i != id);
+        }
+        if let Some(root) = &self.root {
+            let text: String = favorites.iter().map(|id| format!("{id}\n")).collect();
+            if let Err(e) = crate::sys::save_file(&root.join("favorites.txt"), text.as_bytes()) {
+                eprintln!("save favorites: {e}");
+                return Err(FAVORITES_SAVE_FAILED);
+            }
+        }
+        self.favorites = favorites;
+        Ok(added)
     }
 
     fn path(&self, id: &str) -> Option<PathBuf> {
@@ -306,14 +320,6 @@ impl Library {
         let text: String = self.recent.iter().map(Recent::line).collect();
         if let Err(e) = crate::sys::save_file(&root.join("recent.txt"), text.as_bytes()) {
             eprintln!("save recent: {e}");
-        }
-    }
-
-    fn save_favorites(&self) {
-        let Some(root) = self.root.as_ref().filter(|_| !self.favorites_unreadable) else { return };
-        let text: String = self.favorites.iter().map(|id| format!("{id}\n")).collect();
-        if let Err(e) = crate::sys::save_file(&root.join("favorites.txt"), text.as_bytes()) {
-            eprintln!("save favorites: {e}");
         }
     }
 }

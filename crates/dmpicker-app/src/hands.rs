@@ -19,12 +19,13 @@ use crate::hotkey::Hotkey;
 
 const MOUSE: u16 = 2;
 const KEYBOARD: u16 = 6;
-const KEY_UP: u16 = 1;
-const KEY_E0: u16 = 2;
+const KEY_UP: u16 = RI_KEY_BREAK as u16;
+const KEY_E0: u16 = RI_KEY_E0 as u16;
 /// 오른쪽 Shift의 스캔 코드 (Ctrl·Alt는 E0 표시로 가림)
 const RIGHT_SHIFT: u16 = 0x36;
-/// 마우스 버튼 다섯 개의 누름과 세로·가로 휠 (`RI_MOUSE_*`)
-const PRESS_OR_WHEEL: u16 = 0x0001 | 0x0004 | 0x0010 | 0x0040 | 0x0100 | 0x0400 | 0x0800;
+/// 마우스 버튼 다섯 개의 누름과 세로·가로 휠
+const PRESS_OR_WHEEL: u16 = (RI_MOUSE_LEFT_BUTTON_DOWN | RI_MOUSE_RIGHT_BUTTON_DOWN | RI_MOUSE_MIDDLE_BUTTON_DOWN
+    | RI_MOUSE_BUTTON_4_DOWN | RI_MOUSE_BUTTON_5_DOWN | RI_MOUSE_WHEEL | RI_MOUSE_HWHEEL) as u16;
 
 /// 단축키 수식 키와 raw input이 주는 키, 왼쪽·오른쪽 키 (`StopKey::held` 순서)
 const MOD_KEYS: [(HOT_KEY_MODIFIERS, VIRTUAL_KEY, [VIRTUAL_KEY; 2]); 3] = [
