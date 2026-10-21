@@ -309,7 +309,7 @@ impl Toast {
         let opening = !self.shown || self.open.target < 1.0;
         // 쉬는 상태 (투명 효과 끔 등)는 검색창처럼 띄울 때만 읽음, 진행률이 바뀔 때마다 읽지 않음
         if opening {
-            self.glass_paused = sys::glass_paused();
+            self.glass_paused = sys::glass_paused().is_some();
         }
         self.follow_glass();
         let bump = !opening && badge == Badge::None && text != self.text;

@@ -32,11 +32,21 @@ pub fn glass_supported() -> bool {
     })
 }
 
-/// 윈도우가 투명 효과를 끄는 상황이라 유리 효과도 잠시 끔 (원격 세션, 투명 효과 끔, 절전 모드, 고대비)
-pub fn glass_paused() -> bool {
+/// 유리 효과를 쉬는 이유, 설정 시트에 켜는 법을 다르게 안내함
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GlassPause {
+    Transparency,
+    Power,
+    /// 원격 세션, 고대비
+    Unavailable,
+}
+
+/// 윈도우가 투명 효과를 끄는 상황이면 그 이유, 그동안 유리 효과도 잠시 끔
+/// (원격 세션, 투명 효과 끔, 절전 모드, 고대비)
+pub fn glass_paused() -> Option<GlassPause> {
     unsafe {
         if GetSystemMetrics(SM_REMOTESESSION) != 0 {
-            return true;
+            return Some(GlassPause::Unavailable);
         }
         let mut transparency = 1u32;
         let mut size = std::mem::size_of::<u32>() as u32;
@@ -49,18 +59,22 @@ pub fn glass_paused() -> bool {
             Some(&mut transparency as *mut _ as *mut _),
             Some(&mut size),
         ).is_ok() && transparency == 0 {
-            return true;
+            return Some(GlassPause::Transparency);
         }
         let mut power = SYSTEM_POWER_STATUS::default();
         if GetSystemPowerStatus(&mut power).is_ok() && power.SystemStatusFlag == 1 {
-            return true;
+            return Some(GlassPause::Power);
         }
         let mut contrast = HIGHCONTRASTW {
             cbSize: std::mem::size_of::<HIGHCONTRASTW>() as u32,
             ..Default::default()
         };
-        SystemParametersInfoW(SPI_GETHIGHCONTRAST, contrast.cbSize, Some(&mut contrast as *mut _ as *mut _), Default::default()).is_ok()
+        if SystemParametersInfoW(SPI_GETHIGHCONTRAST, contrast.cbSize, Some(&mut contrast as *mut _ as *mut _), Default::default()).is_ok()
             && contrast.dwFlags.contains(HCF_HIGHCONTRASTON)
+        {
+            return Some(GlassPause::Unavailable);
+        }
+        None
     }
 }
 

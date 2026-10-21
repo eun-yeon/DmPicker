@@ -70,6 +70,9 @@ const SHEET_IN_SECS: f32 = 0.22;
 const SHEET_OUT_SECS: f32 = 0.16;
 /// 보기·탭·카드를 바꿀 때 옛 내용에서 새 내용으로 섞이는 시간 (`Crossfade`)
 const SWAP_SECS: f32 = 0.25;
+/// 설정 시트 스크롤 막대: 멈춘 뒤 이만큼 그대로 있다가 흐려짐
+const SCROLLBAR_HOLD_SECS: f32 = 0.45;
+const SCROLLBAR_FADE_SECS: f32 = 0.2;
 /// 즐겨찾기 별 (`StarMotion`): 색과 채움은 켤 때도 끌 때도 이 시간에 바뀜, 눌림과 점 튀기는 켤 때만
 const STAR_FILL_SECS: f32 = 0.15;
 /// 눌림: 앞 30 %에 이 배율까지 줄었다 나머지에 돌아옴, 구간마다 넘쳤다 돌아옴
@@ -103,6 +106,8 @@ mod lay {
     pub const LEVEL_W: f32 = 60.0; // 줄 오른쪽 끝의 레벨 칸
     pub const PLAYLIST_LEVEL_W: f32 = 72.0; // 플레이리스트 결과·뽑은 기록은 모드까지, 가장 긴 "8B · MX 15"가 약 66
     pub const SETTINGS_H: f32 = 456.0; // 맨 아래 줄(410..440) 아래 16 (= 오른쪽 여백)
+    /// 설정 시트 휠 한 칸, 내 곡 목록부터 아래 묶음끼리의 간격
+    pub const SETTINGS_WHEEL: f32 = 54.0;
     /// 키워드 칩·결과 줄 수 한도 기준 높이 (설정 시트만 한 줄 더 김)
     pub const CONTENT_H: f32 = 402.0;
     /// 제목·요약·탭 아래부터 목록
@@ -740,6 +745,22 @@ struct SettingsLayout {
     glass_note: f32,
 }
 
+impl SettingsLayout {
+    /// 묶음마다 (위, 아래): 라벨·제목 위부터 컨트롤이나 설명 글 아래까지
+    /// 시트를 자르는 자리와 포커스 스크롤이 씀
+    fn groups(&self, note_h: f32) -> [(f32, f32); 7] {
+        [
+            (self.labels[0], self.mode.bottom),
+            (self.labels[1], self.diff.bottom),
+            (self.list_title, self.rescan.bottom.max(self.list_note + note_h)),
+            (self.hotkey_title, self.hotkey.bottom.max(self.hotkey_note + note_h)),
+            (self.keep_title, self.keep.bottom.max(self.keep_note + note_h)),
+            (self.dlc_title, self.dlc.bottom.max(self.dlc_note + note_h)),
+            (self.glass_title, self.glass.bottom.max(self.glass_note + note_h)),
+        ]
+    }
+}
+
 /// 물리 px 기준 키워드 시트: 클릭 영역과 각 글줄의 위쪽
 struct KeywordLayout {
     /// 완료 버튼 왼쪽의 별 버튼
@@ -823,7 +844,9 @@ pub struct Popup {
     /// 윈도우 11이라 켤 수 있음 (`sys::glass_supported`)
     glass_ok: bool,
     /// 열 때 읽은 `sys::glass_paused`, 그동안은 설정이 켜져 있어도 판만 그림
-    glass_paused: bool,
+    glass_paused: Option<sys::GlassPause>,
+    /// 열 때 흐림 층이 없었음 (만들기 실패), 그동안 토글을 막음
+    glass_failed: bool,
     /// 결과 보기에서 닫을 때 고른 줄과 스크롤, 다음 열기에서만 씀
     kept_row: Option<(Row, usize)>,
     /// 입력한 글, 캐럿과 선택 (조합 중인 글자는 `preedit`에 따로, 캐럿 자리에 그림)
@@ -863,6 +886,9 @@ pub struct Popup {
     view: View,
     sheet: Sheet,
     kb_focus: Option<usize>, // 설정 키보드 포커스: 0 모드, 1 난이도, 2 검색 제외, 3 다시 인식, 4 단축키, 5 검색어 유지, 6 DLC 표시, 7 유리 효과
+    settings_room: f32, // 패널 위에서 기준 영역 아래 16까지 px, 설정 시트가 더 길면 줄여서 스크롤
+    settings_scroll_s: Spring, // 설정 내용을 올린 px, 멈추면 정수
+    settings_scroll_at: Option<Instant>, // 마지막으로 스크롤한 때, 막대가 그 뒤 잠깐 보임
     toggle_down: Option<Toggle>, // 누른 토글 (떼면 바뀜)
     exclude_rows: Vec<ExcludeRow>,
     exclude_tab: ExcludeTab,
@@ -1057,7 +1083,8 @@ impl Popup {
             show_dlc: false,
             glass: true,
             glass_ok: sys::glass_supported(),
-            glass_paused: false,
+            glass_paused: None,
+            glass_failed: false,
             kept_row: None,
             edit: Editor::default(),
             preedit: String::new(),
@@ -1081,6 +1108,9 @@ impl Popup {
             view: View::Results,
             sheet: Sheet::Results,
             kb_focus: None,
+            settings_room: f32::INFINITY,
+            settings_scroll_s: Spring::new(0.0, 600.0, 46.0),
+            settings_scroll_at: None,
             toggle_down: None,
             exclude_rows: Vec::new(),
             exclude_tab: ExcludeTab::Dlc,
@@ -1281,6 +1311,8 @@ impl Popup {
                 || self.toggles.iter().any(|t| !t.done())
                 || !self.glass_fade.done()
                 || !self.exclude_scroll_s.settled()
+                || !self.settings_scroll_s.settled()
+                || self.settings_scroll_at.is_some()
                 || self.exclude_rows.iter().any(|r| !r.motion.done())
                 || self.hover_since.is_some()
                 || self.leave_since.is_some())
@@ -1345,7 +1377,22 @@ impl Popup {
     // ---------------------------------------------------------------- 열기 / 닫기
 
     fn glass_now(&self) -> bool {
-        self.glass_ok && self.glass && !self.glass_paused
+        self.glass_ok && self.glass && self.glass_paused.is_none()
+    }
+
+    /// 유리 효과를 지금 못 쓰는 이유 (설정 시트 설명 글), 그동안 토글은 흐리고 안 눌림
+    /// 저장된 값은 그대로 둠
+    fn glass_unavailable(&self) -> Option<&'static str> {
+        if !self.glass_ok {
+            return Some("Windows 11에서 쓸 수 있어요");
+        }
+        match self.glass_paused {
+            Some(sys::GlassPause::Transparency) => Some("Windows 투명 효과를 켜면 쓸 수 있어요"),
+            Some(sys::GlassPause::Power) => Some("절전 모드를 끄면 쓸 수 있어요"),
+            Some(sys::GlassPause::Unavailable) => Some("지금은 쓸 수 없어요"),
+            None if self.glass_failed => Some("지금은 쓸 수 없어요"),
+            None => None,
+        }
     }
 
     /// 멈춘 스프링은 목표 값 그대로, 판 가장자리가 정수 px에 와야 1 px 테두리가 한 줄로 선명함
@@ -1378,6 +1425,7 @@ impl Popup {
         let x = cx - w / 2;
         let ah = anchor.bottom - anchor.top;
         let y = anchor.top + (ah as f32 * 0.28) as i32 - self.px(lay::MARGIN) as i32;
+        self.settings_room = (anchor.bottom - y) as f32 - self.panel_top() - self.px(lay::INSET);
 
         unsafe {
             let _ = SetWindowPos(self.hwnd, Some(HWND_TOPMOST), x, y, w, h, SWP_NOACTIVATE);
@@ -1423,6 +1471,7 @@ impl Popup {
         if !self.prepare() {
             return;
         }
+        self.glass_failed = self.gfx.as_ref().is_some_and(|g| !g.has_glass());
         if let Some(g) = &self.gfx {
             g.retune(self.hwnd); // 게임이 (그래서 우리도) 다른 모니터로 옮겼을 수 있음
         }
@@ -1767,8 +1816,12 @@ impl Popup {
         (b.left + self.px(46.0), b.top)
     }
 
+    /// 지금 스크롤한 자리, 그리기·판정이 같이 씀
     fn settings_layout(&self) -> SettingsLayout {
-        let top = self.panel_top();
+        self.settings_layout_at(self.panel_top() - self.settings_scroll_s.value)
+    }
+
+    fn settings_layout_at(&self, top: f32) -> SettingsLayout {
         let (l, r) = (self.px(lay::MARGIN + lay::INSET), self.px(lay::MARGIN + lay::W - lay::INSET));
         let y = |v: f32| top + self.px(v);
         // 글자 기준 한 리듬 (글자는 텍스트 박스보다 ~2 아래): 위 끝에서 제목까지 20 (모서리 반지름,
@@ -1800,6 +1853,64 @@ impl Popup {
             glass: rect(r - self.px(lay::TOGGLE_W), y(425.0 - lay::TOGGLE_H / 2.0), r, y(425.0 + lay::TOGGLE_H / 2.0)),
             glass_note: y(428.0),
         }
+    }
+
+    /// 묶음 자리, 스크롤과 상관없이 시트 위 기준
+    fn settings_groups(&self) -> [(f32, f32); 7] {
+        // 설명 글줄 높이 14, 텍스트 상자의 아래 여백 제외
+        self.settings_layout_at(0.0).groups(self.px(14.0))
+    }
+
+    /// 키보드 포커스 `focus`가 든 묶음, 다시 인식은 검색 제외와 같은 묶음
+    fn settings_group(&self, focus: usize) -> (f32, f32) {
+        self.settings_groups()[if focus <= 2 { focus } else { focus - 1 }]
+    }
+
+    /// 다 들어가면 다 편 높이, 아니면 묶음 가운데 절반 안에서 잘라 반쯤 보이는 줄로 아래가 더 있음을 알림
+    /// 그 자리가 안 맞으면 위쪽 가장 가까운 묶음 가운데, 첫 묶음 가운데보다 줄이진 않음
+    fn settings_height(&self) -> f32 {
+        let full = self.px(lay::SETTINGS_H);
+        if self.settings_room >= full {
+            return full;
+        }
+        let groups = self.settings_groups();
+        let room = self.settings_room.floor();
+        let mut height = ((groups[0].0 + groups[0].1) / 2.0).floor();
+        for (top, bottom) in groups {
+            let quarter = (bottom - top) / 4.0;
+            if room >= top + quarter && room <= bottom - quarter {
+                return room.max(height);
+            }
+            let middle = ((top + bottom) / 2.0).floor();
+            if middle <= room {
+                height = middle;
+            }
+        }
+        height
+    }
+
+    fn settings_scroll_max(&self) -> f32 {
+        self.px(lay::SETTINGS_H) - self.settings_height()
+    }
+
+    /// 스크롤 막대 자리 (다 편 시트 자리)와 불투명도, 스크롤한 뒤 잠깐만
+    /// 위아래는 판 모서리 반지름만큼 띄움, 8만 띄우면 막대 끝이 둥근 모서리에 붙어 보임
+    fn settings_scrollbar(&self, now: Instant) -> Option<(D2D_RECT_F, f32)> {
+        let max = self.settings_scroll_max();
+        if max <= 0.0 {
+            return None;
+        }
+        let elapsed = now.duration_since(self.settings_scroll_at?).as_secs_f32();
+        let alpha = 0.3 * (1.0 - (elapsed - SCROLLBAR_HOLD_SECS) / SCROLLBAR_FADE_SECS).clamp(0.0, 1.0);
+        if alpha <= 0.0 {
+            return None;
+        }
+        let height = self.settings_height();
+        let track = height - self.px(lay::PANEL_R) * 2.0;
+        let length = track * height / self.px(lay::SETTINGS_H);
+        let top = self.panel_top() + self.px(lay::PANEL_R) + (track - length) * (self.settings_scroll_s.value / max).clamp(0.0, 1.0);
+        let right = self.px(lay::MARGIN + lay::W) - self.px(5.0);
+        Some((rect(right - self.px(3.0), top, right, top + length), alpha))
     }
 
     /// 키워드 시트: 결과 줄과 같은 곡 줄, 라벨, 줄바꿈하며 흐르는 칩, 안내 문구
@@ -1967,7 +2078,7 @@ impl Popup {
     /// 지금 보기의 패널 높이, 보여 줄 게 없으면 0 (줄이 없으면 문구 한 줄)
     fn panel_target(&self) -> f32 {
         match self.sheet_now() {
-            Sheet::Settings => self.px(lay::SETTINGS_H),
+            Sheet::Settings => self.settings_height(),
             // 줄 자리를 그리기·판정과 같은 식으로 더해야 다 편 패널 아래 끝이 마지막 줄 아래 8에 딱 맞음
             Sheet::Exclude => self.px(lay::EXCLUDE_TOP) + self.px(lay::PAD) + self.exclude_list_h() + self.px(lay::PAD),
             Sheet::Keywords => self.keyword_layout().height,
@@ -2110,6 +2221,10 @@ impl Popup {
             }
         }
         if self.view == View::Settings {
+            // 더 긴 시트에서 판이 줄어드는 동안에도 그림은 보이는 칸까지만이라 그 아래는 안 눌림
+            if y >= self.panel_top() + self.settings_height() {
+                return Hit::Inside;
+            }
             let sl = self.settings_layout();
             if inside(&sl.mode, x, y) {
                 return Hit::ModeSeg(segment_at(&sl.mode, x, Mode::ALL.len()));
@@ -2128,7 +2243,7 @@ impl Popup {
             }
             // 토글은 작아서 둘레를 조금 더, 위아래는 버튼 줄만큼
             for (k, toggle) in [(sl.keep, Toggle::KeepQuery), (sl.dlc, Toggle::ShowDlc), (sl.glass, Toggle::Glass)] {
-                if toggle == Toggle::Glass && !self.glass_ok {
+                if toggle == Toggle::Glass && self.glass_unavailable().is_some() {
                     continue;
                 }
                 if inside(&rect(k.left - self.px(6.0), k.top - self.px(3.0), k.right, k.bottom + self.px(3.0)), x, y) {
@@ -2581,8 +2696,27 @@ impl Popup {
         if v.searches_sheet() {
             self.begin_list_search(restore);
         }
+        // 설정에서 모은 휠 값이 다른 목록으로, 다른 목록 것이 설정으로 넘어가지 않게
+        if (v == View::Settings || self.view == View::Settings) && self.settings_scroll_max() > 0.0 {
+            self.wheel_acc = 0;
+        }
         self.view = v;
         self.end_hotkey_wait();
+        if v == View::Settings {
+            let scrolled = self.settings_scroll_s.value != 0.0;
+            self.settings_scroll_s.snap(0.0);
+            self.settings_scroll_at = None;
+            // 내려 둔 채 나갔으면 커서 아래 컨트롤이 바뀌어서 호버를 다시 봄
+            if scrolled {
+                if let Some((x, y)) = self.last_mouse.filter(|_| self.tracking) {
+                    self.hover = self.hit(x as f32, y as f32);
+                }
+            }
+            // 히스토리를 다녀와도 포커스가 남음, 맨 위 칸에서 안 보이면 풂 (안 보이는 토글이 키로 바뀌지 않게)
+            if self.kb_focus.is_some_and(|f| self.settings_group(f).1 > self.settings_height()) {
+                self.kb_focus = None;
+            }
+        }
         if v == View::History {
             self.fill_history();
         } else if from_list {
@@ -2876,10 +3010,47 @@ impl Popup {
         if next == 2 && self.owned.is_none() {
             next = if d > 0 { 3 } else { 1 };
         }
-        if next == 7 && !self.glass_ok {
+        if next == 7 && self.glass_unavailable().is_some() {
             next = 6;
         }
-        self.kb_focus = Some(next);
+        self.focus_settings(next);
+    }
+
+    /// 포커스 묶음이 보이는 칸을 벗어나면 위아래 16 여유를 두고 따라감
+    fn focus_settings(&mut self, focus: usize) {
+        self.kb_focus = Some(focus);
+        let (top, bottom) = self.settings_group(focus);
+        let (offset, height) = (self.settings_scroll_s.target, self.settings_height());
+        if top < offset {
+            self.set_settings_scroll(top - self.px(16.0));
+        } else if bottom > offset + height {
+            self.set_settings_scroll(bottom + self.px(16.0) - height);
+        }
+    }
+
+    /// 정수 px에서 멈춰야 글자가 선명함
+    fn set_settings_scroll(&mut self, offset: f32) {
+        self.settings_scroll_s.target = offset.round().clamp(0.0, self.settings_scroll_max());
+    }
+
+    /// 끝에서 더 굴려도 막대를 보여 끝임을 알림
+    fn scroll_settings(&mut self, rows: i32) {
+        self.set_settings_scroll(self.settings_scroll_s.target + self.px(lay::SETTINGS_WHEEL) * rows as f32);
+        self.settings_scroll_at = Some(Instant::now());
+    }
+
+    /// 움직이는 동안은 막대를 남기고, 멈추면 목표 정수 px에 딱 맞춤
+    fn step_settings_scroll(&mut self, dt: f32, now: Instant) {
+        let moving = !self.settings_scroll_s.settled();
+        self.settings_scroll_s.step(dt);
+        if self.settings_scroll_s.settled() {
+            self.settings_scroll_s.snap(self.settings_scroll_s.target);
+        }
+        if moving {
+            self.settings_scroll_at = Some(now);
+        } else if self.settings_scroll_at.is_some_and(|at| now.duration_since(at).as_secs_f32() >= SCROLLBAR_HOLD_SECS + SCROLLBAR_FADE_SECS) {
+            self.settings_scroll_at = None;
+        }
     }
 
     /// 고른 줄이 보이게 스크롤
@@ -2900,12 +3071,16 @@ impl Popup {
         self.exclude_scroll_s.target = self.px(self.exclude_tab.row_height()) * self.exclude_scroll as f32;
     }
 
-    /// 목록이 스크롤로 움직이면 커서 아래 줄을 다시 호버 (화살표로 고른 동안은 그대로)
-    fn refresh_exclude_hover(&mut self) {
-        if self.view == View::Exclude && self.exclude_focus.is_none() {
-            if let Some((x, y)) = self.last_mouse.filter(|_| self.tracking) {
-                self.hover = self.hit(x as f32, y as f32);
-            }
+    /// 내용이 스크롤로 움직이면 커서 아래를 다시 호버
+    /// 검색 제외 목록은 화살표로 고른 동안 그대로, 설정은 스크롤한 뒤에만 (시트가 나타날 땐 커서를 움직여야 호버)
+    fn refresh_scroll_hover(&mut self) {
+        let follow = match self.view {
+            View::Exclude => self.exclude_focus.is_none(),
+            View::Settings => self.settings_scroll_at.is_some(),
+            _ => false,
+        };
+        if let Some((x, y)) = self.last_mouse.filter(|_| follow && self.tracking) {
+            self.hover = self.hit(x as f32, y as f32);
         }
     }
 
@@ -3803,7 +3978,7 @@ impl Popup {
         match toggle {
             Toggle::KeepQuery => self.keep_query,
             Toggle::ShowDlc => self.show_dlc,
-            Toggle::Glass => self.glass_ok && self.glass,
+            Toggle::Glass => self.glass_unavailable().is_none() && self.glass,
         }
     }
 
@@ -3812,7 +3987,7 @@ impl Popup {
         match toggle {
             Toggle::KeepQuery => self.keep_query = on,
             Toggle::ShowDlc => self.show_dlc = on,
-            Toggle::Glass if self.glass_ok => self.glass = on,
+            Toggle::Glass if self.glass_unavailable().is_none() => self.glass = on,
             Toggle::Glass => return,
         }
         self.toggles[toggle as usize].go(on);
@@ -4137,7 +4312,7 @@ impl Popup {
                         }
                         VK_LEFT | VK_RIGHT => {
                             let d = if vk == VK_LEFT { -1 } else { 1 };
-                            self.kb_focus = Some(f);
+                            self.focus_settings(f);
                             match f {
                                 0 => {
                                     self.cycle_mode(d);
@@ -4156,7 +4331,7 @@ impl Popup {
                                     self.set_toggle(Toggle::ShowDlc, d > 0);
                                     Action::Choice
                                 }
-                                7 if self.glass_ok && (d > 0) != self.glass => {
+                                7 if self.glass_unavailable().is_none() && (d > 0) != self.glass => {
                                     self.set_toggle(Toggle::Glass, d > 0);
                                     Action::Choice
                                 }
@@ -4180,7 +4355,7 @@ impl Popup {
                             self.set_toggle(Toggle::ShowDlc, !self.show_dlc);
                             Action::Choice
                         }
-                        VK_RETURN if f == 7 && self.glass_ok => {
+                        VK_RETURN if f == 7 && self.glass_unavailable().is_none() => {
                             self.set_toggle(Toggle::Glass, !self.glass);
                             Action::Choice
                         }
@@ -4331,7 +4506,9 @@ impl Popup {
             WM_MOUSEWHEEL => {
                 // 한 칸에 한 줄, 정밀 휠과 터치패드는 모아서 칸으로 셈
                 let d = ((wp.0 >> 16) as i16) as i32;
-                if matches!(self.view, View::Results | View::History | View::Rolls | View::Exclude) {
+                if matches!(self.view, View::Results | View::History | View::Rolls | View::Exclude)
+                    || (self.view == View::Settings && self.settings_scroll_max() > 0.0)
+                {
                     if d.signum() != self.wheel_acc.signum() {
                         self.wheel_acc = 0; // 방향 바뀜
                     }
@@ -4341,11 +4518,17 @@ impl Popup {
                     if rows != 0 {
                         let mut p = POINT { x: lp.0 as i16 as i32, y: (lp.0 >> 16) as i16 as i32 }; // 화면 좌표
                         let _ = unsafe { windows::Win32::Graphics::Gdi::ScreenToClient(self.hwnd, &mut p) };
+                        if self.view == View::Settings {
+                            self.kb_focus = None;
+                            self.last_mouse = Some((p.x, p.y));
+                            self.scroll_settings(-rows);
+                            return Some((0, Action::None));
+                        }
                         if self.view == View::Exclude {
                             self.exclude_focus = None;
                             self.last_mouse = Some((p.x, p.y));
                             self.scroll_exclude(-rows);
-                            self.refresh_exclude_hover();
+                            self.refresh_scroll_hover();
                             return Some((0, Action::None));
                         }
                         self.search_now();
@@ -4737,7 +4920,8 @@ impl Popup {
         if self.exclude_scroll_s.settled() {
             self.exclude_scroll_s.snap(self.exclude_scroll_s.target);
         }
-        self.refresh_exclude_hover();
+        self.step_settings_scroll(dt, now);
+        self.refresh_scroll_hover();
         if self.scroll_s.settled() {
             self.scroll_s.snap(self.scroll_s.target); // 정수 픽셀에서 멈춰야 글자가 선명함
         }
@@ -5055,18 +5239,22 @@ impl Popup {
                     for (title, note, title_y, note_y, r, toggle, focus) in [
                         ("검색어 유지", "다시 열면 마지막 검색어가 남아 있어요", sl.keep_title, sl.keep_note, sl.keep, Toggle::KeepQuery, 5),
                         ("DLC 표시", "작곡가 옆에 DLC 이름을 표시해요", sl.dlc_title, sl.dlc_note, sl.dlc, Toggle::ShowDlc, 6),
-                        ("유리 효과", if self.glass_ok { "검색창 뒤로 게임 화면이 은은하게 비쳐요" } else { "Windows 11에서 쓸 수 있어요" }, sl.glass_title, sl.glass_note, sl.glass, Toggle::Glass, 7),
+                        ("유리 효과", self.glass_unavailable().unwrap_or("검색창 뒤로 게임 화면이 은은하게 비쳐요"), sl.glass_title, sl.glass_note, sl.glass, Toggle::Glass, 7),
                     ] {
                         let tl = g.layout(title, &f.item_bold, self.px(200.0), self.px(20.0))?;
                         dc.DrawTextLayout(gfx::pt(l0t, title_y), &tl, &text_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
                         let nl = g.layout(note, &f.sub, r.left - self.px(12.0) - l0, self.px(18.0))?;
                         dc.DrawTextLayout(gfx::pt(l0t, note_y), &nl, &note_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
                         let m = &self.toggles[toggle as usize];
-                        if toggle == Toggle::Glass && !self.glass_ok {
+                        if toggle == Toggle::Glass && self.glass_unavailable().is_some() {
                             draw_toggle_off(g, r, s)?;
                         } else {
                             draw_toggle(g, r, (m.knob.value(), m.tint.value(), m.press.value()), self.hover == Hit::Toggle(toggle) || self.kb_focus == Some(focus), s)?;
                         }
+                    }
+                    // 막대도 내용과 같이 기록해야 다른 시트로 바뀔 때 같이 흐려짐
+                    if let Some((at, alpha)) = self.settings_scrollbar(now) {
+                        dc.FillRoundedRectangle(&rounded(at, (at.right - at.left) / 2.0), &g.brush(white(alpha))?);
                     }
                 } else if self.sheet == Sheet::Exclude {
                     self.draw_exclude_head()?;
@@ -5162,7 +5350,21 @@ impl Popup {
                     Sheet::Exclude => Some(self.list_swap.compose(g, record(dc, || self.draw_exclude_list(&exclude_shown))?)?),
                     _ => None,
                 };
-                sheet_drawn = Some(self.sheet_swap.compose(g, record(dc, || draw_sheet(list.as_ref().map(|(l, _)| l)))?)?);
+                // 줄인 설정 시트는 보이는 칸만 기록, 더 긴 시트로 바뀌며 판이 커질 때 가려졌던 줄이 드러나지 않게
+                let cut = (self.sheet == Sheet::Settings && self.settings_scroll_max() > 0.0).then(|| {
+                    let top = self.panel_top();
+                    rect(self.px(lay::MARGIN), top, self.px(lay::MARGIN + lay::W), top + self.settings_height())
+                });
+                sheet_drawn = Some(self.sheet_swap.compose(g, record(dc, || {
+                    if let Some(c) = &cut {
+                        dc.PushAxisAlignedClip(c, D2D1_ANTIALIAS_MODE_ALIASED);
+                    }
+                    let drawn = draw_sheet(list.as_ref().map(|(l, _)| l));
+                    if cut.is_some() {
+                        dc.PopAxisAlignedClip();
+                    }
+                    drawn
+                })?)?);
                 list_drawn = list;
             }
 
