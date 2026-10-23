@@ -4070,7 +4070,7 @@ impl Popup {
     }
 
     /// 검색어로 찾은 줄: 조건 검색이면 무작위 줄과 맞는 줄 전부, 아니면 잘 맞는 곡
-    /// 레벨이나 패턴 특성 조건이 있으면 맞는 패턴마다, BPM 조건만이면 곡 (설정의 모드·난이도로 이동)
+    /// 레벨·서열표·패턴 특성 조건이 있으면 맞는 패턴마다, BPM 조건만이면 곡 (설정의 모드·난이도로 이동)
     fn find(&self, q: &str) -> Vec<Row> {
         self.find_in(q, self.owned.as_ref())
     }
@@ -4084,7 +4084,7 @@ impl Popup {
             }
             return self.catalog.search(q, LIMIT, owned).into_iter().map(Row::Song).collect();
         };
-        let mode = f.level.and_then(|l| l.mode).unwrap_or(self.mode_choice);
+        let mode = f.mode().unwrap_or(self.mode_choice);
         let row = |(i, diff)| match diff {
             Some(d) => Row::Chart(i, mode, d),
             None => Row::Song(i),
@@ -4419,7 +4419,7 @@ impl Popup {
         self.set_mode(Mode::ALL[i]);
     }
 
-    /// 모드를 정하지 않은 레벨·패턴 특성 조건 검색은 설정 모드의 패턴이라 다시 찾음
+    /// 모드를 정하지 않은 레벨·서열표·패턴 특성 조건 검색은 설정 모드의 패턴이라 다시 찾음
     fn set_mode(&mut self, m: Mode) {
         self.mode_choice = m;
         let uses_mode = |q: &str| self.catalog.parse_filter(q).is_some_and(|f| f.uses_mode_setting());
@@ -5927,8 +5927,8 @@ impl Popup {
                 let searching = matches!(self.view, View::Results | View::History);
                 let cond = match self.catalog.parse_filter(&self.searched).filter(|_| searching) {
                     Some(Filter { level: Some(q), .. }) => format!("{} · {}", q.mode.unwrap_or(self.mode_choice).label(), q.diff.label()),
-                    // 레벨 조건 없이 특성 조건이 있으면 난이도는 줄마다 달라서 모드만
-                    Some(c) if !c.tags.is_empty() => self.mode_choice.label().to_owned(),
+                    // 레벨 조건 없이 서열표나 특성 조건이 있으면 난이도는 줄마다 달라서 모드만
+                    Some(c) if c.floor.is_some() || !c.tags.is_empty() => c.mode().unwrap_or(self.mode_choice).label().to_owned(),
                     None if searching && self.catalog.has_tag_syntax(&self.searched) => self.mode_choice.label().to_owned(),
                     _ => format!("{} · {}", self.mode_choice.label(), self.diff_choice.label()),
                 };

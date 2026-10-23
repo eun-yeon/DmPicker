@@ -11,7 +11,7 @@
 use crate::catalog::{Diff, Mode, Song};
 use crate::filter::{keys, range};
 
-const MODE_KEYS: [(&str, Mode); 4] = [("4b", Mode::B4), ("5b", Mode::B5), ("6b", Mode::B6), ("8b", Mode::B8)];
+pub(crate) const MODE_KEYS: [(&str, Mode); 4] = [("4b", Mode::B4), ("5b", Mode::B5), ("6b", Mode::B6), ("8b", Mode::B8)];
 const DIFF_KEYS: [(&str, Diff); 4] = [("nm", Diff::NM), ("hd", Diff::HD), ("mx", Diff::MX), ("sc", Diff::SC)];
 
 /// 레벨 조건

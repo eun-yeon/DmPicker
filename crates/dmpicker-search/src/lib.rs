@@ -56,8 +56,8 @@
 //! 초성 등급은 자음만 있는 검색어에만 쓰여서 작곡가 등급과 겹칠 일 없음
 //!
 //! ## 조건 검색
-//! 검색어 전체가 레벨 조건 ("sc15", "4b mx14-15", "ㄴㅊ14~15", "sc14~"), BPM 조건 ("bpm150", "bpm:150~180", "bpm200~"),
-//! 패턴 특성 조건 ("트릴:2~", "가변:~1") 또는 그 조합이면 ("sc14 bpm150~180 트릴:1~")
+//! 검색어 전체가 레벨 조건 ("sc15", "4b mx14-15", "ㄴㅊ14~15", "sc14~"), 서열표 조건 ("15.1~", "4b 14.1~15.3"),
+//! BPM 조건 ("bpm150", "bpm:150~180", "bpm200~"), 패턴 특성 조건 ("트릴:2~", "가변:~1") 또는 그 조합이면 ("sc14 bpm150~180 트릴:1~")
 //! [`Filter`]로 맞는 곡이나 패턴을 제목순으로 모음
 //! 난이도가 없거나 ("15", "4b15") 꼴이 안 맞으면 위의 텍스트 검색
 //! 알려진 특성 이름 뒤에 ':'가 있으면 꼴이 틀려도 텍스트 검색 대신 결과 없음 ([`TagNames::has_tag_syntax`])
@@ -70,7 +70,7 @@ mod normalize;
 mod search;
 
 pub use catalog::{Catalog, Diff, Mode, PatternTags, Song};
-pub use filter::{BpmRange, Filter, TagNames, TagRange};
+pub use filter::{BpmRange, Filter, FloorRange, TagNames, TagRange};
 pub use level::LevelQuery;
 pub use normalize::normalize;
 pub use search::{Hit, Searcher};

@@ -1,7 +1,12 @@
-//! 조건 검색: 검색어 전체가 레벨·BPM·패턴 특성 조건이면 맞는 곡이나 패턴을 모두 모음
+//! 조건 검색: 검색어 전체가 레벨·서열표·BPM·패턴 특성 조건이면 맞는 곡이나 패턴을 모두 모음
 //! ("sc15", "bpm:150~180", "4b sc14-15 bpm200~", "트릴:2~ 연타:1~")
 //!
 //! * 레벨 조건은 [`LevelQuery`]
+//! * 서열표 조건은 소수 한 자리 값이나 범위 ("15.2", "15.1~", "~13.3", "14.1~15.3"), 정수 부분은 앞자리 0 없이 한두 자리
+//! * 서열표는 NM부터 SC까지 같은 잣대, 값이 없는 패턴은 제외하고 레벨 조건과는 같이 못 씀
+//! * 서열표 조건은 하나만, 모드는 앞에 붙임 ("4b 15.1~", "4ㅠ 15.1~"), 없으면 설정 모드
+//! * 서열표 조건과 다른 조건은 공백으로 구분, 범위 안 공백은 허용 ("트릴:1~ 15.1~", "14.1 ~ 15.3 bpm180~")
+//! * 양쪽 조건에 붙을 수 있는 범위 기호는 서열표 쪽으로 읽음 ("트릴:1 ~ 15.1"은 특성 1, 서열표 15.1 이하)
 //! * BPM 조건은 `bpm` 뒤에 BPM 하나나 범위, ':'는 써도 되고 안 써도 됨 ("bpm150", "bpm:150~180")
 //! * 패턴 특성 조건은 `이름:값`, 값은 0..=3 하나나 범위 ("트릴:2", "트릴:1~2")
 //! * 범위 구분은 '-' 또는 '~', 양 끝 포함, 거꾸로 쓴 범위도 받음
@@ -10,17 +15,17 @@
 //! * 소수 BPM은 반올림해서 비교 (123.8은 124)
 //! * 레벨·BPM 조건은 하나씩, 어느 쪽을 먼저 써도 됨 ("sc14 bpm150", "bpm150 4b sc14")
 //! * 패턴 특성 조건은 아무 데나 몇 개든 ("트릴:2~ sc14 연타:1~")
-//! * 같이 쓰면 전부 맞는 같은 패턴, 레벨 조건이 없으면 설정 모드의 아무 난이도
-//! * 대소문자·공백 무시, 한글 모드로 친 것도 받음 ("ㅠㅔㅡ150")
+//! * 같이 쓰면 전부 맞는 같은 패턴, 레벨 조건이 없으면 아무 난이도
+//! * 대소문자 무시, 공백은 서열표 조건 앞뒤와 서열 값 안을 빼면 무시, 한글 모드로 친 것도 받음 ("ㅠㅔㅡ150")
 //! * 결과는 게임 목록의 제목순 (영문, 한자·가나, 한글, 기호, 숫자), 같은 곡은 NM부터
 
 use std::collections::BTreeMap;
 
 use crate::catalog::{Diff, Mode, Song};
 use crate::hangul;
-use crate::level::LevelQuery;
+use crate::level::{LevelQuery, MODE_KEYS};
 
-/// 공백을 빼고 영문 소문자·숫자·'-'·'~'·':'로, 한글은 그 자모를 치는 2벌식 자판의 영문 키로
+/// 공백을 빼고 영문 소문자·숫자·'-'·'~'·':'·'.'로, 한글은 그 자모를 치는 2벌식 자판의 영문 키로
 /// 다른 글자가 있으면 None
 pub(crate) fn keys(raw: &str) -> Option<String> {
     let mut keys = String::with_capacity(raw.len());
@@ -28,7 +33,7 @@ pub(crate) fn keys(raw: &str) -> Option<String> {
         if c.is_whitespace() {
             continue;
         }
-        if c.is_ascii_alphanumeric() || matches!(c, '-' | '~' | ':') {
+        if c.is_ascii_alphanumeric() || matches!(c, '-' | '~' | ':' | '.') {
             keys.push(c.to_ascii_lowercase());
         } else if hangul::is_hangul(c) {
             let mut ok = true;
@@ -80,6 +85,48 @@ impl BpmRange {
     /// 곡의 최저·최고 BPM이 둘 다 범위 안, BPM을 모르는 곡은 안 맞음
     pub fn matches(&self, song: &Song) -> bool {
         song.bpm_range.is_some_and(|(lo, hi)| f32::from(self.lo) <= lo.round() && hi.round() <= f32::from(self.hi))
+    }
+}
+
+/// 서열표 조건 `lo..=hi`, 서열 값 하나면 둘이 같음
+/// 소수 비교 오차를 피하려고 0.1 단위 정수 (15.1은 151)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FloorRange {
+    /// 없으면 설정의 모드
+    pub mode: Option<Mode>,
+    /// 비워 둔 끝은 0
+    pub lo: u16,
+    /// 비워 둔 끝은 `u16::MAX`
+    pub hi: u16,
+}
+
+impl FloorRange {
+    /// 공백으로 나눈 낱말들이 "15.1", "14.1~15.3", "15.1~", "~13.3"이나 앞에 모드를 붙인 꼴 ("4b 15.1~")
+    fn parse(words: &[&str]) -> Option<FloorRange> {
+        // 숫자 사이 공백까지 지우면 앞 조건의 끝값을 서열 값의 앞자리로 읽음
+        let numeric = |c: char| c.is_ascii_digit() || c == '.';
+        if words.windows(2).any(|w| w[0].ends_with(numeric) && w[1].starts_with(numeric)) {
+            return None;
+        }
+        let text = keys(&words.concat())?;
+        let (mode, s) = match MODE_KEYS.iter().find(|(k, _)| text.starts_with(k)) {
+            Some(&(k, m)) => (Some(m), &text[k.len()..]),
+            None => (None, text.as_str()),
+        };
+        // `u16` 파싱이 받는 '+'는 `keys`에서 이미 걸러짐
+        let one = |s: &str| {
+            let (whole, tenth) = s.split_once('.')?;
+            let &[tenth @ b'0'..=b'9'] = tenth.as_bytes() else { return None };
+            let whole = whole.parse::<u16>().ok().filter(|_| whole.len() <= 2 && !whole.starts_with('0'))?;
+            Some(whole * 10 + u16::from(tenth - b'0'))
+        };
+        let (lo, hi) = range(s, one, 0, u16::MAX)?;
+        Some(FloorRange { mode, lo, hi })
+    }
+
+    /// 모드 `mode`의 `diff` 패턴 서열 값이 범위 안, 값이 없는 패턴은 안 맞음
+    pub fn matches(&self, song: &Song, mode: Mode, diff: Diff) -> bool {
+        song.floor(mode, diff).is_some_and(|f| (self.lo..=self.hi).contains(&((f * 10.0).round() as u16)))
     }
 }
 
@@ -176,10 +223,11 @@ impl TagRange {
     }
 }
 
-/// 조건 검색어, 셋 중 하나는 꼭 있음
+/// 조건 검색어, 넷 중 하나는 꼭 있음
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Filter {
     pub level: Option<LevelQuery>,
+    pub floor: Option<FloorRange>,
     pub bpm: Option<BpmRange>,
     pub tags: Vec<TagRange>,
 }
@@ -188,6 +236,33 @@ impl Filter {
     /// 검색어 전체가 조건으로만 이뤄졌으면 Some
     /// 패턴 특성 이름은 `names`에 있는 것만 받음
     pub fn parse(raw: &str, names: &TagNames) -> Option<Filter> {
+        if raw.contains('.') {
+            let words: Vec<_> = raw.split_whitespace().collect();
+            // 먼저 떼어야 "트릴:1~ 15.1~"의 15를 특성 범위 끝값으로 안 읽음
+            // 긴 쪽부터 봐야 "4b 14.1 ~ 15.3"의 모드와 범위 끝을 놓치지 않음
+            // 앞뒤가 조건이 아니면 다른 자리를 봄 ("트릴:1 ~ 15.1 ~"는 "15.1 ~"가 서열표)
+            // 점 든 글은 조건이 안 돼서 서열표 둘은 어느 자리로도 안 맞음
+            for start in 0..words.len() {
+                'span: for end in (start + 1..=words.len()).rev() {
+                    let Some(floor) = FloorRange::parse(&words[start..end]) else { continue };
+                    let mut filter = Filter { level: None, floor: Some(floor), bpm: None, tags: Vec::new() };
+                    // 앞뒤를 이으면 "bp 15.1 m150"이 bpm150으로 읽혀서 따로 봄
+                    for part in [&words[..start], &words[end..]].into_iter().filter(|p| !p.is_empty()) {
+                        let Some(rest) = Self::parse_conditions(&part.join(" "), names) else { continue 'span };
+                        if rest.level.is_some() || (filter.bpm.is_some() && rest.bpm.is_some()) {
+                            continue 'span;
+                        }
+                        filter.bpm = filter.bpm.or(rest.bpm);
+                        filter.tags.extend(rest.tags);
+                    }
+                    return Some(filter);
+                }
+            }
+        }
+        Self::parse_conditions(raw, names)
+    }
+
+    fn parse_conditions(raw: &str, names: &TagNames) -> Option<Filter> {
         // 특성 이름은 친 글자 그대로 비교, 자판 키로 바꾸면 "게단"이 계단으로 읽힘
         let text = squeeze(raw);
         let mut rest = Vec::new();
@@ -202,7 +277,7 @@ impl Filter {
             from = at + 1 + used;
         }
         rest.push(&text[from..]);
-        let mut filter = Filter { level: None, bpm: None, tags };
+        let mut filter = Filter { level: None, floor: None, bpm: None, tags };
         // 남은 글을 이어 붙이면 "sc1트릴:24"가 sc14로 읽혀서 조각마다 따로 봄
         for part in rest.into_iter().filter(|p| !p.is_empty()) {
             let (level, bpm) = Self::level_and_bpm(&keys(part)?)?;
@@ -239,26 +314,34 @@ impl Filter {
         Some((level, Some(bpm)))
     }
 
-    /// 설정 모드로 찾는 패턴 조건, 레벨 조건에 모드가 없거나 레벨 조건 없이 특성 조건이 있음
+    /// 검색어에 적은 모드, 레벨이나 서열표 조건 앞에만 붙음
+    pub fn mode(&self) -> Option<Mode> {
+        self.level.and_then(|l| l.mode).or(self.floor.and_then(|f| f.mode))
+    }
+
+    /// 설정 모드로 찾는 패턴 조건, 레벨·서열표 조건에 모드가 없거나 둘 다 없이 특성 조건이 있음
     pub fn uses_mode_setting(&self) -> bool {
-        match self.level {
-            Some(l) => l.mode.is_none(),
-            None => !self.tags.is_empty(),
+        match (self.level, self.floor) {
+            (Some(l), _) => l.mode.is_none(),
+            (_, Some(f)) => f.mode.is_none(),
+            _ => !self.tags.is_empty(),
         }
     }
 
     /// 조건에 맞는 (`songs` 인덱스, 패턴 난이도), `allow`가 받는 곡만
-    /// 레벨이나 특성 조건이 있으면 맞는 패턴마다, 없으면 곡마다 난이도 None
+    /// 레벨·서열표·특성 조건이 있으면 맞는 패턴마다, 없으면 곡마다 난이도 None
     /// 패턴은 모드 `mode` (실제로 적용할 모드)로 봄
     /// 게임 목록의 제목순 (`dmpicker_nav::order_key`, 같으면 원래 이름), 같은 곡은 NM부터
     pub fn find(&self, songs: &[Song], mode: Mode, allow: impl Fn(usize) -> bool) -> Vec<(usize, Option<Diff>)> {
-        let fits = |s: &Song, d: Diff| s.level(mode, d).is_some() && self.tags.iter().all(|t| t.matches(s.pattern_tags(mode, d)));
+        let fits = |s: &Song, d: Diff| s.level(mode, d).is_some()
+            && self.floor.is_none_or(|f| f.matches(s, mode, d))
+            && self.tags.iter().all(|t| t.matches(s.pattern_tags(mode, d)));
         let mut hits: Vec<(Option<dmpicker_nav::OrderKey>, usize, Option<Diff>)> = Vec::new();
         for (i, s) in songs.iter().enumerate() {
             if !self.bpm.is_none_or(|b| b.matches(s)) || !allow(i) {
                 continue;
             }
-            let diffs: Vec<Option<Diff>> = if self.level.is_none() && self.tags.is_empty() {
+            let diffs: Vec<Option<Diff>> = if self.level.is_none() && self.floor.is_none() && self.tags.is_empty() {
                 vec![None]
             } else {
                 Diff::ALL.into_iter().filter(|&d| self.level.is_none_or(|l| l.diff == d && l.matches(s, mode)) && fits(s, d)).map(Some).collect()
