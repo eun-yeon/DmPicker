@@ -74,6 +74,10 @@ impl Popup {
         if !self.records.apply(reply) {
             return false;
         }
+        // 받은 결과로 상태 글이 바뀌고 반짝임이 끝나서 한 프레임에 안 바뀌게 겹쳐 바꿈
+        if self.sheet == Sheet::Filter && self.sheet_geom().alpha >= 0.5 {
+            self.sheet_swap.swap();
+        }
         self.refresh_record_rows();
         true
     }
@@ -229,6 +233,8 @@ impl Popup {
                 false
             }
             Control::Refresh => {
+                // 상태 글이 받는 중으로 바뀌며 반짝임이 시작돼서 겹쳐 바꿈
+                self.sheet_swap.swap();
                 self.filter_changed(committed);
                 return Action::RefreshRecords;
             }

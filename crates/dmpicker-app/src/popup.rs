@@ -1289,6 +1289,7 @@ pub struct Popup {
     filter_swap: IconSwap,  // 필터 버튼 아이콘, 기록 필터가 걸리면 채운 깔때기로 번지며 바뀜
     cond_shown: Presence,   // 바 채보 칸, 나타나고 사라질 때 번지며 줄어듦 (아이콘 바꾸기와 같은 빠르기)
     cond_text: String,      // 바 채보 칸 글, 사라지는 동안엔 마지막 글 그대로
+    cond_swap: Crossfade,   // 바 채보 칸 글, 모드·난이도가 바뀌면 겹쳐 바꿈
     lead_swap: IconSwap,    // 입력 칸 앞 아이콘, 바뀌면 번지며 바뀜
     filter_connected: bool, // 지난 프레임 필터 시트가 닉네임을 연결한 모양, 바뀌면 버튼 하나가 둘로 바뀌는 것까지 겹쳐 바꿈
     sort_arrow: IconSwap,   // 정렬 방향 화살표, 방향을 바꾸면 옛 것은 줄며 빠지고 새 것이 커지며 들어옴
@@ -1301,6 +1302,7 @@ pub struct Popup {
     scroll_s: Spring,       // 목록 오프셋 px, scroll x 줄 간격을 따라감
     seg: [SegThumb; 6],     // 세그먼트 손잡이 [모드, 난이도, 히스토리 탭, 검색 제외 탭, 정렬, 플레이]
     sheet_swap: Crossfade,  // 시트 내용, 보기나 카드가 바뀌면 겹쳐 바꿈
+    exclude_hl: Option<Spring>, // 검색 제외 줄 강조 위쪽 (목록 맨 위에서), 줄을 옮기면 다른 목록 선택 강조처럼 미끄러짐
     list_swap: Crossfade,   // 히스토리·검색 제외 줄 목록, 탭이 바뀌면 겹쳐 바꿈 (탭은 제자리)
     star: Option<StarMotion>, // 키워드 시트 별 버튼 모션, 시트를 닫으면 버림
     toggles: [ToggleMotion; 3], // 검색어 유지, DLC 표시, 유리 효과
@@ -1540,6 +1542,7 @@ impl Popup {
             filter_swap: IconSwap::new(Icon::Filter),
             cond_shown: Presence::new(1.0),
             cond_text: String::new(),
+            cond_swap: Crossfade::new(),
             lead_swap: IconSwap::new(Icon::Search),
             filter_connected: false,
             sort_arrow: IconSwap::new(Icon::SortUp),
@@ -1552,6 +1555,7 @@ impl Popup {
             scroll_s: Spring::new(0.0, SCROLL_SPRING.0, SCROLL_SPRING.1),
             seg: [SegThumb::new(); 6],
             sheet_swap: Crossfade::new(),
+            exclude_hl: None,
             list_swap: Crossfade::new(),
             star: None,
             toggles: [ToggleMotion::new(), ToggleMotion::new(), ToggleMotion::new()],
@@ -1734,6 +1738,8 @@ impl Popup {
                 || !self.scroll_s.settled()
                 || self.seg.iter().any(|t| !t.settled())
                 || self.sheet_swap.animating()
+                || self.cond_swap.animating()
+                || self.exclude_hl.is_some_and(|s| !s.settled_to(PANEL_REST))
                 || self.list_swap.animating()
                 || self.star.as_ref().is_some_and(|m| !m.done(m.elapsed()))
                 || self.toggles.iter().any(|t| !t.done())
@@ -2275,7 +2281,7 @@ impl Popup {
     fn retarget_panel(&mut self) {
         let to = self.panel_target();
         if to <= 0.0 {
-            self.shown.go(0.0, SHEET_OUT_SECS, Ease::STANDARD);
+            self.shown.go(0.0, SHEET_OUT_SECS, Ease::DECEL);
             self.panel_h.target = 0.0;
             self.unfolding = false;
             return;
@@ -3912,6 +3918,29 @@ impl Popup {
         if height == 0.0 { self.px(lay::EXCLUDE_EMPTY_H) } else { height.min(self.px(lay::EXCLUDE_LIST_H)) }
     }
 
+    /// 강조할 검색 제외 줄: 화살표로 고른 줄, 없으면 커서 아래 줄 (지워지는 줄은 빼고)
+    fn exclude_lit(&self) -> Option<usize> {
+        let hovered = match self.hover {
+            Hit::ExcludeRow(j) | Hit::ExcludeButton(j) => Some(j),
+            _ => None,
+        };
+        let i = self.exclude_focus.or(hovered)?;
+        self.exclude_rows.get(i).filter(|r| r.removal.is_none()).map(|_| i)
+    }
+
+    /// 검색 제외 줄 강조를 고른 줄로 보냄, 없다가 생기면 그 자리에 바로
+    fn step_exclude_highlight(&mut self, dt: f32) {
+        let top = self.exclude_lit().filter(|_| self.view == View::Exclude).map(|i| self.exclude_row_top(i));
+        self.exclude_hl = top.map(|top| match self.exclude_hl {
+            Some(mut s) => {
+                s.target = top;
+                s.step(dt);
+                s
+            }
+            None => Spring { value: top, target: top, ..SEL_SPRING },
+        });
+    }
+
     /// 판정(`exclude_at`)·스크롤·패널 높이와 같은 식, 한꺼번에 반올림하면 4/3 배율에서 아래 줄로 몇 px씩 밀림
     fn exclude_row_rect(&self, i: usize) -> D2D_RECT_F {
         let clip = self.exclude_clip();
@@ -4002,6 +4031,12 @@ impl Popup {
                 unsafe { dc.PopLayer() };
                 result?;
             }
+            // 강조는 줄마다 칠하지 않고 하나를 미끄러지게 그림 (`exclude_hl`)
+            if let (Some(i), Some(hl)) = (self.exclude_lit(), self.exclude_hl) {
+                let r = self.exclude_row_rect(i);
+                let top = clip.top + hl.value - self.exclude_scroll_s.value;
+                unsafe { dc.FillRoundedRectangle(&rounded(rect(r.left, top, r.right, top + (r.bottom - r.top)), self.px(12.0)), &g.brush(white(FILL_HOVER))?) };
+            }
             for (i, jacket) in shown {
                 let row = &self.exclude_rows[*i];
                 if let Some(removal) = &row.removal {
@@ -4059,14 +4094,10 @@ impl Popup {
         let dc = &g.dc;
         let row = &self.exclude_rows[i];
         let r = self.exclude_row_rect(i);
-        let lit = row.removal.is_none() && self.exclude_focus.map_or(matches!(self.hover, Hit::ExcludeRow(j) | Hit::ExcludeButton(j) if i == j), |focus| focus == i);
         let on = alpha_step(row.motion.tint.value());
         let ink = |c: D2D1_COLOR_F| g.brush(white(FAINT.a + (c.a - FAINT.a) * on));
         let (title_b, sub_b, faint) = (ink(TEXT)?, ink(SUB)?, g.brush(FAINT)?);
         let control = self.exclude_control_rect(i);
-        if lit {
-            unsafe { dc.FillRoundedRectangle(&rounded(r, self.px(12.0)), &g.brush(white(FILL_HOVER))?) };
-        }
         match &row.kind {
             ExcludeKind::Dlc(pack) => {
                 let left = self.px(lay::MARGIN + lay::INSET);
@@ -4096,7 +4127,7 @@ impl Popup {
             draw_button(g, &f.item, control, self.exclude_button_label(i), pressed, self.scale)
         } else {
             let m = &row.motion;
-            draw_toggle(g, control, (m.knob.value(), m.tint.value(), m.press.value()), lit, self.scale)
+            draw_toggle(g, control, (m.knob.value(), m.tint.value(), m.press.value()), self.exclude_lit() == Some(i), self.scale)
         }
     }
 
@@ -5060,13 +5091,18 @@ impl Popup {
         self.cond_shown.go(shown);
         self.cond_shown.step(dt);
         if shown {
-            self.cond_text = self.cond_label();
+            let label = self.cond_label();
+            if label != self.cond_text {
+                self.cond_swap.swap();
+            }
+            self.cond_text = label;
         }
     }
 
     fn snap_bar_swaps(&mut self) {
         self.lead_swap = IconSwap::new(self.lead_icon());
         self.filter_swap = IconSwap::new(self.filter_icon());
+        self.cond_swap.reset();
         self.cond_shown = Presence::new(self.shows_cond() as u8 as f32);
         self.cond_text = self.cond_label();
     }
@@ -6537,6 +6573,7 @@ impl Popup {
         }
         self.step_settings_scroll(dt);
         self.refresh_scroll_hover();
+        self.step_exclude_highlight(dt);
         if self.scroll_s.settled() {
             self.scroll_s.snap(self.scroll_s.target); // 정수 픽셀에서 멈춰야 글자가 선명함
         }
@@ -6615,6 +6652,7 @@ impl Popup {
         let (ox, oy) = (self.px(lay::MARGIN + lay::W / 2.0), self.px(lay::MARGIN + lay::BAR_H / 2.0));
         let shrink = windows_numerics::Matrix3x2 { M11: k, M12: 0.0, M21: 0.0, M22: k, M31: ox * (1.0 - k), M32: oy * (1.0 - k) };
         let (mut sheet_drawn, mut list_drawn) = (None, None);
+        let mut cond_parts = Parts::new();
 
         unsafe {
             let dc = &g.dc;
@@ -6932,14 +6970,33 @@ impl Popup {
                 Vec::new()
             };
             let cond_v = self.cond_shown.value();
-            let cond_drawn = if cond_v > 0.0 && self.cond_shown.moving() {
+            let cond_drawn = if cond_v > 0.0 {
+                // 칸 왼쪽 위 기준으로 기록해서 섞는 중에 바가 움직여도 옛 글이 제자리에 안 남음
+                // 기준점은 정수 픽셀, 소수 자리로 옮기면 멈춘 글도 반 픽셀 번짐
+                // 글을 먼저 섞고 줄임·흐림·불투명도는 섞은 그림에 줌, 섞는 중에 사라져도 옛 글이 같이 사라짐
                 let cr = self.cond_rect();
+                let (ox, oy) = (cr.left.round(), cr.top.round());
+                let moving = self.cond_shown.moving();
+                let local = record(dc, || {
+                    dc.SetTransform(&windows_numerics::Matrix3x2 { M11: 1.0, M12: 0.0, M21: 0.0, M22: 1.0, M31: -ox, M32: -oy });
+                    self.draw_cond(1.0, moving)
+                })?;
+                let (mixed, parts) = self.cond_swap.compose(g, local)?;
+                cond_parts = parts;
                 let k = COND_FADE_MIN + (1.0 - COND_FADE_MIN) * cond_v;
-                let at = windows_numerics::Matrix3x2 { M11: k, M12: 0.0, M21: 0.0, M22: k, M31: cr.right * (1.0 - k), M32: cy * (1.0 - k) };
                 let (a, b) = self.cond_shown.look();
+                let at = windows_numerics::Matrix3x2 { M11: k, M12: 0.0, M21: 0.0, M22: k, M31: ox * k + cr.right * (1.0 - k), M32: oy * k + cy * (1.0 - k) };
                 Some(soften(g, ICON_SWAP_BLUR * s * b, || {
                     dc.SetTransform(&at);
-                    self.draw_cond(alpha_step(a), true)
+                    let a = alpha_step(a);
+                    if a < 1.0 {
+                        dc.PushLayer(&gfx::layer(a, None), None);
+                    }
+                    dc.DrawImage(&mixed, None, None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
+                    if a < 1.0 {
+                        dc.PopLayer();
+                    }
+                    Ok(())
                 })?)
             } else {
                 None
@@ -6975,8 +7032,6 @@ impl Popup {
             // 보이는 때와 글은 `shows_cond`·`cond_label`, 나타나고 사라지는 동안엔 3)에서 기록한 그림
             if let Some(img) = &cond_drawn {
                 dc.DrawImage(img, None, None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
-            } else if cond_v >= 1.0 {
-                self.draw_cond(1.0, false)?;
             }
 
             // 버튼이 다 들어가 멈추면 바를 따라 돌아오던 입력 칸 글은 원래대로
@@ -7073,8 +7128,10 @@ impl Popup {
         }
         self.sheet_swap.last = sheet_drawn.map(|(_, parts)| parts).unwrap_or_default();
         self.list_swap.last = list_drawn.map(|(_, parts)| parts).unwrap_or_default();
+        self.cond_swap.last = cond_parts;
         self.sheet_swap.retire();
         self.list_swap.retire();
+        self.cond_swap.retire();
         let seen = self.schema_card_visible();
         self.moving = self.animating();
         let presented = self.gfx.as_ref().unwrap().present();
