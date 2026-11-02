@@ -1289,7 +1289,6 @@ pub struct Popup {
     filter_swap: IconSwap,  // 필터 버튼 아이콘, 기록 필터가 걸리면 채운 깔때기로 번지며 바뀜
     cond_shown: Presence,   // 바 채보 칸, 나타나고 사라질 때 번지며 줄어듦 (아이콘 바꾸기와 같은 빠르기)
     cond_text: String,      // 바 채보 칸 글, 사라지는 동안엔 마지막 글 그대로
-    cond_swap: Crossfade,   // 바 채보 칸 글, 모드·난이도가 바뀌면 겹쳐 바꿈
     lead_swap: IconSwap,    // 입력 칸 앞 아이콘, 바뀌면 번지며 바뀜
     filter_connected: bool, // 지난 프레임 필터 시트가 닉네임을 연결한 모양, 바뀌면 버튼 하나가 둘로 바뀌는 것까지 겹쳐 바꿈
     sort_arrow: IconSwap,   // 정렬 방향 화살표, 방향을 바꾸면 옛 것은 줄며 빠지고 새 것이 커지며 들어옴
@@ -1542,7 +1541,6 @@ impl Popup {
             filter_swap: IconSwap::new(Icon::Filter),
             cond_shown: Presence::new(1.0),
             cond_text: String::new(),
-            cond_swap: Crossfade::new(),
             lead_swap: IconSwap::new(Icon::Search),
             filter_connected: false,
             sort_arrow: IconSwap::new(Icon::SortUp),
@@ -1738,7 +1736,6 @@ impl Popup {
                 || !self.scroll_s.settled()
                 || self.seg.iter().any(|t| !t.settled())
                 || self.sheet_swap.animating()
-                || self.cond_swap.animating()
                 || self.exclude_hl.is_some_and(|s| !s.settled_to(PANEL_REST))
                 || self.list_swap.animating()
                 || self.star.as_ref().is_some_and(|m| !m.done(m.elapsed()))
@@ -5091,18 +5088,13 @@ impl Popup {
         self.cond_shown.go(shown);
         self.cond_shown.step(dt);
         if shown {
-            let label = self.cond_label();
-            if label != self.cond_text {
-                self.cond_swap.swap();
-            }
-            self.cond_text = label;
+            self.cond_text = self.cond_label();
         }
     }
 
     fn snap_bar_swaps(&mut self) {
         self.lead_swap = IconSwap::new(self.lead_icon());
         self.filter_swap = IconSwap::new(self.filter_icon());
-        self.cond_swap.reset();
         self.cond_shown = Presence::new(self.shows_cond() as u8 as f32);
         self.cond_text = self.cond_label();
     }
@@ -6088,11 +6080,12 @@ impl Popup {
         Ok(l)
     }
 
-    /// 위쪽이 `y`인 줄의 재킷 자리: 줄 강조 안쪽 8에 32 x 32로 세로 가운데, 모서리는 줄 강조와 동심
+    /// 위쪽이 `y`인 줄의 재킷 자리: 줄 강조 안쪽 8에 32 x 32로 세로 가운데
+    /// 모서리는 6 고정, 줄 강조와 동심인 4는 강조·바보다 훨씬 각져 보이고 8은 작은 앱 아이콘처럼 보임
     fn jacket_slot(&self, y: f32) -> D2D1_ROUNDED_RECT {
         let size = self.px(32.0);
         let (x, top) = (self.px(lay::MARGIN) + self.px(lay::PAD) + self.px(8.0), y + (self.px(lay::ROW_H) - size) / 2.0);
-        rrect(x, top, x + size, top + size, self.px(lay::PANEL_R - lay::PAD - 8.0))
+        rrect(x, top, x + size, top + size, self.px(6.0))
     }
 
     /// 위쪽이 `y`인 줄의 제목과 아랫줄, 재킷 자리 오른쪽 10부터 `right`까지 (넘치면 말줄임)
@@ -6652,7 +6645,6 @@ impl Popup {
         let (ox, oy) = (self.px(lay::MARGIN + lay::W / 2.0), self.px(lay::MARGIN + lay::BAR_H / 2.0));
         let shrink = windows_numerics::Matrix3x2 { M11: k, M12: 0.0, M21: 0.0, M22: k, M31: ox * (1.0 - k), M32: oy * (1.0 - k) };
         let (mut sheet_drawn, mut list_drawn) = (None, None);
-        let mut cond_parts = Parts::new();
 
         unsafe {
             let dc = &g.dc;
@@ -6970,33 +6962,14 @@ impl Popup {
                 Vec::new()
             };
             let cond_v = self.cond_shown.value();
-            let cond_drawn = if cond_v > 0.0 {
-                // 칸 왼쪽 위 기준으로 기록해서 섞는 중에 바가 움직여도 옛 글이 제자리에 안 남음
-                // 기준점은 정수 픽셀, 소수 자리로 옮기면 멈춘 글도 반 픽셀 번짐
-                // 글을 먼저 섞고 줄임·흐림·불투명도는 섞은 그림에 줌, 섞는 중에 사라져도 옛 글이 같이 사라짐
+            let cond_drawn = if cond_v > 0.0 && self.cond_shown.moving() {
                 let cr = self.cond_rect();
-                let (ox, oy) = (cr.left.round(), cr.top.round());
-                let moving = self.cond_shown.moving();
-                let local = record(dc, || {
-                    dc.SetTransform(&windows_numerics::Matrix3x2 { M11: 1.0, M12: 0.0, M21: 0.0, M22: 1.0, M31: -ox, M32: -oy });
-                    self.draw_cond(1.0, moving)
-                })?;
-                let (mixed, parts) = self.cond_swap.compose(g, local)?;
-                cond_parts = parts;
                 let k = COND_FADE_MIN + (1.0 - COND_FADE_MIN) * cond_v;
+                let at = windows_numerics::Matrix3x2 { M11: k, M12: 0.0, M21: 0.0, M22: k, M31: cr.right * (1.0 - k), M32: cy * (1.0 - k) };
                 let (a, b) = self.cond_shown.look();
-                let at = windows_numerics::Matrix3x2 { M11: k, M12: 0.0, M21: 0.0, M22: k, M31: ox * k + cr.right * (1.0 - k), M32: oy * k + cy * (1.0 - k) };
                 Some(soften(g, ICON_SWAP_BLUR * s * b, || {
                     dc.SetTransform(&at);
-                    let a = alpha_step(a);
-                    if a < 1.0 {
-                        dc.PushLayer(&gfx::layer(a, None), None);
-                    }
-                    dc.DrawImage(&mixed, None, None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
-                    if a < 1.0 {
-                        dc.PopLayer();
-                    }
-                    Ok(())
+                    self.draw_cond(alpha_step(a), true)
                 })?)
             } else {
                 None
@@ -7032,6 +7005,8 @@ impl Popup {
             // 보이는 때와 글은 `shows_cond`·`cond_label`, 나타나고 사라지는 동안엔 3)에서 기록한 그림
             if let Some(img) = &cond_drawn {
                 dc.DrawImage(img, None, None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
+            } else if cond_v >= 1.0 {
+                self.draw_cond(1.0, false)?;
             }
 
             // 버튼이 다 들어가 멈추면 바를 따라 돌아오던 입력 칸 글은 원래대로
@@ -7128,10 +7103,8 @@ impl Popup {
         }
         self.sheet_swap.last = sheet_drawn.map(|(_, parts)| parts).unwrap_or_default();
         self.list_swap.last = list_drawn.map(|(_, parts)| parts).unwrap_or_default();
-        self.cond_swap.last = cond_parts;
         self.sheet_swap.retire();
         self.list_swap.retire();
-        self.cond_swap.retire();
         let seen = self.schema_card_visible();
         self.moving = self.animating();
         let presented = self.gfx.as_ref().unwrap().present();
