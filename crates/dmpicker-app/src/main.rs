@@ -19,11 +19,14 @@ mod keywords;
 mod pace;
 mod playlist;
 mod popup;
+mod presets;
+mod record_filter;
 mod scene;
 mod sys;
 mod toast;
 mod tray;
 mod update;
+mod varchive;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -84,6 +87,7 @@ struct App {
     /// 지금 검색창을 연 선곡 화면, 첫 데이터를 넣을 때 고를 수 있는 곡을 다시 계산
     open_kind: Option<ScreenKind>,
     playlists: playlist::Loader,
+    records: varchive::Loader,
 }
 
 /// 단축키 뒤 화면 확인 결과: 선곡 목록이 보였으면 Some(그 화면, 그 목록에서 고를 수 있는 곡, 첫 인식 전엔 None)
@@ -240,7 +244,11 @@ fn load_settings(p: &mut Popup) {
 }
 
 /// 설정 파일 내용을 검색창에 넣음, 없거나 못 읽는 값은 그대로 (1.0.0 파일엔 keep_query·show_dlc가 없음)
+/// 필터·프리셋·닉네임은 없거나 못 읽으면 기본값
 fn apply_settings(p: &mut Popup, v: &serde_json::Value) {
+    p.record_filter = record_filter::Options::from_json(&v["filter"]);
+    p.load_presets(&v["presets"]);
+    p.records.set_nickname(v["varchive_nickname"].as_str().unwrap_or_default());
     if let Some(m) = v["mode"].as_str() {
         if let Some(m) = dmpicker_search::Mode::from_label(m) {
             p.mode_choice = m;
@@ -274,11 +282,12 @@ fn settings_json(p: &Popup) -> serde_json::Value {
     hidden_dlc.sort();
     let mut hidden_songs: Vec<_> = p.hidden_songs().iter().collect();
     hidden_songs.sort();
-    serde_json::json!({ "mode": p.mode_choice.label(), "diff": p.diff_choice.label(), "hotkey": p.hotkey.label(), "keep_query": p.keep_query, "show_dlc": p.show_dlc, "glass": p.glass, "hidden_dlc": hidden_dlc, "hidden_songs": hidden_songs })
+    serde_json::json!({ "mode": p.mode_choice.label(), "diff": p.diff_choice.label(), "hotkey": p.hotkey.label(), "keep_query": p.keep_query, "show_dlc": p.show_dlc, "glass": p.glass, "hidden_dlc": hidden_dlc, "hidden_songs": hidden_songs, "varchive_nickname": p.records.nickname, "filter": p.record_filter.json(), "presets": p.presets_json() })
 }
 
 /// 저장하지 못하면 알림 (다시 켜면 예전 값으로 돌아감)
 fn save_settings(a: &mut App) -> bool {
+    a.popup.take_filter_changed();
     let ok = sys::save_file(&settings_path(), settings_json(&a.popup).to_string().as_bytes()).is_ok();
     if !ok {
         a.toast.show("설정을 저장하지 못했어요", Badge::None, Some(3.0));
@@ -400,6 +409,16 @@ fn on_action(a: &mut App, act: Action) -> Option<After> {
             after = Some(After::Open(a.updates.release_url()));
         }
         Action::Hide => a.popup.hide(),
+        Action::RefreshRecords => {
+            request_records(a);
+            let _ = a.popup.render();
+        }
+        Action::Nickname => {
+            save_settings(a);
+            save_records(a);
+            request_records(a);
+            let _ = a.popup.render();
+        }
         Action::Choice => {
             a.toast.set_glass(a.popup.glass);
             save_settings(a);
@@ -424,6 +443,16 @@ fn on_action(a: &mut App, act: Action) -> Option<After> {
     if !a.popup.is_open() { a.updates.closed(); }
     request_playlist(a);
     after
+}
+
+fn save_records(a: &mut App) {
+    if let Err(note) = a.popup.records.save(&a.store.join("varchive.json")) {
+        a.toast.show(note, Badge::None, Some(3.0));
+    }
+}
+
+fn request_records(a: &mut App) {
+    a.records.request(&mut a.popup.records, a.titles.keys().copied().collect(), a.popup.hwnd);
 }
 
 /// 검색창이 플레이리스트 주소를 검색했으면 작업 스레드로 받아 오기 시작
@@ -612,6 +641,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
     let Some(cell) = APP.with(Cell::get) else { return unsafe { DefWindowProcW(hwnd, msg, wp, lp) } };
     let Ok(mut guard) = cell.try_borrow_mut() else { return reentered(hwnd, msg, wp, lp) };
     let (ret, after) = on_message(&mut guard, hwnd, msg, wp, lp);
+    if guard.popup.has_filter_changes() {
+        save_settings(&mut guard);
+    }
     drop(guard);
     match after {
         Some(After::Menu { tray, x, y, hotkey }) => {
@@ -727,6 +759,15 @@ fn on_message(a: &mut App, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> (Opt
         request_playlist(a);
         return (Some(LRESULT(0)), None);
     }
+    if msg == varchive::READY {
+        while let Some(reply) = a.records.take() {
+            if a.popup.records_reply(reply) {
+                save_records(a);
+            }
+        }
+        let _ = a.popup.render();
+        return (Some(LRESULT(0)), None);
+    }
     if msg == playlist::READY {
         while let Some(reply) = a.playlists.take() {
             a.popup.playlist_reply(reply);
@@ -809,11 +850,13 @@ fn main() -> Result<()> {
             peeked: Arc::new(Mutex::new(None)),
             open_kind: None,
             playlists: playlist::Loader::default(),
+            records: varchive::Loader::default(),
         })));
         {
             let mut guard = app.borrow_mut();
             let a = &mut *guard;
             load_settings(&mut a.popup);
+            a.popup.records = varchive::Cache::load(&a.store.join("varchive.json"), &a.popup.records.nickname);
             a.toast.set_glass(a.popup.glass);
             a.popup.load_history(store_dir());
             a.popup.warm_up();

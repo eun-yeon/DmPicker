@@ -14,7 +14,7 @@ const MAX_REDIRECTS: usize = 5;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const BUFFER_BYTES: usize = 8192;
 const POLL: Duration = Duration::from_millis(50);
-const UPDATE_RECEIVE_TIMEOUT_MS: i32 = 30_000;
+const DEFAULT_RECEIVE_TIMEOUT_MS: i32 = 30_000;
 const PLAYLIST_RECEIVE_TIMEOUT_MS: i32 = 3_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,7 +75,7 @@ pub fn first_redirect(
 ) -> Result<String, Failure> {
     let deadline = deadline(timeout_secs)?;
     check(deadline, cancel)?;
-    let session = Session::new(UPDATE_RECEIVE_TIMEOUT_MS)?;
+    let session = Session::new(DEFAULT_RECEIVE_TIMEOUT_MS)?;
     let parsed = Url::parse(url)?;
     let request = session.request(&parsed, deadline, cancel)?;
     if request.status()? != 302 {
@@ -100,7 +100,7 @@ pub fn download(
         cap,
         timeout_secs,
         None,
-        UPDATE_RECEIVE_TIMEOUT_MS,
+        DEFAULT_RECEIVE_TIMEOUT_MS,
         cancel,
     )
 }
@@ -116,6 +116,11 @@ pub fn playlist(url: &str) -> Result<Vec<u8>, Failure> {
         PLAYLIST_RECEIVE_TIMEOUT_MS,
         &AtomicBool::new(false),
     )
+}
+
+/// 모드당 약 0.8 MiB인 기록에 여유를 두고 8 MiB·전체 30초로 제한
+pub fn varchive(url: &str, cancel: &AtomicBool) -> Result<Vec<u8>, Failure> {
+    download_inner(url, 8_388_608, 30, None, DEFAULT_RECEIVE_TIMEOUT_MS, cancel)
 }
 
 fn download_inner(
