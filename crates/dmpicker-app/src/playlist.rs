@@ -143,8 +143,7 @@ fn optional_text(v: &Value, key: &str) -> Option<String> {
     v.get(key)?.as_str().map(str::to_owned)
 }
 
-/// 히스토리 한 줄, `recent.txt`에 최신순으로 한 줄씩
-/// 곡은 곡 id, 플레이리스트는 `p {id} {곡 id} {모드} {난이도}`
+/// 히스토리 한 줄, `recent.json`에 최신순으로
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Recent {
     Song(u32),
@@ -160,7 +159,7 @@ impl Recent {
         }
     }
 
-    /// 곡 id만 있는 예전 파일도 그대로 읽힘
+    /// 옛 `recent.txt` 한 줄, 곡은 곡 id, 플레이리스트는 `p {id} {곡 id} {모드} {난이도}`
     fn parse(line: &str) -> Option<Self> {
         if let Ok(id) = line.trim().parse() {
             return Some(Self::Song(id));
@@ -174,11 +173,21 @@ impl Recent {
         Some(Self::Playlist { id: (*id).into(), last })
     }
 
-    fn line(&self) -> String {
+    fn json(&self) -> Value {
         match self {
-            Self::Song(id) => format!("{id}\n"),
-            Self::Playlist { id, last } => format!("p {id} {} {} {}\n", last.title, last.mode.label(), last.diff.label()),
+            Self::Song(id) => json!({ "song": id }),
+            Self::Playlist { id, last } => json!({ "playlist": id, "song": last.title, "mode": last.mode.label(), "diff": last.diff.label() }),
         }
+    }
+
+    fn from_json(value: &Value) -> Option<Self> {
+        let song = u32::try_from(value["song"].as_u64()?).ok()?;
+        let Some(id) = value.get("playlist") else {
+            return Some(Self::Song(song));
+        };
+        let id = id.as_str().filter(|id| valid_id(id))?;
+        let last = Pattern { title: song, mode: Mode::from_label(value["mode"].as_str()?)?, diff: Diff::from_label(value["diff"].as_str()?)? };
+        Some(Self::Playlist { id: id.into(), last })
     }
 
     /// 같은 곡이나 같은 플레이리스트, 마지막 패턴은 안 봄
@@ -207,22 +216,20 @@ pub struct Library {
 }
 
 impl Library {
-    /// 못 읽거나 겹치는 줄은 버림, 최근 기록만 `RECENT_MAX`까지, 사본이 없어도 히스토리 줄은 남김
+    /// 못 읽거나 겹치는 항목은 버림, 최근 기록만 `RECENT_MAX`까지, 사본이 없어도 히스토리 줄은 남김
+    /// 1.2.x까지 쓰던 txt는 json이 없을 때만 읽고 바로 json으로 옮김, 저장에 실패하면 txt를 남겨 다음에 다시 옮김
     pub fn load(root: PathBuf) -> Self {
-        let text = std::fs::read_to_string(root.join("recent.txt")).unwrap_or_default();
-        let favorites = match std::fs::read_to_string(root.join("favorites.txt")) {
-            Ok(text) => Some(text),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(String::new()),
-            Err(_) => None,
-        };
-        let favorites_unreadable = favorites.is_none();
-        let mut lib = Self { root: Some(root), favorites_unreadable, ..Self::default() };
-        for id in favorites.unwrap_or_default().lines().filter_map(|line| line.trim().parse().ok()) {
+        let favorites = read_list(&root, "favorites", |v| u32::try_from(v.as_u64()?).ok(), |line| line.trim().parse().ok());
+        let recent = read_list(&root, "recent", Recent::from_json, Recent::parse);
+        let mut lib = Self { root: Some(root), favorites_unreadable: favorites.is_none(), ..Self::default() };
+        let (favorites, moved_favorites) = favorites.unwrap_or_default();
+        for id in favorites {
             if !lib.is_favorite(id) {
                 lib.favorites.push(id);
             }
         }
-        for entry in text.lines().filter_map(Recent::parse) {
+        let (recent, moved_recent) = recent.unwrap_or_default();
+        for entry in recent {
             if lib.recent.len() == RECENT_MAX {
                 break;
             }
@@ -236,6 +243,13 @@ impl Library {
                 }
             }
             lib.recent.push(entry);
+        }
+        let root = lib.root.clone().unwrap_or_default();
+        if moved_favorites && lib.save_favorites(&lib.favorites) {
+            let _ = std::fs::remove_file(root.join("favorites.txt"));
+        }
+        if moved_recent && lib.save_recent() {
+            let _ = std::fs::remove_file(root.join("recent.txt"));
         }
         lib
     }
@@ -257,15 +271,23 @@ impl Library {
         } else {
             favorites.retain(|&i| i != id);
         }
-        if let Some(root) = &self.root {
-            let text: String = favorites.iter().map(|id| format!("{id}\n")).collect();
-            if let Err(e) = crate::sys::save_file(&root.join("favorites.txt"), text.as_bytes()) {
-                eprintln!("save favorites: {e}");
-                return Err(FAVORITES_SAVE_FAILED);
-            }
+        if !self.save_favorites(&favorites) {
+            return Err(FAVORITES_SAVE_FAILED);
         }
         self.favorites = favorites;
         Ok(added)
+    }
+
+    /// 쓸 곳이 없으면 안 쓰고 성공
+    fn save_favorites(&self, favorites: &[u32]) -> bool {
+        let Some(root) = &self.root else { return true };
+        match crate::sys::save_file(&root.join("favorites.json"), json!(favorites).to_string().as_bytes()) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("save favorites: {e}");
+                false
+            }
+        }
     }
 
     fn path(&self, id: &str) -> Option<PathBuf> {
@@ -315,12 +337,35 @@ impl Library {
         }
     }
 
-    fn save_recent(&self) {
-        let Some(root) = &self.root else { return };
-        let text: String = self.recent.iter().map(Recent::line).collect();
-        if let Err(e) = crate::sys::save_file(&root.join("recent.txt"), text.as_bytes()) {
-            eprintln!("save recent: {e}");
+    /// 쓸 곳이 없으면 안 쓰고 성공
+    fn save_recent(&self) -> bool {
+        let Some(root) = &self.root else { return true };
+        let text = Value::Array(self.recent.iter().map(Recent::json).collect()).to_string();
+        match crate::sys::save_file(&root.join("recent.json"), text.as_bytes()) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("save recent: {e}");
+                false
+            }
         }
+    }
+}
+
+/// `root`의 `{name}.json` 배열 항목, 없으면 옛 `{name}.txt` 줄 (옮겼는지도), 둘 다 없으면 빈 목록
+/// 파일은 있는데 못 읽으면 None, 덮어쓰면 목록을 잃음
+fn read_list<T>(root: &std::path::Path, name: &str, item: impl Fn(&Value) -> Option<T>, line: impl Fn(&str) -> Option<T>) -> Option<(Vec<T>, bool)> {
+    let read = |ext: &str| match std::fs::read_to_string(root.join(format!("{name}.{ext}"))) {
+        Ok(text) => Some(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(None),
+        Err(_) => None,
+    };
+    if let Some(text) = read("json")? {
+        let items = serde_json::from_str::<Value>(&text).ok()?;
+        return Some((items.as_array()?.iter().filter_map(item).collect(), false));
+    }
+    match read("txt")? {
+        Some(text) => Some((text.lines().filter_map(line).collect(), true)),
+        None => Some((Vec::new(), false)),
     }
 }
 
