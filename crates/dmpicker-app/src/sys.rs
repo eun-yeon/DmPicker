@@ -5,12 +5,13 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use windows::core::{s, w, Result, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{HWND, POINT, RECT};
+use windows::Win32::Foundation::{FILETIME, HWND, LPARAM, POINT, RECT, SYSTEMTIME, WPARAM};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 use windows::Win32::System::SystemInformation::OSVERSIONINFOW;
+use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 use windows::Win32::UI::Accessibility::{HIGHCONTRASTW, HCF_HIGHCONTRASTON};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -285,4 +286,20 @@ pub fn save_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
     }
     dmpicker_update::store::atomic_write(path, bytes).map_err(std::io::Error::other)
+}
+
+/// `HWND`는 스레드로 못 넘겨서 정수로 받음
+pub fn notify(hwnd: isize, message: u32) {
+    unsafe {
+        let _ = PostMessageW(Some(HWND(hwnd as _)), message, WPARAM(0), LPARAM(0));
+    }
+}
+
+pub fn local_time(stamp: &FILETIME) -> Option<SYSTEMTIME> {
+    let (mut utc, mut local) = (SYSTEMTIME::default(), SYSTEMTIME::default());
+    unsafe {
+        FileTimeToSystemTime(stamp, &mut utc).ok()?;
+        SystemTimeToTzSpecificLocalTime(None, &utc, &mut local).ok()?;
+    }
+    Some(local)
 }

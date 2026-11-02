@@ -1257,9 +1257,7 @@ fn success_text(published: &str, summary: &Summary) -> String {
 /// 발행 시각을 이 PC의 시간대로 바꾼 `M월 D일 HH:MM`
 fn published_label(published: &str) -> Option<String> {
     use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
-    use windows::Win32::System::Time::{
-        FileTimeToSystemTime, SystemTimeToFileTime, SystemTimeToTzSpecificLocalTime,
-    };
+    use windows::Win32::System::Time::SystemTimeToFileTime;
     let part = |range: std::ops::Range<usize>| published.get(range)?.parse::<u16>().ok();
     let utc = SYSTEMTIME {
         wYear: part(0..4)?,
@@ -1289,12 +1287,7 @@ fn published_label(published: &str) -> Option<String> {
         dwLowDateTime: ticks as u32,
         dwHighDateTime: (ticks >> 32) as u32,
     };
-    let mut utc = SYSTEMTIME::default();
-    let mut local = SYSTEMTIME::default();
-    unsafe {
-        FileTimeToSystemTime(&stamp, &mut utc).ok()?;
-        SystemTimeToTzSpecificLocalTime(None, &utc, &mut local).ok()?;
-    }
+    let local = crate::sys::local_time(&stamp)?;
     Some(format!(
         "{}월 {}일 {:02}:{:02}",
         local.wMonth, local.wDay, local.wHour, local.wMinute

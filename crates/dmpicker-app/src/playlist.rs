@@ -6,8 +6,8 @@ use std::sync::mpsc::{self, Receiver, Sender};
 
 use dmpicker_search::{Diff, Mode};
 use serde_json::{json, Value};
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
-use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
+use windows::Win32::Foundation::HWND;
+use windows::Win32::UI::WindowsAndMessaging::WM_APP;
 
 /// 응답이 도착함, 검색창 창으로 옴 (main.rs의 WM_APP 메시지와 안 겹치게)
 pub const READY: u32 = WM_APP + 3;
@@ -377,11 +377,11 @@ impl Loader {
         let spawned = std::thread::Builder::new().spawn(move || {
             let result = fetch(&id);
             let _ = tx.send(Reply { id, result });
-            notify(hwnd);
+            crate::sys::notify(hwnd, READY);
         });
         if spawned.is_err() {
             let _ = self.tx.send(Reply { id: failed_id, result: Err(Failure::Failed) });
-            notify(hwnd);
+            crate::sys::notify(hwnd, READY);
         }
     }
 
@@ -389,13 +389,6 @@ impl Loader {
         let reply = self.rx.try_recv().ok()?;
         self.pending.remove(&reply.id);
         Some(reply)
-    }
-}
-
-/// `HWND`는 스레드로 못 넘겨서 정수로 받음
-fn notify(hwnd: isize) {
-    unsafe {
-        let _ = PostMessageW(Some(HWND(hwnd as _)), READY, WPARAM(0), LPARAM(0));
     }
 }
 
