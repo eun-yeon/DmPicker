@@ -5270,8 +5270,6 @@ impl Popup {
                 Some((0, Action::None))
             }
             WM_IME_STARTCOMPOSITION => {
-                // 한글 자모 키는 IME가 가져가서 아래 키 처리에서 삭제 버튼을 못 닫음, 그대로 두면 Enter가 프리셋을 지움
-                self.close_preset_menu();
                 self.set_keyword_note(None);
                 // 선택이 있으면 먼저 지우고 그 자리에서 조합 (검색은 이어 오는 조합 메시지가 함)
                 self.edit.delete_selection();
@@ -5289,12 +5287,7 @@ impl Popup {
                         self.preedit.clear();
                     }
                     if flags & GCS_COMPSTR.0 != 0 {
-                        let comp = ime_string(himc, GCS_COMPSTR);
-                        // 확정하며 비우는 건 두어야 F2 뒤 Enter가 조합을 확정하고 그 프리셋을 지움
-                        if !comp.is_empty() && comp != self.preedit {
-                            self.close_preset_menu();
-                        }
-                        self.preedit = comp;
+                        self.preedit = ime_string(himc, GCS_COMPSTR);
                     } else if flags & GCS_RESULTSTR.0 == 0 {
                         self.preedit.clear();
                     }
@@ -5382,6 +5375,8 @@ impl Popup {
                         // 한국어 Windows 관례: Enter·화살표는 글자를 확정하고 동작도 함
                         self.complete_composition();
                     } else {
+                        // 입력기가 가져가는 키도 다른 키라 삭제 버튼을 닫음, 안 닫으면 글을 다 치고 누른 Enter가 프리셋을 지움
+                        self.close_preset_menu();
                         return None; // IME가 처리하는 키 (자모, 조합 중 Backspace 등)
                     }
                 }
