@@ -218,8 +218,8 @@ impl Cache {
         let Some(snapshot) = snapshot else {
             return "새로고침으로 기록을 불러와 주세요".into();
         };
-        // 닉네임은 옆 버튼에 있어서 안 붙임
-        format!("{} 기록 {}개 · {}", mode.label(), grouped(snapshot.records.len()), ago(snapshot.received_at, now))
+        // 받은 때만, 닉네임은 옆 버튼에 있고 모드는 검색어에 따라 여럿일 수 있어서 안 붙임
+        ago(snapshot.received_at, now)
     }
 }
 
@@ -232,18 +232,6 @@ fn ago(received_at: u64, now: u64) -> String {
         3600..86400 => format!("{}시간 전", elapsed / 3600),
         _ => format!("{}일 전", elapsed / 86400),
     }
-}
-
-fn grouped(n: usize) -> String {
-    let digits = n.to_string();
-    let mut text = String::new();
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            text.push(',');
-        }
-        text.push(c);
-    }
-    text
 }
 
 pub struct Reply {
