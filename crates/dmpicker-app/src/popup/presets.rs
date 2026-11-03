@@ -1,11 +1,11 @@
-//! 프리셋 목록과 저장·삭제·적용 처리
+//! 프리셋 목록과 저장·삭제·적용 처리, 이름을 붙이고 지우는 프리셋 시트
 
 use super::*;
 use crate::presets::Preset;
 
 const SAVE_LABEL: &str = "지금 검색 저장";
 const NO_PRESETS: &str = "저장한 프리셋이 없어요";
-const PRESET_DELETE: &str = "삭제하기";
+pub(super) const DELETE_LABEL: &str = "삭제";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ChangeKind {
@@ -19,6 +19,15 @@ pub(super) struct PresetChange {
     /// 저장 줄을 포함한 변경 전 지운 줄, 저장 줄 자리에 새로 저장하면 None
     pub row: Option<usize>,
     pub preset: Preset,
+}
+
+/// 프리셋 시트 상태와 닫으면 돌아갈 입력·스크롤
+pub(super) struct PresetEdit {
+    /// `presets` 자리, 시트가 열린 동안엔 프리셋을 넣거나 지우지 않아서 그대로
+    index: usize,
+    /// 열기 전 입력 (프리셋에서 찾던 글), 시트에선 입력 칸에 이름을 씀
+    edit: Editor,
+    scroll: usize,
 }
 
 impl Popup {
@@ -58,32 +67,19 @@ impl Popup {
             self.history.push(Row::PresetSave);
         }
         for (index, preset) in self.presets.iter().enumerate() {
-            if !finding || name_matches(&preset.query, &query) || name_matches(&preset.summary(), &query) {
+            let named = preset.name.as_deref().is_some_and(|name| name_matches(name, &query));
+            if !finding || named || name_matches(&preset.query, &query) || name_matches(&preset.summary(), &query) {
                 self.history.push(Row::Preset(index));
             }
         }
         if !finding && self.presets.is_empty() {
             self.history.push(Row::PresetEmpty);
         }
-        // 한글 조합을 확정하며 다시 채워도 같은 프리셋이 보이면 삭제 버튼은 그대로, 안 그러면 Enter가 적용으로 넘어감
-        // 그 줄이 안 보이게 됐으면 버튼도 바로 없앰
-        if self.preset_menu.is_some_and(|i| !self.history.contains(&Row::Preset(i))) {
-            self.drop_preset_menu();
-        }
         if self.view == View::History {
             self.searched.clone_from(&self.history_query);
         }
         if self.sel_of == Sheet::History {
-            // 삭제 버튼을 그대로 두면 강조도 그 줄에, 안 그러면 Enter가 화면 밖 버튼의 프리셋을 지움
-            // 처음부터 다시 맞추면 강조·스크롤이 맨 위로 튀었다 돌아와서 지금 자리에서 옮김
-            match self.preset_menu.and_then(|i| self.history.iter().position(|r| *r == Row::Preset(i))) {
-                Some(row) => {
-                    self.selected = row;
-                    self.fit_scroll();
-                    self.retarget_selection(false);
-                }
-                None => self.reset_rows(),
-            }
+            self.reset_rows();
         }
     }
 
@@ -99,7 +95,7 @@ impl Popup {
 
     /// 저장 줄 아랫줄: 지금 검색어와 요약
     fn preset_save_sub(&self) -> String {
-        self.preset_current.as_ref().map(|preset| format!("{} · {}", preset.query, preset.summary())).unwrap_or_default()
+        self.preset_current.as_ref().map(Preset::query_line).unwrap_or_default()
     }
 
     /// 지금 검색을 목록 맨 위에 저장, 맨 위에 있던 저장 줄 자리가 그대로 새 프리셋 줄이 됨
@@ -111,14 +107,6 @@ impl Popup {
             return Action::None;
         };
         self.change_preset(PresetChange { kind: ChangeKind::Inserted, row: None, preset })
-    }
-
-    /// 고른 줄에서 Delete, 찾는 중엔 Delete가 입력 칸 글을 지워서 안 씀
-    pub(super) fn delete_selected_preset(&mut self) -> Action {
-        if self.typed() {
-            return Action::None;
-        }
-        self.delete_preset_row(self.selected)
     }
 
     fn delete_preset_row(&mut self, row: usize) -> Action {
@@ -137,81 +125,89 @@ impl Popup {
         self.change_preset(change)
     }
 
-    /// `row` 프리셋 줄 끝에 삭제 버튼을 띄우고 강조를 그 줄로, 저장 줄·안내 줄에선 안 띄움
-    pub(super) fn open_preset_menu(&mut self, row: usize) -> bool {
-        let Some(Row::Preset(index)) = self.history.get(row).copied() else {
-            return false;
-        };
-        if self.preset_menu == Some(index) {
-            return true;
-        }
-        // 줄이 접히고 펼쳐지는 동안엔 버튼 자리 (고정 줄 높이)가 그린 줄과 어긋남
-        if self.preset_rows_moving() {
-            return false;
-        }
-        self.selected = row;
-        self.fit_scroll();
-        self.retarget_selection(false);
-        // 흐려지던 같은 버튼이면 지금 진하기에서 다시 나타나고, 다른 줄 버튼은 흐려지며 사라짐
-        if self.preset_menu_drawn != Some(index) {
-            self.preset_menu_leaving.retain(|(_, t)| !t.done() || t.value() > 0.0);
-            let back = self.preset_menu_leaving.iter().position(|(i, _)| *i == index).map(|at| self.preset_menu_leaving.remove(at).1);
-            if let Some(old) = self.preset_menu_drawn {
-                let mut fade = self.preset_menu_a;
-                fade.go(0.0, QUICK_SECS, QUICK_EASE);
-                self.preset_menu_leaving.push((old, fade));
-            }
-            self.preset_menu_a = back.unwrap_or(Tween::new(0.0));
-        }
-        self.preset_menu = Some(index);
-        self.preset_menu_drawn = Some(index);
-        self.preset_menu_a.go(1.0, QUICK_SECS, QUICK_EASE);
-        true
+    /// 프리셋 `index`의 시트를 엶, 열기 전 입력 (찾던 글)은 보관하고 입력 칸엔 지금 이름
+    /// 접히거나 펼쳐지던 줄 모션은 버림, 닫으면 목록을 다시 채움
+    pub(super) fn open_preset_sheet(&mut self, index: usize) {
+        let Some(name) = self.presets.get(index).map(|p| p.name.clone().unwrap_or_default()) else { return };
+        self.finish_input();
+        self.preset_edit = Some(PresetEdit { index, edit: std::mem::take(&mut self.edit), scroll: self.scroll });
+        self.clear_input();
+        self.edit.insert(&name);
+        self.preset_change = None;
+        self.view = View::Preset;
+        self.hover = Hit::None;
+        self.retarget_panel();
     }
 
-    /// 삭제 버튼을 닫음, 버튼은 흐려지며 사라지고 그 줄 글 끝도 같이 돌아옴
-    pub(super) fn close_preset_menu(&mut self) {
-        if self.preset_menu.take().is_some() {
-            self.preset_menu_a.go(0.0, QUICK_SECS, QUICK_EASE);
+    /// 열기 전 입력과 히스토리 보기로 되돌리고 그 프리셋 줄과 스크롤을 돌려줌, 쓰던 이름은 버림
+    /// 검색창을 닫거나 다시 열 때도 불림, 쓰던 이름이 찾는 글로 남지 않게
+    pub(super) fn restore_preset_query(&mut self) -> Option<(Row, usize)> {
+        let p = self.preset_edit.take()?;
+        self.clear_input();
+        self.edit = p.edit;
+        self.seen = self.edit.text().to_owned();
+        self.view = View::History;
+        Some((Row::Preset(p.index), p.scroll))
+    }
+
+    /// 프리셋 탭으로 돌아가 그 프리셋 줄을 고름, 바에 쓰던 이름은 여기서 저장 안 함
+    pub(super) fn close_preset_sheet(&mut self) {
+        if self.preset_edit.is_none() {
+            return;
         }
+        // 쓰던 이름의 조합 중인 글자는 찾는 글로 안 넘어가게 버림
+        self.preedit.clear();
+        self.notify_composition(CPS_CANCEL);
+        let Some((row, scroll)) = self.restore_preset_query() else { return };
+        self.fill_history();
+        self.retarget_panel();
+        self.restore_row(row, scroll);
+        self.hover = Hit::None;
     }
 
-    /// 삭제 버튼을 바로 없앰, 줄이 지워지거나 안 보이게 될 때
-    pub(super) fn drop_preset_menu(&mut self) {
-        self.preset_menu = None;
-        self.preset_menu_drawn = None;
-        self.preset_menu_a = Tween::new(0.0);
-        self.preset_menu_leaving.clear();
+    /// 바에 쓰는 이름, 조합 중인 글자까지 앞뒤 공백 없이 보고 비면 이름 없음
+    fn typed_preset_name(&self) -> Option<String> {
+        Some(self.query().trim().to_owned()).filter(|n| !n.is_empty())
     }
 
-    /// 누를 수 있는 삭제 버튼 자리, 띄운 프리셋이 목록에 있을 때만
-    pub(super) fn preset_delete_rect(&self) -> Option<D2D_RECT_F> {
-        self.preset_button_rect(self.preset_menu?)
+    /// Enter·완료: 바의 이름을 저장하고 닫음
+    pub(super) fn save_preset_name(&mut self) -> Action {
+        let Some(index) = self.preset_edit.as_ref().map(|p| p.index) else { return Action::None };
+        self.complete_composition();
+        let name = self.typed_preset_name();
+        let changed = self.presets.get(index).is_some_and(|p| p.name != name);
+        if changed {
+            self.presets[index].name = name;
+        }
+        self.close_preset_sheet();
+        if changed { Action::Choice } else { Action::None }
     }
 
-    /// 프리셋 `index` 줄 끝 삭제 버튼 자리, 프리셋 탭에서 그 줄이 목록에 있을 때만
-    fn preset_button_rect(&self, index: usize) -> Option<D2D_RECT_F> {
-        if self.view != View::History || self.history_tab != HistoryTab::Presets {
+    /// 삭제: 시트를 닫고 목록에서 그 줄을 지움, 다음 줄을 고르고 지운 줄은 접힘
+    pub(super) fn delete_sheet_preset(&mut self) -> Action {
+        let Some(index) = self.preset_edit.as_ref().map(|p| p.index) else { return Action::None };
+        self.close_preset_sheet();
+        let Some(row) = self.history.iter().position(|r| *r == Row::Preset(index)) else { return Action::None };
+        let action = self.delete_preset_row(row);
+        // 시트를 닫으며 판 전체를 겹쳐 바꾸는 중이라 줄 목록은 따로 안 섞음, 섞으면 줄만 탭보다 늦게 나타남
+        self.list_swap.reset();
+        action
+    }
+
+    /// 프리셋 시트의 키, Enter는 이름 저장, Esc·F2는 저장하지 않고 닫음
+    /// 입력 편집 키는 아래 공통 처리로 넘기고 모드·난이도 단축키 (Alt)와 줄 이동·다른 여는 키는 막음
+    pub(super) fn preset_key(&mut self, vk: VIRTUAL_KEY, ctrl: bool, alt: bool, shift: bool) -> Option<Action> {
+        if self.view != View::Preset {
             return None;
         }
-        let row = self.history.iter().position(|r| *r == Row::Preset(index))?;
-        let y = self.panel_top() + self.list_top(Sheet::History) + self.px(lay::ROW_H) * row as f32 - self.scroll_s.value;
-        Some(self.row_button(y, PRESET_DELETE))
-    }
-
-    pub(super) fn delete_menu_preset(&mut self) -> Action {
-        let Some(index) = self.preset_menu else {
-            return Action::None;
-        };
-        let gone = self.presets.get(index).cloned().map(|p| (p, self.preset_menu_a.value()));
-        self.drop_preset_menu();
-        let action = match self.history.iter().position(|r| *r == Row::Preset(index)) {
-            Some(row) => self.delete_preset_row(row),
-            None => Action::None,
-        };
-        // 버튼은 지워져 접히는 줄 띠 안에 그려서 줄과 같이 흐려지고 접힘, 제자리에서 겹쳐 바뀌면 옛 그림에 같이 들어 있음
-        self.preset_menu_gone = gone.filter(|_| self.preset_rows_moving());
-        action
+        if vk == VK_ESCAPE || (!ctrl && !alt && !shift && vk == VK_F2) {
+            self.close_preset_sheet();
+        } else if vk == VK_RETURN {
+            return Some(self.save_preset_name());
+        } else if !alt && !matches!(vk, VK_UP | VK_DOWN | VK_PRIOR | VK_NEXT | VK_APPS | VK_F10 | VK_F2) {
+            return None;
+        }
+        Some(Action::None)
     }
 
     fn change_preset(&mut self, change: PresetChange) -> Action {
@@ -222,8 +218,6 @@ impl Popup {
         }
         let before = self.history.clone();
         let (scroll, scroll_s, sel_y) = (self.scroll, self.scroll_s, self.sel_y);
-        // 프리셋 자리가 바뀌어서 삭제 버튼은 바로 없앰
-        self.drop_preset_menu();
         self.fill_presets();
         // 맨 위 줄이 저장 줄과 서로 바뀌거나 (저장, 맨 위 지금 검색 프리셋 지우기) 찾던 마지막 줄이 안내 문구가 되면 줄 자리는 그대로 두고 글만 겹쳐 바꿈
         // 접고 펼치면 지운 줄이 새 저장 줄에 밀려 내려가며 접혀 보임
@@ -273,7 +267,6 @@ impl Popup {
         self.view = View::Results;
         self.kb_focus = None;
         self.preset_change = None;
-        self.close_preset_menu();
         if !self.in_zone && self.leave_since.is_none() {
             self.leave_since = Some(Instant::now());
         }
@@ -360,7 +353,6 @@ impl Popup {
             self.preset_slots.clear();
         }
         if self.preset_slots.is_empty() {
-            self.preset_menu_gone = None;
             return;
         }
         let before = self.panel_target();
@@ -454,12 +446,6 @@ impl Popup {
         // 레벨 칸이 없어 글은 16 정렬선까지
         let right = panel.right - self.px(lay::INSET);
         let clip = rect(panel.left, top, panel.right, top + self.preset_list_h());
-        // 그릴 삭제 버튼마다 (프리셋, 자리, 진하기), 지금 버튼과 다른 줄로 옮겨 사라지는 버튼
-        let buttons: Vec<_> = self.preset_menu_drawn.map(|i| (i, self.preset_menu_a))
-            .into_iter()
-            .chain(self.preset_menu_leaving.iter().copied())
-            .filter_map(|(i, t)| Some((i, self.preset_button_rect(i)?, t.value())).filter(|b| b.2 > 0.0))
-            .collect();
         unsafe { dc.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_ALIASED) };
         let result = (|| -> Result<()> {
             for band in self.preset_bands() {
@@ -475,27 +461,9 @@ impl Popup {
                 }
                 let drawn = match band.row {
                     BandRow::Row(Row::PresetSave) => self.draw_preset_save(y, right),
-                    // 삭제 버튼을 띄운 줄은 글이 버튼 앞 8에서 끝남, 버튼이 나타나고 사라지는 만큼 움직임
-                    BandRow::Row(Row::Preset(i)) if buttons.iter().any(|b| b.0 == i) => {
-                        let (_, b, a) = buttons.iter().find(|b| b.0 == i).unwrap();
-                        let right = right + (b.left - self.px(8.0) - right) * a;
-                        self.presets.get(i).map_or(Ok(()), |p| self.draw_preset_row(y, right, p))
-                    }
                     BandRow::Row(Row::Preset(i)) => self.presets.get(i).map_or(Ok(()), |p| self.draw_preset_row(y, right, p)),
                     BandRow::Row(Row::PresetEmpty) => self.preset_empty_text().map_or(Ok(()), |text| self.draw_preset_empty(y, panel, text)),
                     BandRow::Row(_) => Ok(()),
-                    // 나타나던 중에 지웠으면 그때 진하기 그대로, 줄이 흐려지는 만큼 같이 흐려짐
-                    BandRow::Gone(Gone::Preset(p)) if self.preset_menu_gone.as_ref().is_some_and(|(g, _)| g == p) => {
-                        let a = self.preset_menu_gone.as_ref().map_or(0.0, |(_, a)| *a);
-                        let b = self.row_button(y, PRESET_DELETE);
-                        let f = self.fonts.as_ref().unwrap();
-                        self.draw_preset_row(y, right + (b.left - self.px(8.0) - right) * a, p).and_then(|_| {
-                            unsafe { dc.PushLayer(&gfx::layer(a, None), None) };
-                            let drawn = draw_button(g, &f.item, b, PRESET_DELETE, false, self.scale);
-                            unsafe { dc.PopLayer() };
-                            drawn
-                        })
-                    }
                     BandRow::Gone(Gone::Preset(p)) => self.draw_preset_row(y, right, p),
                     BandRow::Gone(Gone::Empty) => self.draw_preset_empty(y, panel, NO_PRESETS),
                 };
@@ -507,25 +475,34 @@ impl Popup {
                 }
                 drawn?;
             }
-            for &(i, b, a) in &buttons {
-                let f = self.fonts.as_ref().unwrap();
-                let lit = self.preset_menu == Some(i) && self.hover == Hit::PresetDelete;
-                unsafe { dc.PushLayer(&gfx::layer(a, None), None) };
-                let drawn = draw_button(g, &f.item, b, PRESET_DELETE, lit, self.scale);
-                unsafe { dc.PopLayer() };
-                drawn?;
-            }
             Ok(())
         })();
         unsafe { dc.PopAxisAlignedClip() };
         result
     }
 
-    /// 프리셋 줄: 재킷 자리에 돋보기, 윗줄 검색어와 아랫줄 요약
+    /// 프리셋 줄: 재킷 자리에 돋보기, 윗줄 이름 (없으면 검색어)과 아랫줄 (`Preset::row_text`)
     fn draw_preset_row(&self, y: f32, right: f32, preset: &Preset) -> Result<()> {
         let g = self.gfx.as_ref().unwrap();
         self.draw_slot_icon(y, Icon::Search)?;
-        self.draw_row_text(y, right, &preset.query, &preset.summary(), None, (&g.brush(TEXT)?, &g.brush(SUB)?))?;
+        let (title, sub) = preset.row_text();
+        self.draw_row_text(y, right, title, &sub, None, (&g.brush(TEXT)?, &g.brush(SUB)?))?;
+        Ok(())
+    }
+
+    /// 프리셋 시트 (다 편 시트 자리): 프리셋 줄과 삭제·완료 버튼, 안내 글
+    /// 안내 글은 키워드 시트 라벨 자리·글꼴, `l0`·`r0`은 패널 안쪽 16 정렬선
+    pub(super) fn draw_preset_sheet(&self, (l0, r0): (f32, f32)) -> Result<()> {
+        let (g, f) = (self.gfx.as_ref().unwrap(), self.fonts.as_ref().unwrap());
+        let pl = self.preset_layout();
+        // 줄 제목은 바에 쓰는 이름을 바로 보여 줘서 저장하면 어떻게 보일지 그 자리에서 앎, 선택 강조 없음
+        if let Some(preset) = self.preset_edit.as_ref().and_then(|p| self.presets.get(p.index)) {
+            let shown = Preset { name: self.typed_preset_name(), ..preset.clone() };
+            self.draw_preset_row(self.panel_top() + self.px(lay::PAD), pl.delete.left - self.px(8.0), &shown)?;
+        }
+        draw_button(g, &f.item, pl.delete, DELETE_LABEL, self.hover == Hit::PresetDelete, self.scale)?;
+        draw_button(g, &f.item, pl.done, "완료", self.hover == Hit::DonePreset, self.scale)?;
+        self.text_line("비워 두면 검색어가 제목으로 보여요", &f.sub, pl.note, self.px(16.0), &g.brush(FAINT)?, (l0, r0))?;
         Ok(())
     }
 

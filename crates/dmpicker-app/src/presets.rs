@@ -51,12 +51,21 @@ impl QueryPattern {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct Preset {
     pub query: String,
     pub filter: Options,
     pub mode: Option<Mode>,
     pub diff: Option<Diff>,
+    /// 앞뒤 공백 없는 이름, 없으면 검색어가 줄 제목
+    pub name: Option<String>,
+}
+
+/// 이름은 안 봄, 같은 검색이면 이름이 달라도 같은 프리셋
+impl PartialEq for Preset {
+    fn eq(&self, other: &Self) -> bool {
+        (&self.query, self.filter, self.mode, self.diff) == (&other.query, other.filter, other.mode, other.diff)
+    }
 }
 
 impl Preset {
@@ -66,7 +75,7 @@ impl Preset {
             return None;
         }
         let (mode, diff) = QueryPattern::read(catalog, query).settings(mode, diff);
-        Some(Self { query: query.to_owned(), filter, mode, diff })
+        Some(Self { query: query.to_owned(), filter, mode, diff, name: None })
     }
 
     pub fn from_json(value: &Value) -> Option<Self> {
@@ -88,14 +97,32 @@ impl Preset {
         if diff.is_some() && mode.is_none() {
             return None;
         }
-        Some(Self { query: query.to_owned(), filter, mode, diff })
+        // 옛 설정 파일엔 이름 항목이 없음
+        let name = match value.get("name") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(value.as_str()?.trim()).filter(|n| !n.is_empty()).map(str::to_owned),
+        };
+        Some(Self { query: query.to_owned(), filter, mode, diff, name })
     }
 
     pub fn json(&self) -> Value {
         json!({
             "query": self.query, "filter": self.filter.json(),
-            "mode": self.mode.map(Mode::label), "diff": self.diff.map(Diff::label),
+            "mode": self.mode.map(Mode::label), "diff": self.diff.map(Diff::label), "name": self.name,
         })
+    }
+
+    /// 검색어와 요약 한 줄, 저장 줄과 이름 붙인 프리셋 줄의 아랫줄
+    pub fn query_line(&self) -> String {
+        format!("{} · {}", self.query, self.summary())
+    }
+
+    /// 줄의 제목과 아랫줄, 이름을 붙였으면 검색어는 아랫줄 앞으로
+    pub fn row_text(&self) -> (&str, String) {
+        match &self.name {
+            Some(name) => (name, self.query_line()),
+            None => (&self.query, self.summary()),
+        }
     }
 
     pub fn summary(&self) -> String {

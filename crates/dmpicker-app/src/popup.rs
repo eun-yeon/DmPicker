@@ -266,6 +266,8 @@ enum View {
     Keywords,
     /// 무작위 줄로 나온 곡, 결과·히스토리의 무작위 줄을 우클릭하거나 F2로 엶
     Rolls,
+    /// 프리셋 하나의 이름과 삭제, 프리셋 줄을 우클릭하거나 F2·Delete로 엶
+    Preset,
 }
 
 impl View {
@@ -322,6 +324,8 @@ enum Sheet {
     Keywords,
     /// 무작위 줄과 나온 곡 줄
     Rolls,
+    /// 프리셋 줄과 이름 안내
+    Preset,
 }
 
 /// 결과 자리에 뜨는 안내 카드, 모두 같은 높이 (`CARD_H`)
@@ -897,8 +901,10 @@ enum Hit {
     DoneRolls,
     /// i번째 키워드 칩의 × 버튼
     RemoveKeyword(usize),
-    /// 프리셋 줄을 우클릭하거나 F2·메뉴 키로 띄운 줄 끝 삭제 버튼
+    /// 프리셋 시트의 삭제 버튼
     PresetDelete,
+    /// 프리셋 시트의 완료 버튼
+    DonePreset,
 }
 
 /// 설정 시트의 토글, 값이 `toggles`의 자리
@@ -1059,6 +1065,15 @@ struct RollLayout {
     clear: D2D_RECT_F,
     done: D2D_RECT_F,
     label: f32,
+}
+
+/// 물리 px 기준 프리셋 시트: 맨 위 프리셋 줄의 두 버튼과 각 글줄의 위쪽
+struct PresetLayout {
+    /// 완료 버튼 왼쪽의 삭제 버튼
+    delete: D2D_RECT_F,
+    done: D2D_RECT_F,
+    note: f32,
+    height: f32, // 시트 높이
 }
 
 /// 물리 px 기준 필터 시트: 클릭 영역과 각 글줄의 위쪽, 설정 시트와 같은 리듬 (라벨 + 세그먼트, 두 줄 묶음 + 오른쪽 컨트롤)
@@ -1223,19 +1238,11 @@ pub struct Popup {
     presets: Vec<crate::presets::Preset>,
     preset_current: Option<crate::presets::Preset>,
     preset_change: Option<presets::PresetChange>,
-    /// 삭제 버튼을 띄운 프리셋 (`presets` 자리), 닫으면 None
-    preset_menu: Option<usize>,
-    /// 그리는 삭제 버튼과 나타난 정도, 닫은 뒤에도 다 흐려질 때까지 그림
-    preset_menu_drawn: Option<usize>,
-    preset_menu_a: Tween,
-    /// 다른 줄로 옮겨서 흐려지며 사라지는 이전 삭제 버튼들, 빠르게 여러 줄을 옮기면 여럿
-    preset_menu_leaving: Vec<(usize, Tween)>,
     /// 프리셋을 넣고 지우는 동안 그리는 줄 자리, 모션이 없으면 비어 있음
     preset_slots: Vec<presets::Slot>,
     /// 줄이 접히고 펼쳐지는 동안 판 빠르기 (px/s), 줄 모션을 버리면 판 스프링이 이어받음 (`step_row_motion`)
     row_panel_speed: Option<f32>,
-    /// 삭제 버튼으로 지워 접히는 프리셋과 그때 버튼 진하기, 버튼도 그 줄 띠 안에서 같이 흐려지고 접힘
-    preset_menu_gone: Option<(crate::presets::Preset, f32)>,
+    preset_edit: Option<presets::PresetEdit>,
     /// 히스토리·검색 제외 보기에서만 Some, 히스토리에서 연 시트도 포함
     list_edit: Option<SavedQuery>,
     /// `selected`·`scroll`이 가리키는 목록 (결과, 히스토리, 뽑은 기록), 보이는 목록이 바뀔 때만 첫 줄로
@@ -1492,13 +1499,9 @@ impl Popup {
             presets: Vec::new(),
             preset_current: None,
             preset_change: None,
-            preset_menu: None,
-            preset_menu_drawn: None,
-            preset_menu_a: Tween::new(0.0),
-            preset_menu_leaving: Vec::new(),
             preset_slots: Vec::new(),
             row_panel_speed: None,
-            preset_menu_gone: None,
+            preset_edit: None,
             list_edit: None,
             sel_of: Sheet::Results,
             rng: Rng::new(),
@@ -1726,8 +1729,6 @@ impl Popup {
                 || self.cond_shown.moving()
                 || self.lead_swap.moving()
                 || self.filter_swap.moving()
-                || !self.preset_menu_a.done()
-                || self.preset_menu_leaving.iter().any(|(_, t)| !t.done())
                 || !self.panel_h.settled_to(PANEL_REST)
                 || !self.shown.done()
                 || (self.shown.target() <= 0.0 && self.panel_h.value != 0.0) // 다 사라진 뒤 높이 정리 (`render`)
@@ -2002,7 +2003,6 @@ impl Popup {
         if !self.visible || self.closing {
             return;
         }
-        self.close_preset_menu();
         if self.view == View::Filter {
             let changed = self.commit_rate();
             self.filter_changed(changed);
@@ -2322,6 +2322,7 @@ impl Popup {
             View::Exclude => Sheet::Exclude,
             View::History => Sheet::History,
             View::Keywords => Sheet::Keywords,
+            View::Preset => Sheet::Preset,
             View::Results if self.card().is_some() => Sheet::Card,
             View::Results => Sheet::Results,
         }
@@ -2332,7 +2333,7 @@ impl Popup {
         match s {
             Sheet::Rolls => self.roll_rows(),
             Sheet::History => &self.history,
-            Sheet::Keywords | Sheet::Filter => &[],
+            Sheet::Keywords | Sheet::Preset | Sheet::Filter => &[],
             _ => &self.results,
         }
     }
@@ -2350,16 +2351,17 @@ impl Popup {
         rect(b.right - self.px(8.0) - w, cy - self.px(15.0), b.right - self.px(8.0), cy + self.px(15.0))
     }
 
-    /// 바에 채보 "4B · HD"가 보임, 키워드·닉네임 입력 중·뽑은 기록과 결과 화면의 플레이리스트 주소엔 안 보임
+    /// 바에 채보 "4B · HD"가 보임, 키워드·프리셋 이름·닉네임 입력 중·뽑은 기록과 결과 화면의 플레이리스트 주소엔 안 보임
     /// 주소는 검색을 기다리지 않고 지금 글로 봄, 붙여 넣는 순간 입력 칸도 같이 넓어져 글이 나중에 안 튐
     /// 모드를 적은 검색어는 같은 정보가 두 번 보이지 않게 채보 칸을 숨김
     fn shows_cond(&self) -> bool {
         match self.view {
-            View::Keywords | View::Rolls => false,
+            View::Keywords | View::Rolls | View::Preset => false,
             View::Results => playlist::id(self.edit.text()).is_none() && !self.cond_label().is_empty(),
             View::History => !self.cond_label().is_empty(),
-            View::Filter => self.nickname_edit.is_none(),
-            View::Settings | View::Exclude => true,
+            View::Filter => self.nickname_edit.is_none() && !self.cond_label().is_empty(),
+            View::Settings => !self.cond_label().is_empty(),
+            View::Exclude => true,
         }
     }
 
@@ -2504,6 +2506,18 @@ impl Popup {
         RollLayout { clear, done, label: self.panel_top() + self.px(lay::PAD + lay::ROW_H + 8.0) }
     }
 
+    /// 프리셋 시트: 키워드 시트 맨 위 줄과 같은 배치, 별 자리 (완료 왼쪽 8)에 삭제, 라벨 자리에 안내 글 한 줄
+    /// 그리기·판정·시트 높이가 같이 씀
+    fn preset_layout(&self) -> PresetLayout {
+        let top = self.panel_top();
+        let done = self.done_button();
+        let delete = self.head_button(done.left - self.px(8.0), presets::DELETE_LABEL);
+        // 안내 글 줄 높이 16, 맨 아래 여백은 양옆과 같은 16
+        let note = top + self.px(lay::PAD + lay::ROW_H + 8.0);
+        let height = note + self.px(16.0) + self.px(lay::INSET) - top;
+        PresetLayout { delete, done, note, height }
+    }
+
     /// 필터 시트: 제목 줄은 설정 시트 제목 자리, 초기화는 다른 시트 맨 위 줄의 글 버튼
     /// 기록 줄 버튼은 설정의 다시 인식·검색 제외 자리 (88 두 개), 숫자 칸은 버튼과 같은 30 높이
     fn filter_layout(&self) -> FilterLayout {
@@ -2574,7 +2588,7 @@ impl Popup {
     }
 
     /// 위쪽이 `y`인 줄 끝 버튼, 레벨 칸 자리에 세로 가운데
-    /// 즐겨찾기 무작위 줄의 필터 초기화, 프리셋 줄의 삭제
+    /// 즐겨찾기 무작위 줄의 필터 초기화
     fn row_button(&self, y: f32, label: &str) -> D2D_RECT_F {
         let right = self.px(lay::MARGIN + lay::W) - self.px(lay::PAD) - self.px(8.0);
         let w = (self.measure(label, |f| &f.item) + self.px(28.0)).round();
@@ -2710,6 +2724,7 @@ impl Popup {
             // 줄이 넘치면 판 끝까지, 모두 들어가면 마지막 줄 아래 8을 남김
             Sheet::Exclude => self.px(lay::EXCLUDE_TOP) + self.px(lay::PAD) + self.exclude_list_h() + self.exclude_bottom_pad(),
             Sheet::Keywords => self.keyword_layout().height,
+            Sheet::Preset => self.preset_layout().height,
             Sheet::Card => self.px(lay::CARD_H),
             Sheet::Results if self.playlist_waiting() => 0.0,
             _ if !self.listing() => 0.0,
@@ -2850,6 +2865,16 @@ impl Popup {
             }
             return Hit::Inside;
         }
+        if self.view == View::Preset {
+            let pl = self.preset_layout();
+            if inside(&pl.delete, x, y) {
+                return Hit::PresetDelete;
+            }
+            if inside(&pl.done, x, y) {
+                return Hit::DonePreset;
+            }
+            return Hit::Inside;
+        }
         // 기록이 없으면 초기화는 흐리게 보이기만 함, 줄 목록은 아래 결과 줄 판정
         if self.view == View::Rolls {
             let rl = self.roll_layout();
@@ -2924,9 +2949,6 @@ impl Popup {
                 return Hit::Tab(HistoryTab::ALL[segment_at(&r, x, HistoryTab::ALL.len())]);
             }
         }
-        if self.preset_delete_rect().is_some_and(|b| inside(&b, x, y)) {
-            return Hit::PresetDelete;
-        }
         // 검색어를 지운 뒤 사라지는 줄은 호버·클릭 대상 아님
         // 스크롤 중엔 줄이 아직 `scroll` 위치가 아니라 그려진 위치에 있음
         // 프리셋 줄이 접히고 펼쳐지는 동안엔 그린 자리와 줄 자리가 달라서 안 받음
@@ -2953,7 +2975,7 @@ impl Popup {
     // ---------------------------------------------------------------- 상태 변경
 
     /// `i`번째 줄 곡의 키워드 시트를 엶, 고를 수 있는 곡 줄에서만 (설정·안내 카드에선 안 엶)
-    /// 무작위 줄이면 뽑은 기록 시트를 엶, 프리셋 줄이면 줄 끝에 삭제 버튼을 띄움
+    /// 무작위 줄이면 뽑은 기록 시트, 프리셋 줄이면 프리셋 시트를 엶
     fn open_keywords(&mut self, i: usize) -> bool {
         if !matches!(self.sheet_now(), Sheet::Results | Sheet::History) || !self.listing() {
             return false;
@@ -2963,8 +2985,9 @@ impl Popup {
             self.open_rolls();
             return true;
         }
-        if matches!(row, Row::Preset(_)) {
-            return self.open_preset_menu(i);
+        if let Row::Preset(index) = row {
+            self.open_preset_sheet(index);
+            return true;
         }
         let Some(song) = row.song() else { return false };
         self.finish_input();
@@ -3351,10 +3374,9 @@ impl Popup {
     }
 
     /// 보여 줄 내용이 있으면 그 내용으로 바꾸고, 없으면 직전 내용 그대로 사라짐 (`retarget_panel`)
-    /// 히스토리는 열 때마다 고른 탭으로 다시 채움, 키워드·뽑은 기록 시트는 닫고 넘어감
+    /// 히스토리는 열 때마다 고른 탭으로 다시 채움, 키워드·뽑은 기록·프리셋 시트는 닫고 넘어감 (프리셋 이름은 저장 안 함)
     /// 히스토리에선 입력 칸으로 그 탭을 찾고, 나가면 원래 입력·결과·고른 줄로 돌아감
     fn set_view(&mut self, v: View) {
-        self.close_preset_menu();
         let from_filter = self.view == View::Filter;
         if from_filter && v != View::Filter {
             self.finish_filter_input();
@@ -3372,6 +3394,9 @@ impl Popup {
         }
         if self.view == View::Keywords {
             self.close_keywords();
+        }
+        if self.view == View::Preset {
+            self.close_preset_sheet();
         }
         if self.view == v {
             return;
@@ -4182,6 +4207,7 @@ impl Popup {
         // 히스토리에서 연 시트가 보관한 건 히스토리에서 찾던 글이라 먼저 되돌려야 원래 검색어가 남음
         self.restore_roll_query();
         self.restore_keyword_query();
+        self.restore_preset_query();
         self.restore_list_query();
     }
 
@@ -4208,9 +4234,13 @@ impl Popup {
     }
 
     /// 버튼이 눌린 채 보이는 보기, 히스토리에서 연 키워드·뽑은 기록 시트는 히스토리 안의 한 단계라 히스토리
+    /// 프리셋 시트는 늘 히스토리에서 엶
     fn bead_view(&self) -> View {
         if self.view == View::Exclude {
             return View::Settings;
+        }
+        if self.view == View::Preset {
+            return View::History;
         }
         if let Some(r) = &self.roll_edit {
             return r.from;
@@ -4293,8 +4323,8 @@ impl Popup {
         if self.view == View::Filter {
             return;
         }
-        // 키워드 입력은 검색하지 않고 안내 문구만 지움
-        if self.view == View::Keywords {
+        // 키워드·프리셋 이름 입력은 검색하지 않음, 키워드는 안내 문구만 지움
+        if matches!(self.view, View::Keywords | View::Preset) {
             self.set_keyword_note(None);
             return;
         }
@@ -4350,8 +4380,8 @@ impl Popup {
         unsafe {
             let _ = KillTimer(Some(self.hwnd), TIMER_SEARCH);
         }
-        if matches!(self.view, View::Keywords | View::Filter) {
-            return false; // 키워드·필터 시트에선 결과 그대로
+        if matches!(self.view, View::Keywords | View::Preset | View::Filter) {
+            return false; // 키워드·프리셋·필터 시트에선 결과 그대로
         }
         let q = self.query();
         if q == self.searched {
@@ -4521,7 +4551,7 @@ impl Popup {
                 p.waiting = false;
             }
         }
-        if matches!(self.view, View::Keywords | View::Rolls) {
+        if matches!(self.view, View::Keywords | View::Rolls | View::Preset) {
             return;
         }
         // 기다리는 동안 숨긴 패널은 아직 결과 시트가 아닐 수 있어 시트를 먼저 맞춘 뒤 줄을 고름
@@ -4815,7 +4845,7 @@ impl Popup {
 
     /// 결과 줄을 고를 수 있음: 검색 결과·히스토리·뽑은 기록, 검색어를 지운 뒤 사라지는 중인 줄은 아님
     fn listing(&self) -> bool {
-        !matches!(self.view, View::Keywords | View::Exclude | View::Filter) && (!self.searched.trim().is_empty() || matches!(self.view, View::History | View::Rolls))
+        !matches!(self.view, View::Keywords | View::Preset | View::Exclude | View::Filter) && (!self.searched.trim().is_empty() || matches!(self.view, View::History | View::Rolls))
     }
 
     /// 고르는 목록 (`sel_of`)의 `i`번째 줄 자리 위쪽, 패널 위에서
@@ -5065,10 +5095,12 @@ impl Popup {
         self.filter_connected = self.records.connected();
     }
 
-    /// 입력 칸 앞 아이콘: 검색은 돋보기, 키워드 입력은 같은 자리에 #, 닉네임 입력은 사람
+    /// 입력 칸 앞 아이콘: 검색은 돋보기, 키워드 입력은 같은 자리에 #, 프리셋 이름은 책갈피, 닉네임 입력은 사람
     fn lead_icon(&self) -> Icon {
         if self.view == View::Keywords {
             Icon::Keyword
+        } else if self.view == View::Preset {
+            Icon::Bookmark
         } else if self.nickname_edit.is_some() {
             Icon::User
         } else {
@@ -5076,10 +5108,10 @@ impl Popup {
         }
     }
 
-    /// 바 채보 칸 글, 검색 중엔 실제로 적용될 모드·난이도
-    /// 검색어가 채보를 정하면 빈 글
+    /// 바 채보 칸 글, 바에 보이는 검색어에 실제로 적용될 모드·난이도
+    /// 검색어가 채보를 정하면 빈 글, 검색 제외는 찾는 글이 따로라 설정 값
     fn cond_label(&self) -> String {
-        let pattern = if matches!(self.view, View::Results | View::History) {
+        let pattern = if matches!(self.view, View::Results | View::History | View::Filter | View::Settings) {
             crate::presets::QueryPattern::read(&self.catalog, &self.searched)
         } else {
             crate::presets::QueryPattern::Settings
@@ -5177,6 +5209,7 @@ impl Popup {
             },
             View::Rolls => "나온 곡에서 찾기",
             View::Keywords => "추가할 키워드를 입력해 주세요",
+            View::Preset => "프리셋 이름을 입력해 주세요",
             View::History if self.history_tab == HistoryTab::Presets => "프리셋에서 찾기",
             View::History if self.history_tab == HistoryTab::Favorites => "즐겨찾기에서 찾기",
             View::History => "최근 기록에서 찾기",
@@ -5378,8 +5411,6 @@ impl Popup {
                         // 한국어 Windows 관례: Enter·화살표는 글자를 확정하고 동작도 함
                         self.complete_composition();
                     } else {
-                        // 입력기가 가져가는 키도 다른 키라 삭제 버튼을 닫음, 안 닫으면 글을 다 치고 누른 Enter가 프리셋을 지움
-                        self.close_preset_menu();
                         return None; // IME가 처리하는 키 (자모, 조합 중 Backspace 등)
                     }
                 }
@@ -5387,20 +5418,9 @@ impl Popup {
                 // F10은 Alt 없이도 WM_SYSKEYDOWN으로 와서 메시지 종류 대신 Alt 눌림 비트(29)를 봄
                 let alt = lp.0 & (1 << 29) != 0 || unsafe { GetKeyState(VK_MENU.0 as i32) } < 0;
                 let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
-                // F2·메뉴 키를 누르고 있으면 반복 입력이 시트나 삭제 버튼을 열고 닫기를 되풀이해서 깜빡임
+                // F2·메뉴 키를 누르고 있으면 반복 입력이 시트를 열고 닫기를 되풀이해서 깜빡임
                 if lp.0 & (1 << 30) != 0 && matches!(vk, VK_F2 | VK_APPS | VK_F10) {
                     return Some((0, Action::None));
-                }
-                // 삭제 버튼을 띄운 동안 Enter·Delete는 지움, Esc·F2·메뉴 키는 닫기만, 다른 키는 닫고 평소대로
-                if self.preset_menu.is_some() {
-                    match vk {
-                        VK_RETURN | VK_DELETE => return Some((0, self.delete_menu_preset())),
-                        VK_ESCAPE | VK_F2 | VK_APPS | VK_F10 => {
-                            self.close_preset_menu();
-                            return Some((0, Action::None));
-                        }
-                        _ => self.close_preset_menu(),
-                    }
                 }
                 if self.view == View::Filter {
                     // 숫자 칸 캐럿도 입력 칸처럼 치는 동안엔 켜진 채
@@ -5409,6 +5429,9 @@ impl Popup {
                     if let Some(action) = self.filter_key(vk, ctrl, alt, shift) {
                         return Some((0, action));
                     }
+                }
+                if let Some(action) = self.preset_key(vk, ctrl, alt, shift) {
+                    return Some((0, action));
                 }
                 if self.keyword_key(vk, ctrl, alt, shift, lp.0 & (1 << 30) != 0) {
                     return Some((0, Action::None));
@@ -5484,7 +5507,6 @@ impl Popup {
                 Some((0, Action::None))
             }
             WM_MOUSEWHEEL => {
-                self.close_preset_menu();
                 if self.view == View::Filter {
                     let mut p = POINT { x: lp.0 as i16 as i32, y: (lp.0 >> 16) as i16 as i32 };
                     let _ = unsafe { windows::Win32::Graphics::Gdi::ScreenToClient(self.hwnd, &mut p) };
@@ -5520,13 +5542,8 @@ impl Popup {
             }
             WM_RBUTTONUP => {
                 let (x, y) = (lp.0 as i16 as f32, (lp.0 >> 16) as i16 as f32);
-                // 삭제 버튼을 띄운 줄을 다시 우클릭하면 닫기만 함, 다시 열면 나타나는 모션이 처음부터라 깜빡임
-                let open = self.preset_menu;
-                self.close_preset_menu();
                 if let Hit::Row(i) = self.hit(x, y) {
-                    if open.is_none() || self.history.get(i) != open.map(Row::Preset).as_ref() {
-                        self.open_keywords(i);
-                    }
+                    self.open_keywords(i);
                 }
                 Some((0, Action::None))
             }
@@ -5693,8 +5710,10 @@ impl Popup {
             self.search_now(); // 입력한 글에 맞는 결과로 동작함
         }
         match vk {
+            // 프리셋 줄에선 Delete도 프리셋 시트를 엶, 찾는 중엔 입력 칸 글을 지움
             VK_DELETE if self.view == View::History && self.history_tab == HistoryTab::Presets && !self.typed() => {
-                self.delete_selected_preset()
+                self.open_keywords(self.selected);
+                Action::None
             }
             VK_ESCAPE if self.view == View::History => {
                 self.set_view(View::Results);
@@ -5812,8 +5831,7 @@ impl Popup {
         }
         if let Hit::Row(i) = self.hover {
             // 스크롤 중 목록 밖으로 나가는 줄엔 강조 자리가 없음, 고를 수 없는 줄은 호버해도 그대로
-            // 삭제 버튼을 띄운 동안엔 강조가 그 줄에 머묾
-            if i != self.selected && self.preset_menu.is_none() && self.rows()[i].selectable() && (self.scroll..self.scroll + self.page()).contains(&i) {
+            if i != self.selected && self.rows()[i].selectable() && (self.scroll..self.scroll + self.page()).contains(&i) {
                 self.selected = i;
                 // 아래 칸이 높아져 보이는 줄이 줄면 고른 줄이 가려질 수 있음
                 self.fit_scroll();
@@ -5832,13 +5850,7 @@ impl Popup {
                 return Action::None;
             }
         }
-        // 삭제 버튼 밖을 누르면 버튼만 닫음, 그 자리의 줄·버튼·창 밖 동작은 안 함
-        if self.preset_menu.is_some() && hit != Hit::PresetDelete {
-            self.close_preset_menu();
-            return Action::None;
-        }
         match hit {
-            Hit::PresetDelete => self.delete_menu_preset(),
             Hit::Filter => {
                 self.toggle_filter();
                 self.filter_keyed = false;
@@ -5954,6 +5966,8 @@ impl Popup {
                 self.delete_keyword(i);
                 Action::None
             }
+            Hit::PresetDelete => self.delete_sheet_preset(),
+            Hit::DonePreset => self.save_preset_name(),
             // 예전 검색어 결과가 보이던 줄을 누르면 대신 지금 결과를 띄움
             Hit::Row(_) if self.search_now() => Action::None,
             Hit::Row(i) if self.rows()[i].selectable() => {
@@ -6923,6 +6937,8 @@ impl Popup {
                     }
                 } else if let (Sheet::Keywords, Some(song)) = (self.sheet, self.keyword_song()) {
                     self.draw_keywords(song, kw_jacket.as_ref(), (l0, r0))?;
+                } else if self.sheet == Sheet::Preset {
+                    self.draw_preset_sheet((l0, r0))?;
                 } else if self.sheet == Sheet::Rolls {
                     let rl = self.roll_layout();
                     // 무작위 줄: 결과의 무작위 줄과 같은 모양 (선택 강조 없음), 레벨 칸 자리에 초기화와 완료
