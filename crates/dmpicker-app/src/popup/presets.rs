@@ -183,14 +183,20 @@ impl Popup {
         if changed { Action::Choice } else { Action::None }
     }
 
-    /// 삭제: 시트를 닫고 목록에서 그 줄을 지움, 다음 줄을 고르고 지운 줄은 접힘
+    /// 삭제: 시트를 닫고 목록에서 그 줄을 지움, 다음 줄을 고름
     pub(super) fn delete_sheet_preset(&mut self) -> Action {
         let Some(index) = self.preset_edit.as_ref().map(|p| p.index) else { return Action::None };
         self.close_preset_sheet();
         let Some(row) = self.history.iter().position(|r| *r == Row::Preset(index)) else { return Action::None };
         let action = self.delete_preset_row(row);
-        // 시트를 닫으며 판 전체를 겹쳐 바꾸는 중이라 줄 목록은 따로 안 섞음, 섞으면 줄만 탭보다 늦게 나타남
+        // 보던 건 시트라 목록은 지운 뒤 모습으로 판 전체와 한 번만 겹쳐 바꿈
+        // 지운 줄이 새 목록에 다시 보였다 접히고 강조·스크롤까지 미끄러지면 섞는 동안 움직임이 겹침
+        self.preset_change = None;
+        self.preset_slots.clear();
         self.list_swap.reset();
+        self.scroll_s.snap(self.scroll as f32 * self.px(lay::ROW_H));
+        self.retarget_selection(true);
+        self.retarget_panel();
         action
     }
 
