@@ -2352,12 +2352,14 @@ impl Popup {
 
     /// 바에 채보 "4B · HD"가 보임, 키워드·닉네임 입력 중·뽑은 기록과 결과 화면의 플레이리스트 주소엔 안 보임
     /// 주소는 검색을 기다리지 않고 지금 글로 봄, 붙여 넣는 순간 입력 칸도 같이 넓어져 글이 나중에 안 튐
+    /// 모드를 적은 검색어는 같은 정보가 두 번 보이지 않게 채보 칸을 숨김
     fn shows_cond(&self) -> bool {
         match self.view {
             View::Keywords | View::Rolls => false,
-            View::Results => playlist::id(self.edit.text()).is_none(),
+            View::Results => playlist::id(self.edit.text()).is_none() && !self.cond_label().is_empty(),
+            View::History => !self.cond_label().is_empty(),
             View::Filter => self.nickname_edit.is_none(),
-            View::Settings | View::Exclude | View::History => true,
+            View::Settings | View::Exclude => true,
         }
     }
 
@@ -4578,12 +4580,13 @@ impl Popup {
         Some(format!("{n}곡 중 하나{left}"))
     }
 
-    /// 그리는 시트의 레벨 칸에 모드까지 씀: 플레이리스트 결과와 뽑은 기록
-    /// 둘 다 바에 모드가 안 보이고 줄마다 모드가 다를 수 있음
-    /// 플레이리스트 결과는 아래 칸처럼 검색어를 지워 사라지는 동안에도 그대로
+    /// 줄마다 모드가 다를 수 있는 목록은 모드도 표시함
+    /// 사라지는 동안에도 그리는 목록의 검색어를 사용함
     fn mode_levels(&self) -> bool {
         match self.sheet {
-            Sheet::Results => self.playlist_data().is_some(),
+            Sheet::Results => self.playlist_data().is_some()
+                || self.catalog.parse_filter(&self.result_query).is_some_and(|f| f.modes.len() > 1),
+            Sheet::History => self.catalog.parse_filter(&self.history_query).is_some_and(|f| f.modes.len() > 1),
             Sheet::Rolls => true,
             _ => false,
         }
@@ -4595,7 +4598,7 @@ impl Popup {
     }
 
     /// 줄 레벨 칸의 글과 서열표, 무작위 줄·히스토리의 플레이리스트 줄은 None
-    /// 플레이리스트 결과·뽑은 기록은 모드까지 "4B · SC 15", 곡 줄은 설정 모드
+    /// 여러 모드를 담은 목록은 "4B · SC 15", 곡 줄은 설정 모드
     /// 고를 수 없는 줄도 항목의 패턴으로, 레벨을 모르면 "4B · SC"까지
     /// 그 밖엔 "SC 15", 그 모드·난이도 패턴이 없는 곡은 None
     fn level_text(&self, row: Row) -> Option<(String, Option<f32>)> {
@@ -4689,12 +4692,11 @@ impl Popup {
             }
             return self.catalog.search(q, LIMIT, owned).into_iter().map(Row::Song).collect();
         };
-        let mode = f.mode().unwrap_or(self.mode_choice);
-        let row = |(i, diff)| match diff {
-            Some(d) => Row::Chart(i, mode, d),
+        let row = |(i, pattern)| match pattern {
+            Some((mode, diff)) => Row::Chart(i, mode, diff),
             None => Row::Song(i),
         };
-        let hits = self.catalog.filter(&f, mode, owned);
+        let hits = self.catalog.filter(&f, self.mode_choice, owned);
         let random = (!hits.is_empty()).then_some(Row::Random);
         random.into_iter().chain(hits.into_iter().map(row)).collect()
     }
@@ -5075,6 +5077,7 @@ impl Popup {
     }
 
     /// 바 채보 칸 글, 검색 중엔 실제로 적용될 모드·난이도
+    /// 검색어가 채보를 정하면 빈 글
     fn cond_label(&self) -> String {
         let pattern = if matches!(self.view, View::Results | View::History) {
             crate::presets::QueryPattern::read(&self.catalog, &self.searched)

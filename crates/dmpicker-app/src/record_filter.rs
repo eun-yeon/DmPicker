@@ -219,7 +219,7 @@ impl Options {
                 (None, None) => Ordering::Equal,
             }
         };
-        primary.then_with(title).then_with(|| a.2.cmp(&b.2))
+        primary.then_with(title).then_with(|| a.2.cmp(&b.2)).then_with(|| a.1.cmp(&b.1))
     }
 }
 

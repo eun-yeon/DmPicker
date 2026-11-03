@@ -17,8 +17,6 @@ const DIFF_KEYS: [(&str, Diff); 4] = [("nm", Diff::NM), ("hd", Diff::HD), ("mx",
 /// 레벨 조건
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LevelQuery {
-    /// 없으면 설정의 모드
-    pub mode: Option<Mode>,
     pub diff: Diff,
     /// 레벨 범위 `lo..=hi`, 레벨 하나면 둘이 같음
     pub lo: u8,
@@ -27,12 +25,12 @@ pub struct LevelQuery {
 
 impl LevelQuery {
     /// 검색어 전체가 `[모드] 난이도 레벨` 또는 레벨 범위 꼴이면 Some
-    pub fn parse(raw: &str) -> Option<LevelQuery> {
+    pub fn parse(raw: &str) -> Option<(Option<Mode>, LevelQuery)> {
         Self::parse_keys(&keys(raw)?)
     }
 
     /// [`keys`]로 바꾼 검색어에서 읽음
-    pub(crate) fn parse_keys(keys: &str) -> Option<LevelQuery> {
+    pub(crate) fn parse_keys(keys: &str) -> Option<(Option<Mode>, LevelQuery)> {
         let mut rest = keys;
         let mut take = |prefix: &str| {
             let hit = rest.starts_with(prefix);
@@ -46,7 +44,7 @@ impl LevelQuery {
         // 레벨은 숫자 한두 자리, `parse`가 받는 '+'는 `keys`에서 이미 걸러짐
         let parse_level = |s: &str| s.parse::<u8>().ok().filter(|l| s.len() <= 2 && (1..=15).contains(l));
         let (lo, hi) = range(rest, parse_level, 1, 15)?;
-        Some(LevelQuery { mode, diff, lo, hi })
+        Some((mode, LevelQuery { diff, lo, hi }))
     }
 
     /// 모드 `mode` (실제로 적용할 모드)에서 이 난이도·레벨 범위인 패턴이 있음

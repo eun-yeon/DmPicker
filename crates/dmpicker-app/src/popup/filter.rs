@@ -34,11 +34,10 @@ impl Popup {
         }
         let had_results = picks(&rows).next().is_some();
         let mut rows: Vec<_> = picks(&rows).filter(|&row| self.record_allows(row)).collect();
-        // 한 조건 검색은 한 버튼 모드만 씀
-        let rate_ready = rows.first().and_then(|&row| self.row_pattern(row)).is_some_and(|(_, mode, _)| self.records.known(mode));
+        let rate_ready = rows.iter().all(|&row| self.row_pattern(row).is_some_and(|(_, mode, _)| self.records.known(mode)));
         let (sort, direction) = self.record_filter.effective_sort(&self.records);
         let title_order = sort == Sort::Title && direction == Direction::Ascending;
-        // 기록을 아직 못 받은 모드의 레이트 정렬은 다 기록 없음이라 정렬 안 함
+        // 받은 모드만으로 정렬하면 못 받은 모드가 기록 없는 줄처럼 뒤로 밀림
         if !title_order && (sort != Sort::Rate || rate_ready) {
             rows.sort_by(|&a, &b| self.record_filter.compare(self.row_pattern(a).unwrap(), self.row_pattern(b).unwrap(), &self.records));
         }

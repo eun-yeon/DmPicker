@@ -207,8 +207,9 @@ impl Catalog {
         self.tag_names.has_tag_syntax(query)
     }
 
-    /// 조건 검색: `f`에 맞는 (`songs` 인덱스, 패턴 난이도) 전부 (개수 제한 없음), 패턴은 모드 `mode`로 봄
-    pub fn filter(&self, f: &Filter, mode: Mode, owned: Option<&HashSet<u32>>) -> Vec<(usize, Option<Diff>)> {
+    /// 조건 검색은 무작위 후보를 빠뜨리지 않도록 개수 제한 없이 모음
+    /// `mode`는 검색어에 모드가 없을 때 쓰는 설정 모드
+    pub fn filter(&self, f: &Filter, mode: Mode, owned: Option<&HashSet<u32>>) -> Vec<(usize, Option<(Mode, Diff)>)> {
         f.find(&self.songs, mode, |i| self.allowed(i, owned))
     }
 
