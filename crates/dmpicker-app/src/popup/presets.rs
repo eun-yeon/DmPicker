@@ -44,7 +44,8 @@ impl Popup {
         } else {
             String::new()
         };
-        let finding = self.view == View::History && self.typed();
+        // 최근·즐겨찾기 탭처럼 공백만 친 건 안 찾음, 기호만 친 글은 찾아서 맞는 게 없음
+        let finding = !self.history_query.trim().is_empty();
         let query = dmpicker_search::normalize(&self.history_query);
         self.preset_current = self.current_preset();
         self.history.clear();
@@ -72,7 +73,7 @@ impl Popup {
     pub(super) fn preset_empty_text(&self) -> Option<&'static str> {
         if self.history.iter().any(|row| matches!(row, Row::Preset(_))) {
             None
-        } else if self.history_query.is_empty() {
+        } else if self.history_query.trim().is_empty() {
             Some(NO_PRESETS)
         } else {
             Some("프리셋에 맞는 검색이 없어요")
@@ -85,9 +86,9 @@ impl Popup {
     }
 
     /// 지금 검색을 목록 맨 위에 저장, 맨 위에 있던 저장 줄 자리가 그대로 새 프리셋 줄이 됨
-    /// 줄 자리는 그대로 두고 글만 겹쳐 바꿈
+    /// 저장 줄 자리는 그대로 두고 줄 내용을 겹쳐 바꿈
     pub(super) fn save_preset(&mut self) -> Action {
-        if self.view != View::History || self.history_tab != HistoryTab::Presets || self.typed() {
+        if self.view != View::History || self.history_tab != HistoryTab::Presets || !self.query().trim().is_empty() {
             return Action::None;
         }
         let Some(preset) = self.current_preset().filter(|p| !self.presets.contains(p)) else {
@@ -95,15 +96,12 @@ impl Popup {
         };
         self.presets.insert(0, preset);
         let before = self.history.clone();
-        let (scroll, scroll_s, sel_y) = (self.scroll, self.scroll_s, self.sel_y);
         self.fill_presets();
-        // 강조는 그 자리 새 프리셋 줄에 그대로
+        // 강조는 그 자리 새 프리셋 줄에 바로, 섞는 동안 강조까지 미끄러지면 옛 층 강조와 두 개로 보임
         self.selected = 0;
-        self.scroll = scroll;
-        // 다시 채우며 맨 위로 맞춘 스크롤·강조를 되돌림, 지금 자리에서 새 줄로 미끄러짐
-        (self.scroll_s, self.sel_y) = (scroll_s, sel_y);
-        self.fit_scroll();
-        self.retarget_selection(false);
+        self.scroll = 0;
+        self.scroll_s.snap(0.0);
+        self.retarget_selection(true);
         // 다시 채운 목록에 옛 줄 번호 호버가 남지 않게, 마우스를 움직이면 다시 정함
         self.hover = Hit::Inside;
         self.start_preset_motion(&before);
@@ -120,7 +118,7 @@ impl Popup {
         self.preset_edit = Some(PresetEdit { index, edit: std::mem::take(&mut self.edit), scroll: self.scroll });
         self.clear_input();
         self.edit.insert(&name);
-        self.preset_slots.clear();
+        self.preset_fold = None;
         self.view = View::Preset;
         self.hover = Hit::None;
         self.retarget_panel();
@@ -231,7 +229,7 @@ impl Popup {
         }
         self.view = View::Results;
         self.kb_focus = None;
-        self.preset_slots.clear();
+        self.preset_fold = None;
         if !self.in_zone && self.leave_since.is_none() {
             self.leave_since = Some(Instant::now());
         }
@@ -242,23 +240,10 @@ impl Popup {
     }
 }
 
-/// 첫 프리셋을 저장하는 동안의 줄 자리, `Row`는 `history` 줄을 차례로 가리킴
-/// 빠진 빈 목록 안내는 접힐 때까지 그 자리에 `Gone`으로 남음
-pub(super) enum Slot {
-    Row,
-    Gone(Gone, RowFold),
-}
-
-/// 빠져서 접히는 동안 그리는 내용
-#[derive(Clone, Copy)]
-pub(super) enum Gone {
-    /// 첫 프리셋을 저장해 빠지는 빈 목록 안내
-    Empty,
-}
-
 /// 그릴 줄 하나, 위쪽은 목록 맨 위에서 스크롤 전 px
 struct Band {
-    row: BandRow,
+    /// None은 첫 프리셋을 저장해 빠지는 빈 목록 안내
+    row: Option<Row>,
     top: f32,
     height: f32,
     alpha: f32,
@@ -266,36 +251,24 @@ struct Band {
     moving: bool,
 }
 
-enum BandRow {
-    Row(Row),
-    Gone(Gone),
-}
-
 impl Popup {
-    /// 첫 프리셋을 저장하면 끝의 빈 목록 안내 띠가 접힘, `before`는 저장 전 줄
-    /// 저장 줄 자리는 그대로 새 프리셋 줄이라 다른 줄은 제자리
+    /// 첫 프리셋을 저장하면 끝의 빈 목록 안내 띠가 접힘, `before`는 저장 전 줄이고 목록을 다시 채운 뒤 부름
+    /// 저장 줄 자리는 그대로 새 프리셋 줄이라 다른 줄은 제자리, 접히는 띠는 줄 뒤에 붙음
     fn start_preset_motion(&mut self, before: &[Row]) {
-        self.preset_slots.clear();
-        if before.last() == Some(&Row::PresetEmpty) {
-            self.preset_slots = before.iter().map(|_| Slot::Row).collect();
-            self.preset_slots[before.len() - 1] = Slot::Gone(Gone::Empty, RowFold::new());
-        }
+        self.preset_fold = (before.last() == Some(&Row::PresetEmpty)).then(|| (RowFold::new(), self.history.len()));
     }
 
     /// 줄 모션을 `dt`만큼, 판 높이는 줄을 같은 프레임에 따라감 (`follow_rows`)
     pub(super) fn step_preset_motion(&mut self, dt: f32) {
-        if self.preset_slots.is_empty() {
+        if self.preset_fold.is_none() {
             return;
         }
         let before = self.panel_target();
-        for slot in &mut self.preset_slots {
-            if let Slot::Gone(_, fold) = slot {
-                fold.step(dt);
-            }
-        }
-        self.preset_slots.retain(|s| !matches!(s, Slot::Gone(_, fold) if fold.done()));
-        if self.preset_slots.iter().all(|s| matches!(s, Slot::Row)) {
-            self.preset_slots.clear();
+        if self.preset_fold.as_mut().is_some_and(|(fold, _)| {
+            fold.step(dt);
+            fold.done()
+        }) {
+            self.preset_fold = None;
         }
         if self.view == View::History && self.sheet == Sheet::History && self.history_tab == HistoryTab::Presets {
             self.follow_rows(before, dt);
@@ -307,16 +280,14 @@ impl Popup {
         self.view == View::History && self.history_tab == HistoryTab::Presets && self.preset_motion().is_some()
     }
 
-    /// 지금 쓰는 줄 자리, 그 뒤 목록을 다시 채워 줄 수가 안 맞으면 None
-    fn preset_motion(&self) -> Option<&[Slot]> {
-        let valid = !self.preset_slots.is_empty() && live_rows(&self.preset_slots) == self.history.len();
-        valid.then_some(self.preset_slots.as_slice())
+    /// 접히는 띠, 그 뒤 목록을 다시 채워 줄 수가 안 맞으면 None
+    fn preset_motion(&self) -> Option<RowFold> {
+        self.preset_fold.filter(|&(_, rows)| rows == self.history.len()).map(|(fold, _)| fold)
     }
 
     fn preset_bands(&self) -> Vec<Band> {
         let row_h = self.px(lay::ROW_H);
         let empty_h = self.px(lay::EXCLUDE_EMPTY_H);
-        let mut rows = self.history.iter().copied();
         let mut bands = Vec::new();
         let mut top = 0.0;
         let mut push = |row, full: f32, fold: Option<RowFold>| {
@@ -325,20 +296,11 @@ impl Popup {
             bands.push(Band { row, top, height, alpha, moving: fold.is_some() });
             top += height;
         };
-        let full = |row: Row| if row == Row::PresetEmpty { empty_h } else { row_h };
-        match self.preset_motion() {
-            None => rows.for_each(|row| push(BandRow::Row(row), full(row), None)),
-            Some(slots) => {
-                for slot in slots {
-                    match slot {
-                        Slot::Row => {
-                            let Some(row) = rows.next() else { break };
-                            push(BandRow::Row(row), full(row), None);
-                        }
-                        Slot::Gone(gone, fold) => push(BandRow::Gone(*gone), empty_h, Some(*fold)),
-                    }
-                }
-            }
+        for &row in &self.history {
+            push(Some(row), if row == Row::PresetEmpty { empty_h } else { row_h }, None);
+        }
+        if let Some(fold) = self.preset_motion() {
+            push(None, empty_h, Some(fold));
         }
         bands
     }
@@ -381,11 +343,11 @@ impl Popup {
                     }
                 }
                 let drawn = match band.row {
-                    BandRow::Row(Row::PresetSave) => self.draw_preset_save(y, right),
-                    BandRow::Row(Row::Preset(i)) => self.presets.get(i).map_or(Ok(()), |p| self.draw_preset_row(y, right, p)),
-                    BandRow::Row(Row::PresetEmpty) => self.preset_empty_text().map_or(Ok(()), |text| self.draw_preset_empty(y, panel, text)),
-                    BandRow::Row(_) => Ok(()),
-                    BandRow::Gone(Gone::Empty) => self.draw_preset_empty(y, panel, NO_PRESETS),
+                    Some(Row::PresetSave) => self.draw_preset_save(y, right),
+                    Some(Row::Preset(i)) => self.presets.get(i).map_or(Ok(()), |p| self.draw_preset_row(y, right, p)),
+                    Some(Row::PresetEmpty) => self.preset_empty_text().map_or(Ok(()), |text| self.draw_preset_empty(y, panel, text)),
+                    Some(_) => Ok(()),
+                    None => self.draw_preset_empty(y, panel, NO_PRESETS),
                 };
                 if band.moving {
                     unsafe {
@@ -448,8 +410,4 @@ impl Popup {
         }
         Ok(())
     }
-}
-
-fn live_rows(slots: &[Slot]) -> usize {
-    slots.iter().filter(|s| matches!(s, Slot::Row)).count()
 }

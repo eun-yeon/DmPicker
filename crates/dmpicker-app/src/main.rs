@@ -298,7 +298,6 @@ fn settings_json(p: &Popup) -> serde_json::Value {
 fn save_settings(a: &mut App) -> bool {
     a.popup.take_filter_changed();
     if a.settings_unreadable {
-        // 휠 한 칸마다 저장하러 와서 알림은 처음 한 번만
         if !std::mem::replace(&mut a.settings_noted, true) {
             a.toast.show("설정 파일을 읽지 못해서 저장할 수 없어요", Badge::None, Some(3.0));
         }
@@ -834,7 +833,8 @@ fn main() -> Result<()> {
         println!("catalog: {} songs", startup.catalog.songs.len());
 
         let ex = WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOREDIRECTIONBITMAP;
-        let hwnd = sys::create_popup(w!("DmPickerPopup"), APP_NAME, ex, Some(wndproc))?;
+        // 두 번째 누름을 따로 받아야 줄을 두 번 눌러도 바뀐 목록의 줄을 안 고름
+        let hwnd = sys::create_popup(w!("DmPickerPopup"), CS_DBLCLKS, APP_NAME, ex, Some(wndproc))?;
         POPUP.with(|c| c.set(hwnd));
         let toast = Toast::new(Some(wndproc))?;
         let tray = tray::Tray::new(Some(wndproc))?;

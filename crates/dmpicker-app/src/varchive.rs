@@ -19,7 +19,6 @@ pub const READY: u32 = WM_APP + 6;
 pub struct Record {
     pub score: f64,
     pub max_combo: bool,
-    pub updated_at: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,12 +52,7 @@ fn records(values: &[Value]) -> Option<BTreeMap<(u32, Diff), Record>> {
             continue;
         };
         let score = value["score"].as_f64().filter(|s| valid_rate(*s))?;
-        let record = Record {
-            score,
-            max_combo: value["maxCombo"].as_bool()?,
-            updated_at: value["updatedAt"].as_str()?.to_owned(),
-        };
-        records.insert((title, diff), record);
+        records.insert((title, diff), Record { score, max_combo: value["maxCombo"].as_bool()? });
     }
     Some(records)
 }
@@ -150,8 +144,7 @@ impl Cache {
         for mode in Mode::ALL {
             if let Some(snapshot) = &self.modes[mode.index()] {
                 let records: Vec<_> = snapshot.records.iter().map(|(&(title, diff), record)| json!({
-                    "title": title, "pattern": diff.label(), "score": record.score,
-                    "maxCombo": record.max_combo, "updatedAt": record.updated_at,
+                    "title": title, "pattern": diff.label(), "score": record.score, "maxCombo": record.max_combo,
                 })).collect();
                 modes.insert(mode.label().to_owned(), json!({ "received_at": snapshot.received_at, "records": records }));
             }

@@ -249,7 +249,7 @@ impl Lights {
 impl Toast {
     pub fn new(wndproc: WNDPROC) -> Result<Self> {
         let ex = WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_NOREDIRECTIONBITMAP;
-        let hwnd = sys::create_popup(w!("DmPickerToast"), &format!("{} status", crate::APP_NAME), ex, wndproc)?;
+        let hwnd = sys::create_popup(w!("DmPickerToast"), WNDCLASS_STYLES::default(), &format!("{} status", crate::APP_NAME), ex, wndproc)?;
         unsafe {
             let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
         }

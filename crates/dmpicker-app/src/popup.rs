@@ -79,7 +79,7 @@ const SHEET_OUT_SECS: f32 = 0.16;
 const PANEL_REST: f32 = 0.1;
 /// 판 높이 스프링 (stiffness, damping), 줄 접기 (`RowFold`)도 같은 걸 써서 시트를 바꿀 때와 같은 빠르기로 움직임
 const PANEL_SPRING: (f32, f32) = (330.0, 29.0);
-/// 줄을 지우거나 넣을 때 흐려지고 나타나는 시간
+/// 줄이 빠지며 흐려지는 시간
 const ROW_FADE_SECS: f32 = 0.15;
 /// 목록·설정·검색 제외 스크롤 스프링 (stiffness, damping)
 const SCROLL_SPRING: (f32, f32) = (600.0, 46.0);
@@ -165,7 +165,7 @@ mod lay {
     pub const ROW_H: f32 = 48.0;
     pub const ROWS: usize = 6;
     pub const LEVEL_W: f32 = 60.0; // 줄 오른쪽 끝의 레벨 칸
-    pub const PLAYLIST_LEVEL_W: f32 = 72.0; // 플레이리스트 결과·뽑은 기록은 모드까지, 가장 긴 "8B · MX 15"가 약 66
+    pub const PLAYLIST_LEVEL_W: f32 = 72.0; // 줄마다 모드가 다를 수 있는 목록은 모드까지, 가장 긴 "8B · MX 15"가 약 66
     pub const SETTINGS_H: f32 = 456.0; // 맨 아래 줄(410..440) 아래 16 (= 오른쪽 여백)
     /// 설정 시트 휠 한 칸, 내 곡 목록부터 아래 묶음끼리의 간격
     pub const SETTINGS_WHEEL: f32 = 54.0;
@@ -186,7 +186,7 @@ mod lay {
     pub const CARD_H: f32 = 84.0;
     pub const CARD_BTN_W: f32 = 112.0;
     pub const COND_W: f32 = 52.0; // 글은 가운데, 오른쪽 끝이 16 정렬선
-    /// 필터 시트: 맨 아래 플레이 세그먼트 (254..286) 아래 16
+    /// 필터 시트: 맨 아래 기록 상태 세그먼트 (254..286) 아래 16
     pub const FILTER_H: f32 = 302.0;
     /// 결과 줄 배지, 재킷 오른쪽 아래에 걸침 (배지 오른쪽은 재킷 오른쪽 + 6, 아래는 재킷 아래 + 4)
     pub const BADGE: f32 = 18.0;
@@ -644,7 +644,7 @@ impl IconSwap {
         self.0[self.0.len() - 1].icon
     }
 
-    /// 바뀌는 중, 끝나면 지금 아이콘 하나만 보임 1로 남음
+    /// 바뀌는 중, 끝나면 지금 아이콘 하나만 1로 남음
     fn moving(&self) -> bool {
         self.0.len() > 1 || self.0.last().is_some_and(|s| s.wait > 0.0 || s.shown.moving())
     }
@@ -1227,8 +1227,8 @@ pub struct Popup {
     history_query: String,
     presets: Vec<crate::presets::Preset>,
     preset_current: Option<crate::presets::Preset>,
-    /// 첫 프리셋을 저장해 빈 목록 안내가 접히는 동안 그리는 줄 자리, 모션을 버리면 비움
-    preset_slots: Vec<presets::Slot>,
+    /// 첫 프리셋을 저장해 접히는 빈 목록 안내 띠와 저장 뒤 줄 수, 목록을 다시 채워 줄 수가 달라지면 안 씀
+    preset_fold: Option<(RowFold, usize)>,
     /// 줄이 접히는 동안 판 빠르기 (px/s), 줄 모션을 버리면 판 스프링이 이어받음 (`step_row_motion`)
     row_panel_speed: Option<f32>,
     preset_edit: Option<presets::PresetEdit>,
@@ -1266,7 +1266,7 @@ pub struct Popup {
     exclude_filtered: bool,
     exclude_focus: Option<usize>, // 화살표로 고른 줄, 마우스를 움직이면 풀림
     exclude_down: Option<usize>, // 누른 줄 (떼면 바뀜)
-    exclude_space: bool, // 마지막 줄을 빼서 포커스가 없어져도 뒤따르는 공백은 입력하지 않음
+    space_held: bool, // 컨트롤을 누른 Space, 뗄 때까지 반복과 공백 글자를 버림 (그사이 연 입력 칸, 줄이 빠져 포커스가 없어진 뒤도)
     exclude_scroll_s: Spring, // 끝 오프셋은 한 줄보다 작을 수 있어 px로 저장함
     keyword_edit: Option<KeywordEdit>,
     roll_edit: Option<RollEdit>,
@@ -1295,7 +1295,7 @@ pub struct Popup {
     close: Tween,           // 닫는 동안 0에서 1로
     sel_y: Spring,          // 선택 강조 위쪽, 패널 px (높이는 한 줄)
     scroll_s: Spring,       // 목록 오프셋 px, scroll x 줄 간격을 따라감
-    seg: [SegThumb; 6],     // 세그먼트 손잡이 [모드, 난이도, 히스토리 탭, 검색 제외 탭, 정렬, 플레이]
+    seg: [SegThumb; 6],     // 세그먼트 손잡이 [모드, 난이도, 히스토리 탭, 검색 제외 탭, 정렬, 기록 상태]
     sheet_swap: Crossfade,  // 시트 내용, 보기나 카드가 바뀌면 겹쳐 바꿈
     exclude_hl: Option<Spring>, // 검색 제외 줄 강조 위쪽 (목록 맨 위에서), 줄을 옮기면 다른 목록 선택 강조처럼 미끄러짐
     list_swap: Crossfade,   // 히스토리·검색 제외 줄 목록, 탭이 바뀌면 겹쳐 바꿈 (탭은 제자리), 필터 시트에선 기록 부분
@@ -1487,7 +1487,7 @@ impl Popup {
             history_query: String::new(),
             presets: Vec::new(),
             preset_current: None,
-            preset_slots: Vec::new(),
+            preset_fold: None,
             row_panel_speed: None,
             preset_edit: None,
             list_edit: None,
@@ -1514,7 +1514,7 @@ impl Popup {
             exclude_filtered: false,
             exclude_focus: None,
             exclude_down: None,
-            exclude_space: false,
+            space_held: false,
             exclude_scroll_s: Spring::new(0.0, SCROLL_SPRING.0, SCROLL_SPRING.1),
             keyword_edit: None,
             roll_edit: None,
@@ -1734,7 +1734,7 @@ impl Popup {
                 || !self.settings_scroll_s.settled()
                 || self.settings_scrolling
                 || self.exclude_rows.iter().any(|r| r.removal.is_some() || !r.motion.done())
-                || !self.preset_slots.is_empty()
+                || self.preset_fold.is_some()
                 || (self.records.loading && self.sheet == Sheet::Filter)
                 || self.hover_since.is_some()
                 || self.leave_since.is_some())
@@ -2480,7 +2480,7 @@ impl Popup {
         rect(right - w, cy - self.px(15.0), right, cy + self.px(15.0))
     }
 
-    /// 키워드·뽑은 기록 시트의 완료 버튼, 레벨 칸 자리
+    /// 시트 맨 위 줄의 완료 버튼, 레벨 칸 자리
     fn done_button(&self) -> D2D_RECT_F {
         self.head_button(self.px(lay::MARGIN + lay::W) - self.px(lay::PAD) - self.px(8.0), "완료")
     }
@@ -2559,16 +2559,16 @@ impl Popup {
         } else {
             return None;
         };
-        record_filter::FilterInput::enabled(control, &self.record_filter, &self.records).then_some(control)
+        self.filter_enabled(control).then_some(control)
     }
 
     /// 필터로 다 걸러진 결과 판: 문구 (줄 상자 높이)와 필터 초기화 버튼을 사이 12로 묶어 120 띠 세로 가운데
     /// (문구 위쪽, 버튼), 그리기와 판정이 같이 씀
-    fn filter_empty_layout(&self, text: &str, button: &str) -> (f32, D2D_RECT_F) {
-        let line = self.text_height(text, |f| &f.item);
+    fn filter_empty_layout(&self) -> (f32, D2D_RECT_F) {
+        let line = self.text_height(filter::FILTER_EMPTY_TEXT, |f| &f.item);
         let total = line + self.px(12.0) + self.px(30.0);
         let text_top = self.panel_top() + ((self.px(lay::EXCLUDE_EMPTY_H) - total) / 2.0).round();
-        let w = (self.measure(button, |f| &f.item) + self.px(28.0)).round();
+        let w = (self.measure(filter::FILTER_RESET_LABEL, |f| &f.item) + self.px(28.0)).round();
         let cx = self.px(lay::MARGIN + lay::W / 2.0);
         let top = text_top + (line + self.px(12.0)).round();
         (text_top, rect((cx - w / 2.0).round(), top, (cx - w / 2.0).round() + w, top + self.px(30.0)))
@@ -2716,7 +2716,7 @@ impl Popup {
             Sheet::Results if self.playlist_waiting() => 0.0,
             _ if !self.listing() => 0.0,
             // 필터로 다 걸러지면 줄 자리 대신 문구와 필터 초기화 버튼, 검색 제외 창 빈 목록과 같은 높이
-            Sheet::Results if self.filter_empty_state(Sheet::Results).is_some() => self.px(lay::EXCLUDE_EMPTY_H),
+            Sheet::Results if self.filter_empty_state(Sheet::Results) => self.px(lay::EXCLUDE_EMPTY_H),
             // 프리셋은 빈 목록 안내 띠가 더 높고 첫 프리셋을 저장하는 동안엔 그 띠가 접히는 만큼
             Sheet::History if self.history_tab == HistoryTab::Presets => {
                 self.head_h(Sheet::History) + self.px(lay::PAD) + self.preset_list_h() + self.px(lay::PAD)
@@ -2915,19 +2915,19 @@ impl Popup {
         }
         // 필터로 다 걸러졌을 때의 필터 초기화: 결과 판 가운데, 즐겨찾기는 무작위 줄 자리
         let sheet = self.sheet_now();
-        if let Some(state) = self.filter_empty_state(sheet).filter(|s| record_filter::FilterInput::enabled(s.control, &self.record_filter, &self.records)) {
+        if self.filter_empty_state(sheet) {
             let button = match sheet {
-                Sheet::Results if self.listing() => Some(self.filter_empty_layout(state.text, state.button).1),
+                Sheet::Results if self.listing() => Some(self.filter_empty_layout().1),
                 Sheet::History => self.rows().iter().position(|r| *r == Row::Random).and_then(|i| {
                     let top = self.panel_top() + self.list_top(sheet);
                     let row_y = top + self.px(lay::ROW_H) * i as f32 - self.scroll_s.value;
                     let visible = row_y >= top - 0.5 && row_y + self.px(lay::ROW_H) <= top + self.px(lay::ROW_H) * self.visible_rows() as f32 + 0.5;
-                    visible.then(|| self.row_button(row_y, state.button))
+                    visible.then(|| self.row_button(row_y, filter::FILTER_RESET_LABEL))
                 }),
                 _ => None,
             };
             if button.is_some_and(|b| inside(&b, x, y)) {
-                return Hit::FilterControl(state.control);
+                return Hit::FilterControl(record_filter::Control::Reset);
             }
         }
         if self.view == View::History {
@@ -3388,7 +3388,7 @@ impl Popup {
         if self.view == v {
             return;
         }
-        self.preset_slots.clear();
+        self.preset_fold = None;
         let from_list = self.view.searches_sheet();
         let restore = if from_list {
             // 찾던 글의 조합 중인 글자는 원래 검색어에 안 붙게 버림
@@ -3589,6 +3589,11 @@ impl Popup {
         self.view == View::Settings && self.kb_focus.is_some()
     }
 
+    /// 필터 시트에서 Space는 포커스가 있는 컨트롤을 누름, 닉네임을 쓰는 동안엔 글자
+    fn space_presses_filter(&self) -> bool {
+        self.view == View::Filter && self.nickname_edit.is_none() && self.filter_sheet.focus.is_some()
+    }
+
     /// 처리하지 않은 편집 키는 입력 칸의 공통 처리로 넘김
     fn exclude_key(&mut self, vk: VIRTUAL_KEY, repeat: bool) -> Option<Action> {
         if self.view != View::Exclude {
@@ -3598,7 +3603,7 @@ impl Popup {
             self.search_now();
         }
         if vk == VK_SPACE && !repeat {
-            self.exclude_space = self.space_toggles_row();
+            self.space_held = self.space_toggles_row();
         }
         Some(match vk {
             VK_ESCAPE => {
@@ -3609,7 +3614,7 @@ impl Popup {
                 self.move_exclude(if vk == VK_UP { -1 } else { 1 });
                 Action::None
             }
-            VK_RETURN | VK_SPACE if vk == VK_RETURN || self.space_toggles_row() || self.exclude_space => {
+            VK_RETURN | VK_SPACE if vk == VK_RETURN || self.space_toggles_row() || self.space_held => {
                 if repeat {
                     Action::None
                 } else if let Some(i) = self.exclude_focus {
@@ -3693,7 +3698,6 @@ impl Popup {
         self.exclude_focus = None;
         // 옛 목록 줄 자리에서 미끄러져 오지 않게 새 줄에 바로 생김
         self.exclude_hl = None;
-        self.exclude_space = false;
         self.exclude_scroll_s.snap(0.0);
         self.wheel_acc = 0;
         self.retarget_panel();
@@ -4213,7 +4217,7 @@ impl Popup {
         if self.history_tab == tab {
             return;
         }
-        self.preset_slots.clear();
+        self.preset_fold = None;
         self.history_tab = tab;
         self.list_swap.swap();
         self.fill_history();
@@ -4300,10 +4304,15 @@ impl Popup {
     fn requery(&mut self, edit: Edit) {
         self.input_changed();
         if self.view == View::History && self.history_tab == HistoryTab::Presets {
-            self.preset_slots.clear();
             self.seen = self.query();
             self.ended = None;
+            let before = self.history.clone();
             self.fill_presets();
+            // 공백만 쳤거나 찾아도 같은 줄이면 접히던 띠도 이어감
+            // 줄이 바뀌면 버려야 줄을 따라가던 판 빠르기를 판 스프링이 이어받음
+            if self.history != before {
+                self.preset_fold = None;
+            }
             self.retarget_panel();
             return;
         }
@@ -4779,6 +4788,8 @@ impl Popup {
         let kept = if self.keep_query { self.query() } else { String::new() };
         let row = self.kept_row.take().filter(|_| self.keep_query);
         self.clear_input();
+        // 컨트롤을 누른 Space가 검색창을 닫으면 뗀 걸 못 받아서, 남은 깃발이 다음 공백 글자나 조합 중 Space를 가로챔
+        self.space_held = false;
         self.results.clear();
         self.result_query.clear();
         self.filter_empty = false;
@@ -5046,7 +5057,7 @@ impl Popup {
         }
     }
 
-    /// 세그먼트마다 고른 칸: 모드, 난이도, 히스토리 탭, 검색 제외 탭, 정렬, 플레이
+    /// 세그먼트마다 고른 칸: 모드, 난이도, 히스토리 탭, 검색 제외 탭, 정렬, 기록 상태
     fn segment_choices(&self) -> [usize; 6] {
         [
             self.mode_choice.index(), self.diff_choice.index(), self.history_tab as usize, self.exclude_tab as usize,
@@ -5106,7 +5117,8 @@ impl Popup {
         pattern.label(self.mode_choice, self.diff_choice).unwrap_or_default()
     }
 
-    /// 필터 버튼 아이콘: 레이트·플레이 필터가 걸려 있으면 채운 깔때기
+    /// 필터 버튼 아이콘: 닉네임을 연결하고 레이트·기록 상태 조건을 정해 두면 채운 깔때기
+    /// 글자 검색처럼 조건을 안 쓰는 검색에서도 채움, 검색어마다 바꾸면 치는 동안 깜빡임
     fn filter_icon(&self) -> Icon {
         if self.filter_marked() {
             Icon::FilterOn
@@ -5336,7 +5348,7 @@ impl Popup {
                 }
                 // BMP 밖 글자 (이모지)는 UTF-16 두 조각으로 옴, 앞 조각을 들고 있다가 합침 (짝이 안 맞으면 버림)
                 let c = wp.0 as u32;
-                if c == 0x20 && (self.space_toggles_row() || (self.view == View::Exclude && self.exclude_space)) {
+                if c == 0x20 && (self.space_toggles_row() || self.space_held) {
                     return Some((0, Action::None));
                 }
                 let ch = match c {
@@ -5384,8 +5396,8 @@ impl Popup {
                 Some((0, act))
             }
             WM_SYSKEYUP if self.hotkey_wait.is_some() => Some((0, Action::None)),
-            WM_KEYUP if wp.0 == VK_SPACE.0 as usize && self.exclude_space => {
-                self.exclude_space = false;
+            WM_KEYUP if wp.0 == VK_SPACE.0 as usize && self.space_held => {
+                self.space_held = false;
                 Some((0, Action::None))
             }
             WM_KEYDOWN | WM_SYSKEYDOWN => {
@@ -5394,7 +5406,7 @@ impl Popup {
                     let real = unsafe { ImmGetVirtualKey(self.hwnd) };
                     vk = VIRTUAL_KEY(real as u16);
                     if matches!(vk, VK_RETURN | VK_UP | VK_DOWN | VK_LEFT | VK_RIGHT | VK_HOME | VK_END | VK_DELETE | VK_ESCAPE | VK_PRIOR | VK_NEXT | VK_TAB)
-                        || (vk == VK_SPACE && (self.space_toggles_row() || self.space_presses_setting() || (self.view == View::Exclude && self.exclude_space))) {
+                        || (vk == VK_SPACE && (self.space_held || self.space_toggles_row() || self.space_presses_setting() || self.space_presses_filter())) {
                         // 한국어 Windows 관례: Enter·화살표는 글자를 확정하고 동작도 함
                         self.complete_composition();
                     } else {
@@ -5407,8 +5419,17 @@ impl Popup {
                 let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
                 let repeat = lp.0 & (1 << 30) != 0;
                 // F2·메뉴 키를 누르고 있으면 반복 입력이 시트를 열고 닫기를 되풀이해서 깜빡임
-                if repeat && matches!(vk, VK_F2 | VK_APPS | VK_F10) {
+                // Enter는 시트를 닫거나 목록을 바꾼 뒤 반복 입력이 새 줄을 골라 곡 이동까지 감
+                if repeat && matches!(vk, VK_F2 | VK_APPS | VK_F10 | VK_RETURN) {
                     return Some((0, Action::None));
+                }
+                // 컨트롤을 누른 Space는 뗄 때까지 반복을 버림
+                // 새로 누르면 다시 정함, 잠깐 다른 창이 포커스를 가져가 뗀 걸 못 받았어도 다음 공백은 들어감
+                if vk == VK_SPACE && repeat && self.space_held {
+                    return Some((0, Action::None));
+                }
+                if vk == VK_SPACE && !repeat {
+                    self.space_held = false;
                 }
                 if self.view == View::Filter {
                     // 숫자 칸 캐럿도 입력 칸처럼 치는 동안엔 켜진 채
@@ -5472,8 +5493,8 @@ impl Popup {
                         return Some((0, Action::None));
                     }
                     let act = self.settings_key(VK_RETURN);
-                    // 검색 제외를 열었으면 누르고 있는 Space의 반복과 공백 글자는 뗄 때까지 그 시트가 버림
-                    self.exclude_space = self.view == View::Exclude;
+                    // 검색 제외를 열었어도 누르고 있는 Space의 반복과 공백 글자는 뗄 때까지 그 입력 칸에 안 들어감
+                    self.space_held = true;
                     return Some((0, act));
                 }
                 let act = if self.view == View::Settings { self.settings_key(vk) } else { self.list_key(vk, ctrl, shift) };
@@ -5535,8 +5556,13 @@ impl Popup {
                 }
                 Some((0, Action::None))
             }
-            WM_LBUTTONDOWN => {
+            WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
                 let (x, y) = (lp.0 as i16 as f32, (lp.0 >> 16) as i16 as f32);
+                // 첫 누름으로 목록이 바뀌면 (프리셋 적용, 필터 초기화) 두 번째 누름이 새 줄을 골라 곡 이동까지 감
+                // 줄이 아닌 자리는 보통 누름이라 토글·입력 칸·버튼은 그대로
+                if msg == WM_LBUTTONDBLCLK && matches!(self.hit(x, y), Hit::Row(_)) {
+                    return Some((0, Action::None));
+                }
                 Some((0, self.on_click(x, y)))
             }
             WM_LBUTTONUP if self.dragging => {
@@ -5847,7 +5873,17 @@ impl Popup {
             }
             Hit::FilterControl(control) => {
                 self.filter_keyed = false;
-                self.filter_control(control)
+                let action = self.filter_control(control);
+                // 결과·즐겨찾기의 필터 초기화는 안내·버튼이 줄로 바뀌어서 뽑은 기록 초기화처럼 겹쳐 바꿈
+                // 필터 시트 안 컨트롤은 손잡이·칸 모션이 따로 있음
+                if control == record_filter::Control::Reset && matches!(action, Action::Choice) {
+                    match self.view {
+                        View::Results => self.sheet_swap.swap(),
+                        View::History => self.list_swap.swap(),
+                        _ => {}
+                    }
+                }
+                action
             }
             Hit::Text => {
                 // 필터 시트에선 바가 글을 안 받아서 누르면 시트를 닫고 검색으로 돌아감, 치던 레이트는 닫을 때 확정
@@ -6162,7 +6198,7 @@ impl Popup {
         g.fill_icon(icon, (r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0, self.px(lay::ICON), &g.brush(TEXT)?)
     }
 
-    /// 키워드·뽑은 기록 시트의 라벨·빈 칸 문구·안내 문구는 줄 높이 안 가운데, 잉크가 16 정렬선에 맞음
+    /// 시트의 라벨·빈 칸 문구·안내 문구는 줄 높이 안 가운데, 잉크가 16 정렬선에 맞음
     /// `l0`·`r0`은 패널 안쪽 16 정렬선
     fn text_line(&self, text: &str, font: &IDWriteTextFormat, top: f32, h: f32, b: &ID2D1SolidColorBrush, (l0, r0): (f32, f32)) -> Result<()> {
         let g = self.gfx.as_ref().unwrap();
@@ -6270,7 +6306,7 @@ impl Popup {
     }
 
     /// 필터 시트 (다 편 시트 자리), `l0`·`r0`은 패널 안쪽 16 정렬선
-    /// 닉네임이 없으면 기록 칸 (정렬의 레이트, 레이트, 플레이)이 흐리고 안 눌림
+    /// 닉네임이 없으면 기록 칸 (정렬의 레이트, 레이트, 기록 상태)이 흐리고 안 눌림
     /// `records`면 기록 줄부터 아래만, 아니면 머리와 정렬 줄만
     /// 닉네임을 넣거나 지우면 기록 부분만 따로 겹쳐 바꿈 (`filter_connected`), 정렬 줄까지 섞으면 손잡이가 옮겨 간 칸 글이 두 겹으로 보임
     fn draw_filter(&self, (l0, r0): (f32, f32), now: Instant, records: bool) -> Result<()> {
@@ -6293,7 +6329,6 @@ impl Popup {
         // 키로 옮긴 포커스만 보여 줌, 세그먼트 줄은 설정 시트처럼 라벨 밝기로
         let focus = self.filter_sheet.focus.filter(|_| self.filter_keyed);
         let lit = |c: Control| self.hover == Hit::FilterControl(c) || focus == Some(c);
-        let enabled = |c: Control| record_filter::FilterInput::enabled(c, &self.record_filter, &self.records);
         let label = |text: &str, font: &IDWriteTextFormat, top: f32, right: f32, b: &ID2D1SolidColorBrush| -> Result<()> {
             let l = g.layout(text, font, (right - l0).max(0.0), self.px(20.0))?;
             unsafe {
@@ -6311,7 +6346,7 @@ impl Popup {
         unsafe {
             if !records {
                 label(rows[Control::Reset.row()].label, &f.title, fl.title, r0, &text_b)?;
-                if enabled(Control::Reset) {
+                if self.filter_enabled(Control::Reset) {
                     draw_button(g, &f.item, fl.reset, "초기화", lit(Control::Reset), s)?;
                 } else {
                     draw_button_off(g, &f.item, fl.reset, "초기화", s)?;
@@ -6341,7 +6376,7 @@ impl Popup {
             let nl = g.layout_centered(nickname, &f.item, fl.nickname.right - fl.nickname.left - pad * 2.0, fl.nickname.bottom - fl.nickname.top)?;
             dc.DrawTextLayout(gfx::pt(fl.nickname.left + pad, fl.nickname.top), &nl, &text_b, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
             if let Some(r) = fl.refresh {
-                if enabled(Control::Refresh) {
+                if self.filter_enabled(Control::Refresh) {
                     draw_button(g, &f.item, r, "새로고침", lit(Control::Refresh), s)?;
                 } else {
                     draw_button_off(g, &f.item, r, "새로고침", s)?;
@@ -6377,10 +6412,10 @@ impl Popup {
     fn draw_rate_field(&self, r: D2D_RECT_F, bound: record_filter::Bound, value: &str, hint: &str, lit: bool, now: Instant) -> Result<()> {
         let (g, f) = (self.gfx.as_ref().unwrap(), self.fonts.as_ref().unwrap());
         let dc = &g.dc;
-        let on = if self.records.connected() { 1.0 } else { 0.0 };
+        let connected = self.records.connected();
+        let on = if connected { 1.0 } else { 0.0 };
         let editing = self.filter_sheet.rate_edit.as_ref().filter(|e| e.bound == bound).map(|e| &e.edit);
-        let usable = record_filter::FilterInput::enabled(record_filter::Control::Rate(bound), &self.record_filter, &self.records);
-        let fill = if usable && (editing.is_some() || lit) {
+        let fill = if connected && (editing.is_some() || lit) {
             FILL_STRONG
         } else {
             FILL_TRACK + (FILL_SELECTED - FILL_TRACK) * on
@@ -6746,13 +6781,13 @@ impl Popup {
             let draw_list = || -> Result<()> {
                 let row0 = self.list_top(self.sheet);
                 // 필터로 다 걸러진 결과: 문구와 필터 초기화 버튼을 한 덩어리로 120 띠 가운데
-                if let Some(state) = self.filter_empty_state(self.sheet).filter(|_| n_rows == 0) {
-                    let (text_top, button) = self.filter_empty_layout(state.text, state.button);
-                    let l = g.layout(state.text, &f.item, panel.right - panel.left, self.px(lay::EXCLUDE_EMPTY_H))?;
+                if n_rows == 0 && self.filter_empty_state(self.sheet) {
+                    let (text_top, button) = self.filter_empty_layout();
+                    let l = g.layout(filter::FILTER_EMPTY_TEXT, &f.item, panel.right - panel.left, self.px(lay::EXCLUDE_EMPTY_H))?;
                     l.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
                     l.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR)?;
                     dc.DrawTextLayout(gfx::pt(panel.left, text_top), &l, &sub_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
-                    draw_button(g, &f.item, button, state.button, self.hover == Hit::FilterControl(state.control), s)?;
+                    draw_button(g, &f.item, button, filter::FILTER_RESET_LABEL, self.hover == Hit::FilterControl(record_filter::Control::Reset), s)?;
                     return Ok(());
                 }
                 if n_rows == 0 {
@@ -6795,17 +6830,15 @@ impl Popup {
                     let (title, sub, tail) = match row {
                         // 즐겨찾기에서 필터에 맞는 곡이 없으면 무작위 줄 자리에 문구와 필터 초기화 버튼
                         Row::Random => {
-                            if self.sheet == Sheet::History {
-                                if let Some(state) = self.filter_empty_state(self.sheet) {
-                                    self.draw_slot_icon(y, Icon::Random)?;
-                                    let button = self.row_button(y, state.button);
-                                    let x = self.jacket_slot(y).rect.right + self.px(10.0);
-                                    let l = g.layout(state.text, &f.item, (button.left - self.px(8.0) - x).max(0.0), pitch)?;
-                                    l.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
-                                    dc.DrawTextLayout(gfx::pt(x, y), &l, &sub_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
-                                    draw_button(g, &f.item, button, state.button, self.hover == Hit::FilterControl(state.control), s)?;
-                                    continue;
-                                }
+                            if self.sheet == Sheet::History && self.filter_empty_state(self.sheet) {
+                                self.draw_slot_icon(y, Icon::Random)?;
+                                let button = self.row_button(y, filter::FILTER_RESET_LABEL);
+                                let x = self.jacket_slot(y).rect.right + self.px(10.0);
+                                let l = g.layout(filter::FILTER_EMPTY_TEXT, &f.item, (button.left - self.px(8.0) - x).max(0.0), pitch)?;
+                                l.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+                                dc.DrawTextLayout(gfx::pt(x, y), &l, &sub_b, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                                draw_button(g, &f.item, button, filter::FILTER_RESET_LABEL, self.hover == Hit::FilterControl(record_filter::Control::Reset), s)?;
+                                continue;
                             }
                             // 플레이리스트 문구는 결과 줄 기준이라 히스토리의 무작위 줄엔 안 씀
                             let note = self.playlist_random_note(rows).filter(|_| self.sheet == Sheet::Results);
@@ -7140,7 +7173,7 @@ impl Popup {
             let list_top = self.panel_top() + self.list_top(self.sheet);
             let list_bottom = (list_top + pitch * n_page as f32).min(panel.bottom);
             // 즐겨찾기에서 뽑을 곡이 없어 무작위 줄 자리에 필터 초기화가 보이면 빛도 없음
-            let random_sheet = matches!(self.sheet, Sheet::Results | Sheet::History) && self.filter_empty_state(self.sheet).is_none();
+            let random_sheet = matches!(self.sheet, Sheet::Results | Sheet::History) && !self.filter_empty_state(self.sheet);
             let random = (random_sheet && has_panel && listed && self.rows_of(self.sheet).get(self.selected) == Some(&Row::Random))
                 .then(|| {
                     let inset = self.px(lay::PAD);

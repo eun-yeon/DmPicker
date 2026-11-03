@@ -84,11 +84,12 @@ pub fn find_game() -> Option<HWND> {
 }
 
 /// `class`를 등록하고 그 클래스로 테두리 없는 최상위 창을 숨긴 채 만듦
-pub fn create_popup(class: PCWSTR, title: &str, ex_style: WINDOW_EX_STYLE, wndproc: WNDPROC) -> Result<HWND> {
+pub fn create_popup(class: PCWSTR, style: WNDCLASS_STYLES, title: &str, ex_style: WINDOW_EX_STYLE, wndproc: WNDPROC) -> Result<HWND> {
     unsafe {
         let hinst = GetModuleHandleW(None)?;
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style,
             lpfnWndProc: wndproc,
             hInstance: hinst.into(),
             hCursor: LoadCursorW(None, IDC_ARROW)?,

@@ -3,12 +3,8 @@
 use super::*;
 use record_filter::{Bound, Control, Direction, Sort};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct FilterEmpty {
-    pub text: &'static str,
-    pub button: &'static str,
-    pub control: Control,
-}
+pub(super) const FILTER_EMPTY_TEXT: &str = "필터에 맞는 곡이 없어요";
+pub(super) const FILTER_RESET_LABEL: &str = "필터 초기화";
 
 impl Popup {
     fn row_pattern(&self, row: Row) -> Option<record_filter::PatternRef<'_>> {
@@ -33,14 +29,28 @@ impl Popup {
             return (rows, false);
         }
         let had_results = picks(&rows).next().is_some();
-        let mut rows: Vec<_> = picks(&rows).filter(|&row| self.record_allows(row)).collect();
-        let rate_ready = rows.iter().all(|&row| self.row_pattern(row).is_some_and(|(_, mode, _)| self.records.known(mode)));
+        // 찾은 줄은 이미 제목순이라 이름이 바뀔 때마다 올린 순번이 제목 비교를 대신함
+        // 곡이 달라도 이름이 같으면 같은 순번, 그런 줄끼리는 난이도·모드로 가름
+        let (mut title, mut last) = (0, None);
+        let mut found: Vec<_> = picks(&rows)
+            .filter_map(|row| self.row_pattern(row).map(|pattern| (row, pattern)))
+            .filter(|&(_, pattern)| self.record_filter.allows(pattern, &self.records))
+            .map(|(row, pattern)| {
+                if last != Some(&pattern.0.name) {
+                    title += 1;
+                    last = Some(&pattern.0.name);
+                }
+                (row, pattern, title)
+            })
+            .collect();
+        let rate_ready = found.iter().all(|&(_, (_, mode, _), _)| self.records.known(mode));
         let (sort, direction) = self.record_filter.effective_sort(&self.records);
         let title_order = sort == Sort::Title && direction == Direction::Ascending;
         // 받은 모드만으로 정렬하면 못 받은 모드가 기록 없는 줄처럼 뒤로 밀림
         if !title_order && (sort != Sort::Rate || rate_ready) {
-            rows.sort_by(|&a, &b| self.record_filter.compare(self.row_pattern(a).unwrap(), self.row_pattern(b).unwrap(), &self.records));
+            found.sort_by(|a, b| self.record_filter.compare(a.1, b.1, a.2.cmp(&b.2), &self.records));
         }
+        let mut rows: Vec<_> = found.into_iter().map(|(row, ..)| row).collect();
         let empty = had_results && rows.is_empty();
         if !rows.is_empty() {
             rows.insert(0, Row::Random);
@@ -96,7 +106,7 @@ impl Popup {
             // 모드·난이도로 저장 줄이 생기거나 빠지면 판이 바뀐 것, 접히던 줄 모션은 줄 수가 안 맞아 버림
             if self.history != before {
                 self.list_swap.swap();
-                self.preset_slots.clear();
+                self.preset_fold = None;
             }
         }
         if self.playlist.is_none() && self.catalog.parse_filter(&self.result_query).is_some() {
@@ -212,7 +222,7 @@ impl Popup {
     }
 
     pub(super) fn filter_control(&mut self, control: Control) -> Action {
-        if !record_filter::FilterInput::enabled(control, &self.record_filter, &self.records) {
+        if !self.filter_enabled(control) {
             return Action::None;
         }
         if control != Control::Nickname {
@@ -393,6 +403,10 @@ impl Popup {
             }
             VK_RETURN | VK_SPACE => {
                 if let Some(control) = self.filter_sheet.focus {
+                    // 닉네임 칸이 열려도 누르고 있는 Space의 반복과 공백 글자가 닉네임을 안 덮음
+                    if vk == VK_SPACE {
+                        self.space_held = true;
+                    }
                     return Some(self.filter_control(control));
                 }
                 Action::None
@@ -435,6 +449,10 @@ impl Popup {
         self.filter_sheet.rows(&self.record_filter, &self.records)
     }
 
+    pub(super) fn filter_enabled(&self, control: Control) -> bool {
+        record_filter::FilterInput::enabled(control, &self.record_filter, &self.records)
+    }
+
     pub(super) fn filter_status(&self) -> String {
         self.records.status(self.mode_choice, varchive::now())
     }
@@ -443,14 +461,15 @@ impl Popup {
         self.records.connected() && self.record_filter.active()
     }
 
-    pub(super) fn filter_empty_state(&self, sheet: Sheet) -> Option<FilterEmpty> {
-        let empty = match sheet {
+    pub(super) fn filter_empty_state(&self, sheet: Sheet) -> bool {
+        match sheet {
             Sheet::Results => self.filter_empty && self.results.is_empty() && self.playlist.is_none(),
-            Sheet::History if self.history_tab == HistoryTab::Favorites => self.history.contains(&Row::Random)
-                && picks(&self.history).next().is_some() && self.random_candidates(sheet).is_empty(),
+            Sheet::History if self.history_tab == HistoryTab::Favorites => {
+                let allows = self.random_allows(sheet);
+                self.history.contains(&Row::Random) && picks(&self.history).next().is_some() && !picks(&self.history).any(|row| allows(&row))
+            }
             _ => false,
-        };
-        empty.then_some(FilterEmpty { text: "필터에 맞는 곡이 없어요", button: "필터 초기화", control: Control::Reset })
+        }
     }
 
     pub(super) fn row_record(&self, row: Row) -> Option<&varchive::Record> {

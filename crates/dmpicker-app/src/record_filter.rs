@@ -196,9 +196,9 @@ impl Options {
         }
     }
 
-    pub fn compare(&self, a: PatternRef<'_>, b: PatternRef<'_>, cache: &Cache) -> Ordering {
+    /// `title`은 두 줄의 제목 순서, 비교마다 제목 키를 만들면 넓은 검색에서 정렬이 느려서 부르는 쪽이 미리 매긴 순번으로 줌
+    pub fn compare(&self, a: PatternRef<'_>, b: PatternRef<'_>, title: Ordering, cache: &Cache) -> Ordering {
         let (sort, direction) = self.effective_sort(cache);
-        let title = || title_order(a.0, b.0);
         let number = |pattern: PatternRef<'_>| -> Option<(f64, f64)> {
             let (song, mode, diff) = pattern;
             match sort {
@@ -210,7 +210,7 @@ impl Options {
             }
         };
         let primary = if sort == Sort::Title {
-            direction.apply(title())
+            direction.apply(title)
         } else {
             match (number(a), number(b)) {
                 (Some(a), Some(b)) => direction.apply(a.0.total_cmp(&b.0).then_with(|| a.1.total_cmp(&b.1))),
@@ -219,12 +219,8 @@ impl Options {
                 (None, None) => Ordering::Equal,
             }
         };
-        primary.then_with(title).then_with(|| a.2.cmp(&b.2)).then_with(|| a.1.cmp(&b.1))
+        primary.then(title).then_with(|| a.2.cmp(&b.2)).then_with(|| a.1.cmp(&b.1))
     }
-}
-
-fn title_order(a: &Song, b: &Song) -> Ordering {
-    dmpicker_nav::order_key(&a.name).cmp(&dmpicker_nav::order_key(&b.name)).then_with(|| a.name.cmp(&b.name))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

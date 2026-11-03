@@ -49,7 +49,7 @@ pub fn taskbar_created() -> u32 {
 
 impl Tray {
     pub fn new(wndproc: WNDPROC) -> Result<Self> {
-        let hwnd = sys::create_popup(w!("DmPickerTray"), APP_NAME, WS_EX_TOOLWINDOW, wndproc)?;
+        let hwnd = sys::create_popup(w!("DmPickerTray"), WNDCLASS_STYLES::default(), APP_NAME, WS_EX_TOOLWINDOW, wndproc)?;
         let taskbar_created = taskbar_created();
         let tray = Self { hwnd, taskbar_created, icon: load_icon().unwrap_or_default() };
         tray.add();
