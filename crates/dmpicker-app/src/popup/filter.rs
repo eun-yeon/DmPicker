@@ -56,14 +56,19 @@ impl Popup {
         rows
     }
 
-    pub(super) fn random_candidates(&self, sheet: Sheet) -> Vec<Row> {
+    /// 기록 필터는 즐겨찾기 탭 후보만 여기서 거름, 조건 검색 결과는 찾을 때 이미 거름
+    fn random_allows(&self, sheet: Sheet) -> impl Fn(&Row) -> bool + '_ {
         let favorites = sheet == Sheet::History && self.history_tab == HistoryTab::Favorites;
-        picks(self.rows_of(sheet)).filter(|&row| !favorites || self.record_allows(row)).collect()
+        move |&row| !favorites || self.record_allows(row)
+    }
+
+    pub(super) fn random_candidates(&self, sheet: Sheet) -> Vec<Row> {
+        picks(self.rows_of(sheet)).filter(self.random_allows(sheet)).collect()
     }
 
     pub(super) fn random_scope(&self, sheet: Sheet) -> Vec<Row> {
-        let favorites = sheet == Sheet::History && self.history_tab == HistoryTab::Favorites;
-        self.rows_of(sheet).iter().copied().filter(|&row| row.song().is_none() || !favorites || self.record_allows(row)).collect()
+        let allows = self.random_allows(sheet);
+        self.rows_of(sheet).iter().copied().filter(|row| row.song().is_none() || allows(row)).collect()
     }
 
     pub(super) fn random_note(&self, sheet: Sheet) -> String {
@@ -87,7 +92,15 @@ impl Popup {
         let selected = rows.get(self.selected).copied();
         let scroll = self.scroll;
         if self.view == View::History && self.history_tab == HistoryTab::Presets {
+            let before = self.history.clone();
             self.fill_presets();
+            // 모드·난이도로 저장 줄이 생기거나 빠지면 판이 바뀐 것, 접히던 줄 모션은 줄 수가 안 맞아 버림
+            // 사라지던 삭제 버튼도 버림, 새 층에선 한 줄 밀린 자리에 그려져 옛 층 것과 두 개로 보임
+            if self.history != before {
+                self.list_swap.swap();
+                self.preset_change = None;
+                self.drop_preset_menu();
+            }
         }
         if self.playlist.is_none() && self.catalog.parse_filter(&self.result_query).is_some() {
             let query = self.result_query.clone();
@@ -180,7 +193,8 @@ impl Popup {
         self.nickname_edit = Some(SavedQuery {
             edit: std::mem::take(&mut self.edit),
             searched: std::mem::take(&mut self.searched),
-            row: self.results.get(self.selected).copied().map(|row| (row, self.scroll)),
+            // 결과 목록은 그대로 두고 입력 칸만 빌려서 되돌릴 줄이 없음
+            row: None,
         });
         self.clear_input();
         self.edit.insert(&self.records.nickname);

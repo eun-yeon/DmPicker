@@ -1302,7 +1302,7 @@ pub struct Popup {
     seg: [SegThumb; 6],     // 세그먼트 손잡이 [모드, 난이도, 히스토리 탭, 검색 제외 탭, 정렬, 플레이]
     sheet_swap: Crossfade,  // 시트 내용, 보기나 카드가 바뀌면 겹쳐 바꿈
     exclude_hl: Option<Spring>, // 검색 제외 줄 강조 위쪽 (목록 맨 위에서), 줄을 옮기면 다른 목록 선택 강조처럼 미끄러짐
-    list_swap: Crossfade,   // 히스토리·검색 제외 줄 목록, 탭이 바뀌면 겹쳐 바꿈 (탭은 제자리)
+    list_swap: Crossfade,   // 히스토리·검색 제외 줄 목록, 탭이 바뀌면 겹쳐 바꿈 (탭은 제자리), 필터 시트에선 기록 부분
     star: Option<StarMotion>, // 키워드 시트 별 버튼 모션, 시트를 닫으면 버림
     toggles: [ToggleMotion; 3], // 검색어 유지, DLC 표시, 유리 효과
     glass_fade: Tween, // 유리 효과가 보이는 정도, 설정에서 바꾸면 토글 색과 같이 바뀜
@@ -1646,9 +1646,9 @@ impl Popup {
         self.kept_row = None;
         self.rolls_after_swap(&rolls);
         self.jackets.clear();
-        // 히스토리·검색 제외 시트 뒤에 숨은 원래 검색도 돌아갈 때 새 목록으로 다시 찾음
-        if let Some(h) = &mut self.list_edit {
-            h.searched.clear();
+        // 히스토리·검색 제외 시트나 닉네임 입력 뒤에 숨은 원래 검색도 돌아갈 때 새 목록으로 다시 찾음
+        for saved in [&mut self.list_edit, &mut self.nickname_edit].into_iter().flatten() {
+            saved.searched.clear();
         }
         self.fill_history();
         self.searched.clear();
@@ -3356,6 +3356,11 @@ impl Popup {
         let from_filter = self.view == View::Filter;
         if from_filter && v != View::Filter {
             self.finish_filter_input();
+            // 시트 컨트롤 호버가 남으면 같은 컨트롤을 쓰는 결과 쪽 [필터 초기화]가 커서 없이 밝음
+            // 필터 버튼 호버는 남김, 버튼으로 닫는 동안 채움이 빠지면 안 됨
+            if matches!(self.hover, Hit::FilterControl(_)) {
+                self.hover = Hit::None;
+            }
         }
         if self.view == View::Exclude && v != View::Exclude {
             self.release_exclude();
@@ -3668,6 +3673,8 @@ impl Popup {
         }).collect();
         self.searched = query;
         self.exclude_focus = None;
+        // 옛 목록 줄 자리에서 미끄러져 오지 않게 새 줄에 바로 생김
+        self.exclude_hl = None;
         self.exclude_space = false;
         self.exclude_scroll_s.snap(0.0);
         self.wheel_acc = 0;
@@ -3926,8 +3933,11 @@ impl Popup {
     }
 
     /// 검색 제외 줄 강조를 고른 줄로 보냄, 없다가 생기면 그 자리에 바로
+    /// 위 줄이 접히는 동안엔 접힌 뒤 자리에서 기다림, 움직이는 줄을 쫓으면 아래로 내려갔다 돌아옴
     fn step_exclude_highlight(&mut self, dt: f32) {
-        let top = self.exclude_lit().filter(|_| self.view == View::Exclude).map(|i| self.exclude_row_top(i));
+        let row_h = self.px(self.exclude_tab.row_height());
+        let rest_top = |i: usize| (0..i).filter(|&j| self.exclude_rows[j].removal.is_none()).count() as f32 * row_h;
+        let top = self.exclude_lit().filter(|_| self.view == View::Exclude).map(rest_top);
         self.exclude_hl = top.map(|top| match self.exclude_hl {
             Some(mut s) => {
                 s.target = top;
@@ -5031,14 +5041,15 @@ impl Popup {
     }
 
     /// 정렬 화살표를 지금 방향으로 보냄
-    /// 닉네임을 넣거나 지우면 기록 줄 버튼 수와 기록 칸 흐림이 한꺼번에 바뀌어서 시트를 겹쳐 바꿈
+    /// 닉네임을 넣거나 지우면 기록 줄 버튼 수와 기록 칸 흐림이 한꺼번에 바뀌어서 기록 부분을 겹쳐 바꿈
+    /// 정렬이 레이트와 제목 사이로 바뀌어도 정렬 줄은 칸을 누를 때와 같은 손잡이·화살표 모션
     fn retarget_filter_motion(&mut self) {
         self.sort_arrow.go(self.sort_arrow_icon());
         let connected = self.records.connected();
         if connected != self.filter_connected {
             self.filter_connected = connected;
             if self.sheet == Sheet::Filter && self.sheet_geom().alpha >= 0.5 {
-                self.sheet_swap.swap();
+                self.list_swap.swap();
             }
         }
     }
@@ -5171,10 +5182,10 @@ impl Popup {
         match self.sheet {
             Sheet::Rolls => self.roll_empty_text(),
             Sheet::History if self.history_tab == HistoryTab::Presets => self.preset_empty_text(),
-            Sheet::History if !self.history_query.trim().is_empty() => Some(match self.history_tab {
-                HistoryTab::Favorites => "즐겨찾기에 맞는 곡이 없어요",
-                HistoryTab::Recent => "최근 기록에 맞는 곡이 없어요",
-                HistoryTab::Presets => return self.preset_empty_text(),
+            Sheet::History if !self.history_query.trim().is_empty() => Some(if self.history_tab == HistoryTab::Favorites {
+                "즐겨찾기에 맞는 곡이 없어요"
+            } else {
+                "최근 기록에 맞는 곡이 없어요"
             }),
             // 기록이나 즐겨찾기가 있는데 이 목록에 하나도 없을 때도 따로 알림
             Sheet::History if self.history_tab == HistoryTab::Favorites && self.library.favorites.is_empty() => {
@@ -5247,8 +5258,16 @@ impl Popup {
     /// 메시지를 처리했으면 Some(action)
     pub fn handle(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<(isize, Action)> {
         match msg {
-            WM_IME_STARTCOMPOSITION | WM_IME_COMPOSITION | WM_IME_ENDCOMPOSITION if self.view == View::Filter && self.nickname_edit.is_none() => Some((0, Action::None)),
+            WM_IME_STARTCOMPOSITION | WM_IME_COMPOSITION | WM_IME_ENDCOMPOSITION if self.view == View::Filter && self.nickname_edit.is_none() => {
+                // 삼키기만 하면 IME에 남은 조합이 시트를 나간 뒤 검색 칸에 붙음
+                if msg == WM_IME_STARTCOMPOSITION || (msg == WM_IME_COMPOSITION && lp.0 as u32 & GCS_COMPSTR.0 != 0) {
+                    self.notify_composition(CPS_CANCEL);
+                }
+                Some((0, Action::None))
+            }
             WM_IME_STARTCOMPOSITION => {
+                // 한글 자모 키는 IME가 가져가서 아래 키 처리에서 삭제 버튼을 못 닫음, 그대로 두면 Enter가 프리셋을 지움
+                self.close_preset_menu();
                 self.set_keyword_note(None);
                 // 선택이 있으면 먼저 지우고 그 자리에서 조합 (검색은 이어 오는 조합 메시지가 함)
                 self.edit.delete_selection();
@@ -5266,7 +5285,12 @@ impl Popup {
                         self.preedit.clear();
                     }
                     if flags & GCS_COMPSTR.0 != 0 {
-                        self.preedit = ime_string(himc, GCS_COMPSTR);
+                        let comp = ime_string(himc, GCS_COMPSTR);
+                        // 확정하며 비우는 건 두어야 F2 뒤 Enter가 조합을 확정하고 그 프리셋을 지움
+                        if !comp.is_empty() && comp != self.preedit {
+                            self.close_preset_menu();
+                        }
+                        self.preedit = comp;
                     } else if flags & GCS_RESULTSTR.0 == 0 {
                         self.preedit.clear();
                     }
@@ -6228,8 +6252,10 @@ impl Popup {
     }
 
     /// 필터 시트 (다 편 시트 자리), `l0`·`r0`은 패널 안쪽 16 정렬선
-    /// 닉네임이 없으면 기록 칸 (정렬의 레이트, 레이트, 플레이)이 흐리고 안 눌림, 넣거나 지우면 시트를 겹쳐 바꿈 (`filter_connected`)
-    fn draw_filter(&self, (l0, r0): (f32, f32), now: Instant) -> Result<()> {
+    /// 닉네임이 없으면 기록 칸 (정렬의 레이트, 레이트, 플레이)이 흐리고 안 눌림
+    /// `records`면 기록 줄부터 아래만, 아니면 머리와 정렬 줄만
+    /// 닉네임을 넣거나 지우면 기록 부분만 따로 겹쳐 바꿈 (`filter_connected`), 정렬 줄까지 섞으면 손잡이가 옮겨 간 칸 글이 두 겹으로 보임
+    fn draw_filter(&self, (l0, r0): (f32, f32), now: Instant, records: bool) -> Result<()> {
         use record_filter::{Bound, Control, Play, Sort};
         let (g, f) = (self.gfx.as_ref().unwrap(), self.fonts.as_ref().unwrap());
         let dc = &g.dc;
@@ -6265,21 +6291,23 @@ impl Popup {
             }
         };
         unsafe {
-            label(rows[Control::Reset.row()].label, &f.title, fl.title, r0, &text_b)?;
-            if enabled(Control::Reset) {
-                draw_button(g, &f.item, fl.reset, "초기화", lit(Control::Reset), s)?;
-            } else {
-                draw_button_off(g, &f.item, fl.reset, "초기화", s)?;
-            }
+            if !records {
+                label(rows[Control::Reset.row()].label, &f.title, fl.title, r0, &text_b)?;
+                if enabled(Control::Reset) {
+                    draw_button(g, &f.item, fl.reset, "초기화", lit(Control::Reset), s)?;
+                } else {
+                    draw_button_off(g, &f.item, fl.reset, "초기화", s)?;
+                }
 
-            label(sort_row.label, &f.sub, fl.sort_label, r0, &g.brush(row_label(sort_control))?)?;
-            let sort = Segments {
-                cells: sort_row.choices.iter().map(|c| (c.text.as_str(), if c.control == Control::Sort(Sort::Rate) { on } else { 1.0 })).collect(),
-                thumb: self.seg[SEG_SORT].ends(),
-                thumb_a: 1.0,
-                arrow: Some(self.sort_arrow.parts().map(|(icon, k, a, _)| (icon, k, a)).collect()),
-            };
-            draw_segment_set(g, f, fl.sort, &sort, lay::SEG_R, s)?;
+                label(sort_row.label, &f.sub, fl.sort_label, r0, &g.brush(row_label(sort_control))?)?;
+                let sort = Segments {
+                    cells: sort_row.choices.iter().map(|c| (c.text.as_str(), if c.control == Control::Sort(Sort::Rate) { on } else { 1.0 })).collect(),
+                    thumb: self.seg[SEG_SORT].ends(),
+                    thumb_a: 1.0,
+                    arrow: Some(self.sort_arrow.parts().map(|(icon, k, a, _)| (icon, k, a)).collect()),
+                };
+                return draw_segment_set(g, f, fl.sort, &sort, lay::SEG_R, s);
+            }
 
             // 기록 줄: 설정의 내 곡 목록 줄과 같은 두 줄 묶음, 닉네임을 고치는 동안 닉네임 버튼은 눌린 채
             label(archive_row.label, &f.item_bold, fl.archive_title, r0, &text_b)?;
@@ -6863,11 +6891,15 @@ impl Popup {
                 Ok(())
             };
             // 시트 내용 (다 편 시트 자리), 히스토리·검색 제외는 제자리 탭 아래에 겹쳐 바꾸는 줄 목록 `list`
+            // 필터는 제자리 정렬 줄 아래에 겹쳐 바꾸는 기록 부분 `list`
             let draw_sheet = |list: Option<&ID2D1Image>| -> Result<()> {
                 if self.sheet == Sheet::Settings {
                     self.draw_settings((l0, r0))?;
                 } else if self.sheet == Sheet::Filter {
-                    self.draw_filter((l0, r0), now)?;
+                    self.draw_filter((l0, r0), now, false)?;
+                    if let Some(list) = list {
+                        dc.DrawImage(list, None, None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
+                    }
                 } else if self.sheet == Sheet::Exclude {
                     self.draw_exclude_head()?;
                     if let Some(list) = list {
@@ -6906,11 +6938,12 @@ impl Popup {
             };
 
             // 3) 패널 내용 기록: 바꾸는 중이면 옛 그림과 섞어서 7)에서 그리고, 다음 프레임에 보기·카드·탭이 바뀌면 이게 옛 그림이 됨 (`Crossfade`)
-            // 히스토리·검색 제외 줄 목록은 탭만 바뀔 때 혼자 섞으려고 먼저 따로 기록
+            // 히스토리·검색 제외 줄 목록은 탭만 바뀔 때, 필터 기록 부분은 닉네임을 넣거나 지울 때 혼자 섞으려고 먼저 따로 기록
             if has_panel {
                 let list = match self.sheet {
                     Sheet::History => Some(self.list_swap.compose(g, record(dc, draw_list)?)?),
                     Sheet::Exclude => Some(self.list_swap.compose(g, record(dc, || self.draw_exclude_list(&exclude_shown))?)?),
+                    Sheet::Filter => Some(self.list_swap.compose(g, record(dc, || self.draw_filter((l0, r0), now, true))?)?),
                     _ => None,
                 };
                 // 줄인 설정 시트는 보이는 칸만 기록, 더 긴 시트로 바뀌며 판이 커질 때 가려졌던 줄이 드러나지 않게

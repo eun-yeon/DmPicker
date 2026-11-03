@@ -1,6 +1,6 @@
 //! V-Archive 기록 사본과 수동 갱신
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,7 +10,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use dmpicker_search::{Diff, Mode};
 use serde_json::{json, Value};
-use windows::Win32::Foundation::{FILETIME, HWND};
+use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::WM_APP;
 
 pub const READY: u32 = WM_APP + 6;
@@ -44,16 +44,14 @@ pub struct Snapshot {
     pub records: BTreeMap<(u32, Diff), Record>,
 }
 
-fn records(values: &[Value], known: impl Fn(u32) -> bool) -> Option<BTreeMap<(u32, Diff), Record>> {
+/// 앱 곡 목록에 아직 없는 곡도 남김, 거르면 곡 데이터를 받기 전이나 새 DLC 곡 기록이 빠져 기록 없음으로 걸림
+fn records(values: &[Value]) -> Option<BTreeMap<(u32, Diff), Record>> {
     let mut records = BTreeMap::new();
     for value in values {
         let title = u32::try_from(value["title"].as_u64()?).ok()?;
         let Some(diff) = value["pattern"].as_str().and_then(Diff::from_label) else {
             continue;
         };
-        if !known(title) {
-            continue;
-        }
         let score = value["score"].as_f64().filter(|s| valid_rate(*s))?;
         let record = Record {
             score,
@@ -65,7 +63,7 @@ fn records(values: &[Value], known: impl Fn(u32) -> bool) -> Option<BTreeMap<(u3
     Some(records)
 }
 
-pub fn parse(raw: &[u8], mode: Mode, known: &HashSet<u32>, received_at: u64) -> Option<Snapshot> {
+pub fn parse(raw: &[u8], mode: Mode, received_at: u64) -> Option<Snapshot> {
     let value: Value = serde_json::from_slice(raw).ok()?;
     if !value["success"].as_bool()? || value["button"].as_u64()? != button(mode) as u64 {
         return None;
@@ -74,7 +72,7 @@ pub fn parse(raw: &[u8], mode: Mode, known: &HashSet<u32>, received_at: u64) -> 
     if value["count"].as_u64()? != values.len() as u64 {
         return None;
     }
-    Some(Snapshot { received_at, records: records(values, |id| known.contains(&id))? })
+    Some(Snapshot { received_at, records: records(values)? })
 }
 
 pub fn button(mode: Mode) -> u8 {
@@ -112,25 +110,19 @@ pub struct Cache {
     pub loading_at: Instant,
     failed: [bool; 4],
     generation: u64,
-    writable: bool,
 }
 
 impl Default for Cache {
     fn default() -> Self {
-        Self { nickname: String::new(), modes: Default::default(), loading: false, loading_at: Instant::now(), failed: [false; 4], generation: 0, writable: true }
+        Self { nickname: String::new(), modes: Default::default(), loading: false, loading_at: Instant::now(), failed: [false; 4], generation: 0 }
     }
 }
 
 impl Cache {
+    /// 다시 받으면 되는 사본이라 못 읽으면 빈 사본으로 시작하고 다음 저장에서 덮어씀
+    /// 막아 두면 옛 버전 파일이나 깨진 파일을 지우기 전까지 매번 저장 못 함
     pub fn load(path: &Path, nickname: &str) -> Self {
-        let parsed = match std::fs::read(path) {
-            Ok(raw) => Self::from_bytes(&raw),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(Self::default()),
-            Err(_) => None,
-        };
-        let writable = parsed.is_some();
-        let mut cache = parsed.unwrap_or_default();
-        cache.writable = writable;
+        let mut cache = std::fs::read(path).ok().and_then(|raw| Self::from_bytes(&raw)).unwrap_or_default();
         cache.set_nickname(nickname);
         cache
     }
@@ -146,7 +138,7 @@ impl Cache {
             if let Some(v) = modes.get(mode.label()) {
                 cache.modes[mode.index()] = Some(Snapshot {
                     received_at: v["received_at"].as_u64()?,
-                    records: records(v["records"].as_array()?, |_| true)?,
+                    records: records(v["records"].as_array()?)?,
                 });
             }
         }
@@ -168,10 +160,6 @@ impl Cache {
     }
 
     pub fn save(&self, path: &Path) -> Result<(), &'static str> {
-        // 읽지 못한 사본은 이번 실행 동안 덮어쓰지 않음
-        if !self.writable {
-            return Err("기록 파일을 읽지 못해서 저장할 수 없어요");
-        }
         crate::sys::save_file(path, self.json().to_string().as_bytes()).map_err(|_| "기록을 저장하지 못했어요")
     }
 
@@ -225,20 +213,24 @@ impl Cache {
         }
         let snapshot = self.modes[mode.index()].as_ref();
         if self.failed[mode.index()] {
-            return snapshot.map_or_else(|| "기록을 불러오지 못했어요".into(), |s| format!("갱신 실패 · {} 기록 사용 중", local_clock(s.received_at)));
+            return snapshot.map_or_else(|| "기록을 불러오지 못했어요".into(), |s| format!("갱신 실패 · {} 기록 사용 중", ago(s.received_at, now)));
         }
         let Some(snapshot) = snapshot else {
             return "새로고침으로 기록을 불러와 주세요".into();
         };
-        let elapsed = now.saturating_sub(snapshot.received_at);
-        let ago = match elapsed {
-            0..60 => "방금 전".into(),
-            60..3600 => format!("{}분 전", elapsed / 60),
-            3600..86400 => format!("{}시간 전", elapsed / 3600),
-            _ => format!("{}일 전", elapsed / 86400),
-        };
         // 닉네임은 옆 버튼에 있어서 안 붙임
-        format!("{} 기록 {}개 · {ago}", mode.label(), grouped(snapshot.records.len()))
+        format!("{} 기록 {}개 · {}", mode.label(), grouped(snapshot.records.len()), ago(snapshot.received_at, now))
+    }
+}
+
+/// 시각만 쓰면 며칠 전 사본도 오늘 기록처럼 읽힘
+fn ago(received_at: u64, now: u64) -> String {
+    let elapsed = now.saturating_sub(received_at);
+    match elapsed {
+        0..60 => "방금 전".into(),
+        60..3600 => format!("{}분 전", elapsed / 60),
+        3600..86400 => format!("{}시간 전", elapsed / 3600),
+        _ => format!("{}일 전", elapsed / 86400),
     }
 }
 
@@ -254,17 +246,6 @@ fn grouped(n: usize) -> String {
     text
 }
 
-fn local_clock(seconds: u64) -> String {
-    let Some(ticks) = seconds.checked_add(11_644_473_600).and_then(|s| s.checked_mul(10_000_000)) else {
-        return "--:--".into();
-    };
-    let stamp = FILETIME { dwLowDateTime: ticks as u32, dwHighDateTime: (ticks >> 32) as u32 };
-    let Some(local) = crate::sys::local_time(&stamp) else {
-        return "--:--".into();
-    };
-    format!("{:02}:{:02}", local.wHour, local.wMinute)
-}
-
 pub struct Reply {
     generation: u64,
     nickname: String,
@@ -274,7 +255,6 @@ pub struct Reply {
 struct Job {
     generation: u64,
     nickname: String,
-    known: HashSet<u32>,
     hwnd: isize,
 }
 
@@ -293,7 +273,7 @@ impl Default for Loader {
 }
 
 impl Loader {
-    pub fn request(&mut self, cache: &mut Cache, known: HashSet<u32>, hwnd: HWND) {
+    pub fn request(&mut self, cache: &mut Cache, hwnd: HWND) {
         if cache.loading {
             return;
         }
@@ -306,7 +286,7 @@ impl Loader {
         }
         cache.loading = true;
         cache.loading_at = Instant::now();
-        let job = Job { generation: cache.generation, nickname: cache.nickname.clone(), known, hwnd: hwnd.0 as isize };
+        let job = Job { generation: cache.generation, nickname: cache.nickname.clone(), hwnd: hwnd.0 as isize };
         if self.active.is_some() {
             self.queued = Some(job);
         } else {
@@ -345,7 +325,7 @@ impl Loader {
 fn receive(job: Job, mut get: impl FnMut(&str) -> Option<Vec<u8>>) -> Reply {
     let modes = Mode::ALL.map(|mode| {
         let raw = get(&url(&job.nickname, mode))?;
-        parse(&raw, mode, &job.known, now())
+        parse(&raw, mode, now())
     });
     Reply { generation: job.generation, nickname: job.nickname, modes }
 }

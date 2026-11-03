@@ -177,7 +177,7 @@ impl Popup {
     }
 
     /// 삭제 버튼을 바로 없앰, 줄이 지워지거나 안 보이게 될 때
-    fn drop_preset_menu(&mut self) {
+    pub(super) fn drop_preset_menu(&mut self) {
         self.preset_menu = None;
         self.preset_menu_drawn = None;
         self.preset_menu_a = Tween::new(0.0);

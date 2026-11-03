@@ -88,6 +88,10 @@ struct App {
     open_kind: Option<ScreenKind>,
     playlists: playlist::Loader,
     records: varchive::Loader,
+    /// 못 읽은 설정 파일을 기본값으로 덮어쓰면 프리셋·검색 제외 목록을 잃어서 이번 실행 동안 저장 안 함
+    settings_unreadable: bool,
+    /// 레이트 휠 한 칸마다 저장을 시도해서 막았다는 알림은 한 번만
+    settings_noted: bool,
 }
 
 /// 단축키 뒤 화면 확인 결과: 선곡 목록이 보였으면 Some(그 화면, 그 목록에서 고를 수 있는 곡, 첫 인식 전엔 None)
@@ -237,10 +241,15 @@ fn settings_path() -> PathBuf {
     store_dir().join("settings.json")
 }
 
-fn load_settings(p: &mut Popup) {
-    let Ok(raw) = std::fs::read(settings_path()) else { return };
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&raw) else { return };
+/// 없는 파일은 처음 켠 것, 못 읽은 파일은 false (덮어쓰면 프리셋·검색 제외 목록을 잃음)
+fn load_settings(p: &mut Popup, path: &std::path::Path) -> bool {
+    let raw = match std::fs::read(path) {
+        Ok(raw) => raw,
+        Err(e) => return e.kind() == std::io::ErrorKind::NotFound,
+    };
+    let Some(v) = serde_json::from_slice::<serde_json::Value>(&raw).ok().filter(serde_json::Value::is_object) else { return false };
     apply_settings(p, &v);
+    true
 }
 
 /// 설정 파일 내용을 검색창에 넣음, 없거나 못 읽는 값은 그대로 (1.0.0 파일엔 keep_query·show_dlc가 없음)
@@ -288,6 +297,13 @@ fn settings_json(p: &Popup) -> serde_json::Value {
 /// 저장하지 못하면 알림 (다시 켜면 예전 값으로 돌아감)
 fn save_settings(a: &mut App) -> bool {
     a.popup.take_filter_changed();
+    if a.settings_unreadable {
+        // 휠 한 칸마다 저장하러 와서 알림은 처음 한 번만
+        if !std::mem::replace(&mut a.settings_noted, true) {
+            a.toast.show("설정 파일을 읽지 못해서 저장할 수 없어요", Badge::None, Some(3.0));
+        }
+        return false;
+    }
     let ok = sys::save_file(&settings_path(), settings_json(&a.popup).to_string().as_bytes()).is_ok();
     if !ok {
         a.toast.show("설정을 저장하지 못했어요", Badge::None, Some(3.0));
@@ -452,7 +468,7 @@ fn save_records(a: &mut App) {
 }
 
 fn request_records(a: &mut App) {
-    a.records.request(&mut a.popup.records, a.titles.keys().copied().collect(), a.popup.hwnd);
+    a.records.request(&mut a.popup.records, a.popup.hwnd);
 }
 
 /// 검색창이 플레이리스트 주소를 검색했으면 작업 스레드로 받아 오기 시작
@@ -851,11 +867,13 @@ fn main() -> Result<()> {
             open_kind: None,
             playlists: playlist::Loader::default(),
             records: varchive::Loader::default(),
+            settings_unreadable: false,
+            settings_noted: false,
         })));
         {
             let mut guard = app.borrow_mut();
             let a = &mut *guard;
-            load_settings(&mut a.popup);
+            a.settings_unreadable = !load_settings(&mut a.popup, &settings_path());
             a.popup.records = varchive::Cache::load(&a.store.join("varchive.json"), &a.popup.records.nickname);
             a.toast.set_glass(a.popup.glass);
             a.popup.load_history(store_dir());

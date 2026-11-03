@@ -160,7 +160,9 @@ impl Options {
             let next = if delta > 0 {
                 RATE_STEPS.into_iter().find(|s| value.is_none_or(|v| *s > v)).unwrap_or(100.0)
             } else {
-                RATE_STEPS.into_iter().rev().find(|s| value.is_none_or(|v| *s < v)).unwrap_or(90.0)
+                // 가장 낮은 단계보다 낮은 값은 내릴 단계가 없어서 그대로
+                let Some(next) = RATE_STEPS.into_iter().rev().find(|s| value.is_none_or(|v| *s < v)) else { break };
+                next
             };
             self.set_bound(bound, Some(next));
         }
