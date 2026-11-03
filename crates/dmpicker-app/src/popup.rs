@@ -3571,6 +3571,10 @@ impl Popup {
         self.view == View::Exclude && self.exclude_focus.is_some()
     }
 
+    fn space_presses_setting(&self) -> bool {
+        self.view == View::Settings && self.kb_focus.is_some()
+    }
+
     /// 처리하지 않은 편집 키는 입력 칸의 공통 처리로 넘김
     fn exclude_key(&mut self, vk: VIRTUAL_KEY, repeat: bool) -> Option<Action> {
         if self.view != View::Exclude {
@@ -5374,7 +5378,7 @@ impl Popup {
                     let real = unsafe { ImmGetVirtualKey(self.hwnd) };
                     vk = VIRTUAL_KEY(real as u16);
                     if matches!(vk, VK_RETURN | VK_UP | VK_DOWN | VK_LEFT | VK_RIGHT | VK_HOME | VK_END | VK_DELETE | VK_ESCAPE | VK_PRIOR | VK_NEXT | VK_TAB)
-                        || (vk == VK_SPACE && (self.space_toggles_row() || (self.view == View::Exclude && self.exclude_space))) {
+                        || (vk == VK_SPACE && (self.space_toggles_row() || self.space_presses_setting() || (self.view == View::Exclude && self.exclude_space))) {
                         // 한국어 Windows 관례: Enter·화살표는 글자를 확정하고 동작도 함
                         self.complete_composition();
                     } else {
@@ -5385,8 +5389,8 @@ impl Popup {
                 // F10은 Alt 없이도 WM_SYSKEYDOWN으로 와서 메시지 종류 대신 Alt 눌림 비트(29)를 봄
                 let alt = lp.0 & (1 << 29) != 0 || unsafe { GetKeyState(VK_MENU.0 as i32) } < 0;
                 let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
-                // F2·메뉴 키를 누르고 있으면 반복 입력이 삭제 버튼을 열고 닫기를 되풀이해서 깜빡임
-                if lp.0 & (1 << 30) != 0 && matches!(vk, VK_F2 | VK_APPS | VK_F10) && self.view == View::History && self.history_tab == HistoryTab::Presets {
+                // F2·메뉴 키를 누르고 있으면 반복 입력이 시트나 삭제 버튼을 열고 닫기를 되풀이해서 깜빡임
+                if lp.0 & (1 << 30) != 0 && matches!(vk, VK_F2 | VK_APPS | VK_F10) {
                     return Some((0, Action::None));
                 }
                 // 삭제 버튼을 띄운 동안 Enter·Delete는 지움, Esc·F2·메뉴 키는 닫기만, 다른 키는 닫고 평소대로
@@ -5449,6 +5453,19 @@ impl Popup {
                 }
                 if let Some(action) = self.exclude_key(vk, lp.0 & (1 << 30) != 0) {
                     return Some((0, action));
+                }
+                // 뒤따르는 공백 글자를 안 버리면 검색어로 들어가 설정이 닫히거나 새로 연 시트 입력 칸에 들어감
+                if vk == VK_SPACE && self.space_presses_setting() {
+                    unsafe {
+                        let _ = PeekMessageW(&mut MSG::default(), Some(self.hwnd), WM_CHAR, WM_CHAR, PM_REMOVE);
+                    }
+                    if lp.0 & (1 << 30) != 0 {
+                        return Some((0, Action::None));
+                    }
+                    let act = self.settings_key(VK_RETURN);
+                    // 검색 제외를 열었으면 누르고 있는 Space의 반복과 공백 글자는 뗄 때까지 그 시트가 버림
+                    self.exclude_space = self.view == View::Exclude;
+                    return Some((0, act));
                 }
                 let act = if self.view == View::Settings { self.settings_key(vk) } else { self.list_key(vk, ctrl, shift) };
                 Some((0, act))
@@ -5841,8 +5858,9 @@ impl Popup {
                     self.filter_keyed = false;
                 }
                 // 조합 중인 글자는 확정하고, Shift를 누른 채면 선택을 넓힘
-                // 고른 줄은 풂, 커서를 안 움직이고 누르면 이동 메시지로는 안 풀려서 Space가 줄을 토글함
+                // 고른 줄·설정 컨트롤은 풂, 커서를 안 움직이고 누르면 이동 메시지로는 안 풀려서 Space가 줄을 토글하거나 컨트롤을 누름
                 self.exclude_focus = None;
+                self.kb_focus = None;
                 self.complete_composition();
                 let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
                 self.edit.move_to(self.text_index(x), shift);

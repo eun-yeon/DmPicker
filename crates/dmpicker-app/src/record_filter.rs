@@ -8,8 +8,6 @@ use serde_json::{json, Value};
 use crate::edit::Editor;
 use crate::varchive::{valid_rate, Cache};
 
-const RATE_STEPS: [f64; 9] = [90.0, 95.0, 97.0, 98.0, 99.0, 99.5, 99.8, 99.9, 100.0];
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Sort {
     #[default]
@@ -90,7 +88,7 @@ impl Options {
             upper: value["upper"].as_f64().filter(|s| valid_rate(*s)),
             play: Play::ALL.into_iter().find(|s| value["play"].as_str() == Some(s.key())).unwrap_or_default(),
         };
-        options.normalize();
+        options.normalize(Bound::Lower);
         options
     }
 
@@ -149,30 +147,29 @@ impl Options {
             Bound::Lower => self.lower = value,
             Bound::Upper => self.upper = value,
         }
-        self.normalize();
+        self.normalize(bound);
         before != *self
     }
 
     pub fn step_rate(&mut self, bound: Bound, delta: i32) -> bool {
-        let before = *self;
-        for _ in 0..delta.unsigned_abs().min(RATE_STEPS.len() as u32) {
-            let value = self.bound(bound);
-            let next = if delta > 0 {
-                RATE_STEPS.into_iter().find(|s| value.is_none_or(|v| *s > v)).unwrap_or(100.0)
-            } else {
-                // 가장 낮은 단계보다 낮은 값은 내릴 단계가 없어서 그대로
-                let Some(next) = RATE_STEPS.into_iter().rev().find(|s| value.is_none_or(|v| *s < v)) else { break };
-                next
-            };
-            self.set_bound(bound, Some(next));
-        }
-        before != *self
+        // 빈 칸은 제한 없음과 같은 끝값에서 시작
+        let from = self.bound(bound).unwrap_or(match bound {
+            Bound::Lower => 0.0,
+            Bound::Upper => 100.0,
+        });
+        // 칠 수 있는 자리인 소수 둘째 자리에서 반올림, 안 하면 32.3 - 1이 31.299999999999997로 보임
+        let next = (((from + delta as f64) * 100.0).round() / 100.0).clamp(0.0, 100.0);
+        next != from && self.set_bound(bound, Some(next))
     }
 
-    fn normalize(&mut self) {
+    /// 범위가 뒤집히면 `kept` 쪽 값으로 반대쪽을 맞춤
+    fn normalize(&mut self, kept: Bound) {
         if let (Some(lower), Some(upper)) = (self.lower, self.upper) {
             if lower > upper {
-                self.upper = Some(lower);
+                match kept {
+                    Bound::Lower => self.upper = Some(lower),
+                    Bound::Upper => self.lower = Some(upper),
+                }
             }
         }
     }
@@ -308,7 +305,7 @@ impl FilterInput {
             SheetRow { label: "정렬", choices: Sort::ALL.map(|s| choice(Control::Sort(s), s.label().into(), s == sort)).into() },
             SheetRow { label: "V-Archive 기록", choices: archive },
             SheetRow { label: "레이트", choices: [Bound::Lower, Bound::Upper].map(|b| choice(Control::Rate(b), self.rate_text(b, options), false)).into() },
-            SheetRow { label: "플레이", choices: Play::ALL.map(|p| choice(Control::Play(p), p.label().into(), p == options.play)).into() },
+            SheetRow { label: "기록 상태", choices: Play::ALL.map(|p| choice(Control::Play(p), p.label().into(), p == options.play)).into() },
         ]
     }
 
