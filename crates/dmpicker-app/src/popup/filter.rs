@@ -96,7 +96,7 @@ impl Popup {
             // 모드·난이도로 저장 줄이 생기거나 빠지면 판이 바뀐 것, 접히던 줄 모션은 줄 수가 안 맞아 버림
             if self.history != before {
                 self.list_swap.swap();
-                self.preset_change = None;
+                self.preset_slots.clear();
             }
         }
         if self.playlist.is_none() && self.catalog.parse_filter(&self.result_query).is_some() {

@@ -7,20 +7,6 @@ const SAVE_LABEL: &str = "지금 검색 저장";
 const NO_PRESETS: &str = "저장한 프리셋이 없어요";
 pub(super) const DELETE_LABEL: &str = "삭제";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum ChangeKind {
-    Inserted,
-    Removed,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub(super) struct PresetChange {
-    pub kind: ChangeKind,
-    /// 저장 줄을 포함한 변경 전 지운 줄, 저장 줄 자리에 새로 저장하면 None
-    pub row: Option<usize>,
-    pub preset: Preset,
-}
-
 /// 프리셋 시트 상태와 닫으면 돌아갈 입력·스크롤
 pub(super) struct PresetEdit {
     /// `presets` 자리, 시트가 열린 동안엔 프리셋을 넣거나 지우지 않아서 그대로
@@ -99,6 +85,7 @@ impl Popup {
     }
 
     /// 지금 검색을 목록 맨 위에 저장, 맨 위에 있던 저장 줄 자리가 그대로 새 프리셋 줄이 됨
+    /// 줄 자리는 그대로 두고 글만 겹쳐 바꿈
     pub(super) fn save_preset(&mut self) -> Action {
         if self.view != View::History || self.history_tab != HistoryTab::Presets || self.typed() {
             return Action::None;
@@ -106,34 +93,34 @@ impl Popup {
         let Some(preset) = self.current_preset().filter(|p| !self.presets.contains(p)) else {
             return Action::None;
         };
-        self.change_preset(PresetChange { kind: ChangeKind::Inserted, row: None, preset })
-    }
-
-    fn delete_preset_row(&mut self, row: usize) -> Action {
-        if self.view != View::History || self.history_tab != HistoryTab::Presets {
-            return Action::None;
-        }
-        let Some(Row::Preset(index)) = self.history.get(row).copied() else {
-            return Action::None;
-        };
-        self.selected = row;
-        let change = PresetChange {
-            kind: ChangeKind::Removed,
-            row: Some(row),
-            preset: self.presets[index].clone(),
-        };
-        self.change_preset(change)
+        self.presets.insert(0, preset);
+        let before = self.history.clone();
+        let (scroll, scroll_s, sel_y) = (self.scroll, self.scroll_s, self.sel_y);
+        self.fill_presets();
+        // 강조는 그 자리 새 프리셋 줄에 그대로
+        self.selected = 0;
+        self.scroll = scroll;
+        // 다시 채우며 맨 위로 맞춘 스크롤·강조를 되돌림, 지금 자리에서 새 줄로 미끄러짐
+        (self.scroll_s, self.sel_y) = (scroll_s, sel_y);
+        self.fit_scroll();
+        self.retarget_selection(false);
+        // 다시 채운 목록에 옛 줄 번호 호버가 남지 않게, 마우스를 움직이면 다시 정함
+        self.hover = Hit::Inside;
+        self.start_preset_motion(&before);
+        self.list_swap.swap();
+        self.retarget_panel();
+        Action::Choice
     }
 
     /// 프리셋 `index`의 시트를 엶, 열기 전 입력 (찾던 글)은 보관하고 입력 칸엔 지금 이름
-    /// 접히거나 펼쳐지던 줄 모션은 버림, 닫으면 목록을 다시 채움
+    /// 접히던 줄 모션은 버림, 닫으면 목록을 다시 채움
     pub(super) fn open_preset_sheet(&mut self, index: usize) {
         let Some(name) = self.presets.get(index).map(|p| p.name.clone().unwrap_or_default()) else { return };
         self.finish_input();
         self.preset_edit = Some(PresetEdit { index, edit: std::mem::take(&mut self.edit), scroll: self.scroll });
         self.clear_input();
         self.edit.insert(&name);
-        self.preset_change = None;
+        self.preset_slots.clear();
         self.view = View::Preset;
         self.hover = Hit::None;
         self.retarget_panel();
@@ -183,21 +170,31 @@ impl Popup {
         if changed { Action::Choice } else { Action::None }
     }
 
-    /// 삭제: 시트를 닫고 목록에서 그 줄을 지움, 다음 줄을 고름
+    /// 삭제: 시트를 닫고 목록에서 그 줄을 지움, 다음 줄 (없으면 이전 줄)을 고름
+    /// 보던 건 시트라 목록은 지운 뒤 모습으로 판 전체와 한 번만 겹쳐 바꿈
+    /// 지운 줄이 새 목록에 다시 보였다 접히고 강조·스크롤까지 미끄러지면 섞는 동안 움직임이 겹침
     pub(super) fn delete_sheet_preset(&mut self) -> Action {
         let Some(index) = self.preset_edit.as_ref().map(|p| p.index) else { return Action::None };
         self.close_preset_sheet();
         let Some(row) = self.history.iter().position(|r| *r == Row::Preset(index)) else { return Action::None };
-        let action = self.delete_preset_row(row);
-        // 보던 건 시트라 목록은 지운 뒤 모습으로 판 전체와 한 번만 겹쳐 바꿈
-        // 지운 줄이 새 목록에 다시 보였다 접히고 강조·스크롤까지 미끄러지면 섞는 동안 움직임이 겹침
-        self.preset_change = None;
-        self.preset_slots.clear();
-        self.list_swap.reset();
+        let had_save = self.history.first() == Some(&Row::PresetSave);
+        let scroll = self.scroll;
+        // 이름만 다른 같은 검색이 있었어도 같이 지움
+        let preset = self.presets[index].clone();
+        self.presets.retain(|p| *p != preset);
+        self.fill_presets();
+        // 맨 위 지금 검색 프리셋을 지우면 그 자리에 저장 줄이, 아래쪽 것을 지우면 맨 위에 생겨 한 줄씩 밀림
+        let row = row + usize::from(row > 0 && !had_save && self.history.first() == Some(&Row::PresetSave));
+        self.selected = (row..self.history.len()).find(|&i| self.history[i].selectable())
+            .or_else(|| (0..row.min(self.history.len())).rev().find(|&i| self.history[i].selectable())).unwrap_or(0);
+        self.scroll = scroll;
+        self.fit_scroll();
         self.scroll_s.snap(self.scroll as f32 * self.px(lay::ROW_H));
         self.retarget_selection(true);
+        // 다시 채운 목록에 옛 줄 번호 호버가 남지 않게, 마우스를 움직이면 다시 정함
+        self.hover = Hit::Inside;
         self.retarget_panel();
-        action
+        Action::Choice
     }
 
     /// 프리셋 시트의 키, Enter는 이름 저장, Esc·F2는 저장하지 않고 닫음
@@ -214,44 +211,6 @@ impl Popup {
             return None;
         }
         Some(Action::None)
-    }
-
-    fn change_preset(&mut self, change: PresetChange) -> Action {
-        match change.kind {
-            ChangeKind::Inserted => self.presets.insert(0, change.preset.clone()),
-            // 저장 줄이 없을 때도 있어서 줄 번호 대신 같은 프리셋을 찾아 지움 (중복 저장은 안 됨)
-            ChangeKind::Removed => self.presets.retain(|p| *p != change.preset),
-        }
-        let before = self.history.clone();
-        let (scroll, scroll_s, sel_y) = (self.scroll, self.scroll_s, self.sel_y);
-        self.fill_presets();
-        // 맨 위 줄이 저장 줄과 서로 바뀌거나 (저장, 맨 위 지금 검색 프리셋 지우기) 찾던 마지막 줄이 안내 문구가 되면 줄 자리는 그대로 두고 글만 겹쳐 바꿈
-        // 접고 펼치면 지운 줄이 새 저장 줄에 밀려 내려가며 접혀 보임
-        let in_place = change.kind == ChangeKind::Inserted
-            || (change.row == Some(0) && self.history.first() == Some(&Row::PresetSave))
-            || self.history.is_empty();
-        // 아래쪽 지금 검색 프리셋을 지우면 맨 위에 저장 줄이 생겨 한 줄씩 밀림
-        let pushed = !in_place && self.history.first() == Some(&Row::PresetSave) && before.first() != Some(&Row::PresetSave);
-        // 저장 줄을 눌렀으면 강조는 그 자리 새 프리셋 줄에 그대로, 지웠으면 다음 줄 (없으면 이전 줄)
-        self.selected = change.row.map_or(0, |row| {
-            let row = row + pushed as usize;
-            (row..self.history.len()).find(|&i| self.history[i].selectable())
-                .or_else(|| (0..row.min(self.history.len())).rev().find(|&i| self.history[i].selectable())).unwrap_or(0)
-        });
-        self.scroll = scroll;
-        // 다시 채우며 맨 위로 맞춘 스크롤·강조를 되돌림, 지금 자리에서 새 줄로 미끄러짐
-        (self.scroll_s, self.sel_y) = (scroll_s, sel_y);
-        self.fit_scroll();
-        self.retarget_selection(false);
-        // 다시 채운 목록에 옛 줄 번호 호버가 남지 않게, 마우스를 움직이면 다시 정함
-        self.hover = Hit::Inside;
-        self.start_preset_motion(&before, &change, in_place);
-        if in_place {
-            self.list_swap.swap();
-        }
-        self.preset_change = Some(change);
-        self.retarget_panel();
-        Action::Choice
     }
 
     pub(super) fn apply_preset(&mut self, index: usize) -> Action {
@@ -272,7 +231,7 @@ impl Popup {
         }
         self.view = View::Results;
         self.kb_focus = None;
-        self.preset_change = None;
+        self.preset_slots.clear();
         if !self.in_zone && self.leave_since.is_none() {
             self.leave_since = Some(Instant::now());
         }
@@ -283,100 +242,59 @@ impl Popup {
     }
 }
 
-/// 넣고 지우는 동안의 줄 자리, `Row`는 `history` 줄을 차례로 가리킴
-/// 지운 줄은 접힐 때까지 그 자리에 `Gone`으로 남음
+/// 첫 프리셋을 저장하는 동안의 줄 자리, `Row`는 `history` 줄을 차례로 가리킴
+/// 빠진 빈 목록 안내는 접힐 때까지 그 자리에 `Gone`으로 남음
 pub(super) enum Slot {
-    /// 넣는 중이면 펼치는 모션
-    Row(Option<RowFold>),
+    Row,
     Gone(Gone, RowFold),
 }
 
-/// 지워져 접히는 동안 그리는 내용
-#[derive(Clone, Debug, PartialEq)]
+/// 빠져서 접히는 동안 그리는 내용
+#[derive(Clone, Copy)]
 pub(super) enum Gone {
-    Preset(Preset),
     /// 첫 프리셋을 저장해 빠지는 빈 목록 안내
     Empty,
 }
 
 /// 그릴 줄 하나, 위쪽은 목록 맨 위에서 스크롤 전 px
-struct Band<'a> {
-    row: BandRow<'a>,
+struct Band {
+    row: BandRow,
     top: f32,
     height: f32,
     alpha: f32,
-    /// 펼쳐지거나 접히는 중, 제 높이 안으로 잘라 그림
+    /// 접히는 중, 제 높이 안으로 잘라 그림
     moving: bool,
 }
 
-enum BandRow<'a> {
+enum BandRow {
     Row(Row),
-    Gone(&'a Gone),
+    Gone(Gone),
 }
 
 impl Popup {
-    /// 저장·지우기로 바뀐 줄의 모션을 시작함, `before`는 바뀌기 전 줄
-    /// 모션 도중 또 바뀌어도 지금 보이는 자리에서 이어감, `in_place`면 맨 위 줄은 접고 펼치지 않음
-    fn start_preset_motion(&mut self, before: &[Row], change: &PresetChange, in_place: bool) {
-        let mut slots = std::mem::take(&mut self.preset_slots);
-        // 지난 변경이 취소된 뒤라면 남은 자리는 버림
-        if self.preset_change.is_none() || live_rows(&slots) != before.len() {
-            slots = before.iter().map(|_| Slot::Row(None)).collect();
-        }
-        if !in_place {
-            if let Some(row) = change.row {
-                if let Some(at) = live_slot(&slots, row) {
-                    slots[at] = Slot::Gone(Gone::Preset(change.preset.clone()), fold_from(&slots[at], false));
-                }
-            }
-            // 아래쪽 지금 검색 프리셋을 지우면 맨 위에 저장 줄이 다시 펼쳐짐
-            if self.history.first() == Some(&Row::PresetSave) && before.first() != Some(&Row::PresetSave) {
-                slots.insert(0, Slot::Row(Some(RowFold::new(true))));
-            }
-        }
-        // 빈 목록 안내 띠도 한 줄처럼 접히고 펼쳐짐, 늘 맨 끝
-        let had = before.last() == Some(&Row::PresetEmpty);
-        let has = self.history.last() == Some(&Row::PresetEmpty);
-        if had && !has {
-            if let Some(at) = slots.iter().rposition(|s| matches!(s, Slot::Row(_))) {
-                slots[at] = Slot::Gone(Gone::Empty, fold_from(&slots[at], false));
-            }
-        } else if has && !had {
-            let fold = match slots.iter().position(|s| matches!(s, Slot::Gone(Gone::Empty, _))) {
-                Some(i) => fold_from(&slots.remove(i), true),
-                None => RowFold::new(true),
-            };
-            slots.push(Slot::Row(Some(fold)));
-        }
-        if slots.iter().any(|s| !matches!(s, Slot::Row(None))) {
-            self.preset_slots = slots;
+    /// 첫 프리셋을 저장하면 끝의 빈 목록 안내 띠가 접힘, `before`는 저장 전 줄
+    /// 저장 줄 자리는 그대로 새 프리셋 줄이라 다른 줄은 제자리
+    fn start_preset_motion(&mut self, before: &[Row]) {
+        self.preset_slots.clear();
+        if before.last() == Some(&Row::PresetEmpty) {
+            self.preset_slots = before.iter().map(|_| Slot::Row).collect();
+            self.preset_slots[before.len() - 1] = Slot::Gone(Gone::Empty, RowFold::new());
         }
     }
 
     /// 줄 모션을 `dt`만큼, 판 높이는 줄을 같은 프레임에 따라감 (`follow_rows`)
     pub(super) fn step_preset_motion(&mut self, dt: f32) {
-        if self.preset_change.is_none() {
-            self.preset_slots.clear();
-        }
         if self.preset_slots.is_empty() {
             return;
         }
         let before = self.panel_target();
         for slot in &mut self.preset_slots {
-            match slot {
-                Slot::Row(Some(fold)) | Slot::Gone(_, fold) => fold.step(dt),
-                Slot::Row(None) => {}
+            if let Slot::Gone(_, fold) = slot {
+                fold.step(dt);
             }
         }
         self.preset_slots.retain(|s| !matches!(s, Slot::Gone(_, fold) if fold.done()));
-        for slot in &mut self.preset_slots {
-            if let Slot::Row(fold) = slot {
-                if fold.is_some_and(RowFold::done) {
-                    *fold = None;
-                }
-            }
-        }
-        if self.preset_slots.iter().all(|s| matches!(s, Slot::Row(None))) {
+        if self.preset_slots.iter().all(|s| matches!(s, Slot::Row)) {
             self.preset_slots.clear();
         }
         if self.view == View::History && self.sheet == Sheet::History && self.history_tab == HistoryTab::Presets {
@@ -384,18 +302,18 @@ impl Popup {
         }
     }
 
-    /// 프리셋 줄이 접히거나 펼쳐지는 중
+    /// 프리셋 탭에서 빈 목록 안내 띠가 접히는 중
     pub(super) fn preset_rows_moving(&self) -> bool {
         self.view == View::History && self.history_tab == HistoryTab::Presets && self.preset_motion().is_some()
     }
 
-    /// 지금 쓰는 줄 자리, 변경이 취소됐거나 줄 수가 안 맞으면 None
+    /// 지금 쓰는 줄 자리, 그 뒤 목록을 다시 채워 줄 수가 안 맞으면 None
     fn preset_motion(&self) -> Option<&[Slot]> {
-        let valid = self.preset_change.is_some() && !self.preset_slots.is_empty() && live_rows(&self.preset_slots) == self.history.len();
+        let valid = !self.preset_slots.is_empty() && live_rows(&self.preset_slots) == self.history.len();
         valid.then_some(self.preset_slots.as_slice())
     }
 
-    fn preset_bands(&self) -> Vec<Band<'_>> {
+    fn preset_bands(&self) -> Vec<Band> {
         let row_h = self.px(lay::ROW_H);
         let empty_h = self.px(lay::EXCLUDE_EMPTY_H);
         let mut rows = self.history.iter().copied();
@@ -413,14 +331,11 @@ impl Popup {
             Some(slots) => {
                 for slot in slots {
                     match slot {
-                        Slot::Row(fold) => {
+                        Slot::Row => {
                             let Some(row) = rows.next() else { break };
-                            push(BandRow::Row(row), full(row), *fold);
+                            push(BandRow::Row(row), full(row), None);
                         }
-                        Slot::Gone(gone, fold) => {
-                            let full = if *gone == Gone::Empty { empty_h } else { row_h };
-                            push(BandRow::Gone(gone), full, Some(*fold));
-                        }
+                        Slot::Gone(gone, fold) => push(BandRow::Gone(*gone), empty_h, Some(*fold)),
                     }
                 }
             }
@@ -438,7 +353,7 @@ impl Popup {
         content.min(self.px(lay::ROW_H) * lay::ROWS as f32)
     }
 
-    /// 프리셋 탭 줄 목록: 선택 강조와 저장 줄·프리셋 줄·빈 목록 안내, 넣고 지우는 동안엔 접히고 펼쳐지는 줄
+    /// 프리셋 탭 줄 목록: 선택 강조와 저장 줄·프리셋 줄·빈 목록 안내, 첫 프리셋을 저장하는 동안엔 접히는 빈 목록 안내 띠
     /// `top`은 첫 줄 자리 위쪽, `panel`은 지금 판
     pub(super) fn draw_preset_list(&self, top: f32, panel: D2D_RECT_F) -> Result<()> {
         let g = self.gfx.as_ref().unwrap();
@@ -470,7 +385,6 @@ impl Popup {
                     BandRow::Row(Row::Preset(i)) => self.presets.get(i).map_or(Ok(()), |p| self.draw_preset_row(y, right, p)),
                     BandRow::Row(Row::PresetEmpty) => self.preset_empty_text().map_or(Ok(()), |text| self.draw_preset_empty(y, panel, text)),
                     BandRow::Row(_) => Ok(()),
-                    BandRow::Gone(Gone::Preset(p)) => self.draw_preset_row(y, right, p),
                     BandRow::Gone(Gone::Empty) => self.draw_preset_empty(y, panel, NO_PRESETS),
                 };
                 if band.moving {
@@ -515,10 +429,7 @@ impl Popup {
     /// 저장 줄: 재킷 자리에 북마크
     fn draw_preset_save(&self, y: f32, right: f32) -> Result<()> {
         let g = self.gfx.as_ref().unwrap();
-        let slot = self.jacket_slot(y);
-        unsafe { g.dc.FillRoundedRectangle(&slot, &g.brush(white(FILL_HOVER))?) };
-        let (cx, cy) = ((slot.rect.left + slot.rect.right) / 2.0, (slot.rect.top + slot.rect.bottom) / 2.0);
-        g.fill_icon(Icon::Bookmark, cx, cy, self.px(lay::ICON), &g.brush(TEXT)?)?;
+        self.draw_slot_icon(y, Icon::Bookmark)?;
         self.draw_row_text(y, right, SAVE_LABEL, &self.preset_save_sub(), None, (&g.brush(TEXT)?, &g.brush(SUB)?))?;
         Ok(())
     }
@@ -540,18 +451,5 @@ impl Popup {
 }
 
 fn live_rows(slots: &[Slot]) -> usize {
-    slots.iter().filter(|s| matches!(s, Slot::Row(_))).count()
-}
-
-/// `history`의 `row`번째 줄 자리
-fn live_slot(slots: &[Slot], row: usize) -> Option<usize> {
-    slots.iter().enumerate().filter(|(_, s)| matches!(s, Slot::Row(_))).nth(row).map(|(i, _)| i)
-}
-
-/// 이 자리가 바뀔 때의 모션, 반대로 움직이던 중이면 거꾸로 돌려 이어감
-fn fold_from(slot: &Slot, opening: bool) -> RowFold {
-    match slot {
-        Slot::Row(Some(fold)) | Slot::Gone(_, fold) if fold.opening != opening => fold.reversed(),
-        _ => RowFold::new(opening),
-    }
+    slots.iter().filter(|s| matches!(s, Slot::Row)).count()
 }

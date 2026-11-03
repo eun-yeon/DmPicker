@@ -24,7 +24,7 @@ pub struct LevelQuery {
 }
 
 impl LevelQuery {
-    /// 검색어 전체가 `[모드] 난이도 레벨` 또는 레벨 범위 꼴이면 Some
+    /// 검색어 전체가 `[모드] 난이도 레벨` 또는 레벨 범위 꼴이면 적은 모드 (없으면 None)와 레벨 조건
     pub fn parse(raw: &str) -> Option<(Option<Mode>, LevelQuery)> {
         Self::parse_keys(&keys(raw)?)
     }
