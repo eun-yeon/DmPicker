@@ -48,7 +48,7 @@ impl Popup {
         let query = dmpicker_search::normalize(&self.history_query);
         self.preset_current = self.current_preset();
         self.history.clear();
-        // 검색어가 없거나 이미 저장한 검색이면 저장 줄을 안 둠, 저장한 검색은 목록 제자리에 보임
+        // 조건 검색이 아니거나 이미 저장한 검색이면 저장 줄을 안 둠, 저장한 검색은 목록 제자리에 보임
         if !finding && self.preset_current.as_ref().is_some_and(|p| !self.presets.contains(p)) {
             self.history.push(Row::PresetSave);
         }

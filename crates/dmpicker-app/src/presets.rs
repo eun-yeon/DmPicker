@@ -71,9 +71,7 @@ impl PartialEq for Preset {
 impl Preset {
     pub fn capture(catalog: &Catalog, query: &str, filter: Options, mode: Mode, diff: Diff) -> Option<Self> {
         let query = query.trim();
-        if query.is_empty() {
-            return None;
-        }
+        catalog.parse_filter(query)?;
         let (mode, diff) = QueryPattern::read(catalog, query).settings(mode, diff);
         Some(Self { query: query.to_owned(), filter, mode, diff, name: None })
     }
@@ -133,6 +131,10 @@ impl Preset {
         if let Some(diff) = self.diff {
             parts.push(diff.label().to_owned());
         }
+        // 정렬은 거르지 않고 순서만 바꿔서 레이트·기록 상태만 봄
+        if !self.filter.active() {
+            parts.push("필터 없음".to_owned());
+        }
         if self.filter.play != Play::All {
             parts.push(self.filter.play.label().to_owned());
         }
@@ -143,7 +145,7 @@ impl Preset {
             (None, None) => {}
         }
         match (self.filter.sort, self.filter.direction) {
-            (Sort::Title, Direction::Ascending) => {}
+            (Sort::Title, Direction::Ascending) => parts.push("제목순".to_owned()),
             (Sort::Title, Direction::Descending) => parts.push("제목 역순".to_owned()),
             (sort, direction) => {
                 let order = if direction == Direction::Ascending {
@@ -153,9 +155,6 @@ impl Preset {
                 };
                 parts.push(format!("{} {order}", sort.label()));
             }
-        }
-        if self.filter == Options::default() {
-            parts.push("필터 없음".to_owned());
         }
         parts.join(" · ")
     }
