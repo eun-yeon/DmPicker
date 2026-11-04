@@ -658,6 +658,55 @@ impl IconSwap {
     }
 }
 
+/// 정렬 줄 화살표, 고른 칸에만 둠
+/// 옛 칸은 누르면 바로 빠지고 새 칸은 손잡이가 절반 넘게 덮으면 들어옴, 지나가는 칸엔 안 뜸
+struct SortArrows {
+    chosen: usize,
+    /// 칸마다 나타난 정도
+    shown: [Presence; record_filter::Sort::ALL.len()],
+    /// 칸마다 방향, 방향을 바꾸다 떠나도 그 칸에서 이어 바뀌며 빠짐
+    swaps: [IconSwap; record_filter::Sort::ALL.len()],
+}
+
+impl SortArrows {
+    fn new(chosen: usize, icon: Icon) -> Self {
+        Self {
+            chosen,
+            shown: std::array::from_fn(|i| Presence::new((i == chosen) as u8 as f32)),
+            swaps: std::array::from_fn(|_| IconSwap::new(icon)),
+        }
+    }
+
+    fn go(&mut self, chosen: usize, icon: Icon) {
+        self.chosen = chosen;
+        // 안 보이는 칸은 들어올 때 방향이 바뀌는 모습이 안 보이게 바로 맞춤
+        if self.shown[chosen].value() > 0.0 {
+            self.swaps[chosen].go(icon);
+        } else {
+            self.swaps[chosen] = IconSwap::new(icon);
+        }
+    }
+
+    fn step(&mut self, dt: f32, thumb: (f32, f32)) {
+        for (i, (shown, swap)) in self.shown.iter_mut().zip(&mut self.swaps).enumerate() {
+            swap.step(dt);
+            shown.go(i == self.chosen && seg_cover(thumb, i) > 0.5);
+            shown.step(dt);
+        }
+    }
+
+    fn moving(&self) -> bool {
+        self.shown.iter().any(Presence::moving) || self.swaps.iter().any(IconSwap::moving)
+    }
+
+    /// 칸에 그릴 화살표마다 (아이콘, 배율, 불투명도), 빠지는 것부터
+    fn parts(&self, cell: usize) -> impl Iterator<Item = (Icon, f32, f32)> + '_ {
+        let shown = self.shown[cell];
+        let (k, look) = (ICON_SWAP_MIN + (1.0 - ICON_SWAP_MIN) * shown.value(), shown.look().0);
+        self.swaps[cell].parts().map(move |(icon, s, a, _)| (icon, k * s, look * a))
+    }
+}
+
 /// 섞을 내용들과 비율 (합 1, 다 편 시트 자리, 변환 없음)
 type Parts = Vec<(ID2D1CommandList, f32)>;
 type BlobShapes = (Vec<blob::Shape>, Vec<blob::Shape>);
@@ -1287,7 +1336,7 @@ pub struct Popup {
     cond_text: String,      // 바 채보 칸 글, 사라지는 동안엔 마지막 글 그대로
     lead_swap: IconSwap,    // 입력 칸 앞 아이콘, 바뀌면 번지며 바뀜
     filter_connected: bool, // 지난 프레임 필터 시트가 닉네임을 연결한 모양, 바뀌면 버튼 하나가 둘로 바뀌는 것까지 겹쳐 바꿈
-    sort_arrow: IconSwap,   // 정렬 방향 화살표, 방향을 바꾸면 옛 것은 줄며 빠지고 새 것이 커지며 들어옴
+    sort_arrow: SortArrows, // 정렬 방향 화살표, 방향을 바꾸면 옛 것은 줄며 빠지고 새 것이 커지며 들어옴
     filter_keyed: bool,     // 필터 시트에서 키를 썼음, 그때만 포커스를 보여 줌 (누르거나 다시 열면 풂)
     panel_h: Spring,        // 보이는 패널의 높이, 내용이 바뀔 때만 움직임
     unfolding: bool,        // 사라졌거나 사라지던 판이 다시 펼쳐지는 중, 다 펼 때까지 아래 빈 곳도 판 자리
@@ -1534,7 +1583,7 @@ impl Popup {
             cond_text: String::new(),
             lead_swap: IconSwap::new(Icon::Search),
             filter_connected: false,
-            sort_arrow: IconSwap::new(Icon::SortUp),
+            sort_arrow: SortArrows::new(record_filter::Sort::Title as usize, Icon::SortUp),
             filter_keyed: false,
             panel_h: Spring::new(0.0, PANEL_SPRING.0, PANEL_SPRING.1),
             unfolding: false,
@@ -5074,11 +5123,11 @@ impl Popup {
         }
     }
 
-    /// 정렬 화살표를 지금 방향으로 보냄
+    /// 정렬 화살표를 지금 칸과 방향으로 보냄
     /// 닉네임을 넣거나 지우면 기록 줄 버튼 수와 기록 칸 흐림이 한꺼번에 바뀌어서 기록 부분을 겹쳐 바꿈
     /// 정렬이 레이트와 제목 사이로 바뀌어도 정렬 줄은 칸을 누를 때와 같은 손잡이·화살표 모션
     fn retarget_filter_motion(&mut self) {
-        self.sort_arrow.go(self.sort_arrow_icon());
+        self.sort_arrow.go(self.record_filter.effective_sort(&self.records).0 as usize, self.sort_arrow_icon());
         let connected = self.records.connected();
         if connected != self.filter_connected {
             self.filter_connected = connected;
@@ -5089,7 +5138,7 @@ impl Popup {
     }
 
     fn snap_filter_motion(&mut self) {
-        self.sort_arrow = IconSwap::new(self.sort_arrow_icon());
+        self.sort_arrow = SortArrows::new(self.record_filter.effective_sort(&self.records).0 as usize, self.sort_arrow_icon());
         self.filter_connected = self.records.connected();
     }
 
@@ -6357,7 +6406,7 @@ impl Popup {
                     cells: sort_row.choices.iter().map(|c| (c.text.as_str(), if c.control == Control::Sort(Sort::Rate) { on } else { 1.0 })).collect(),
                     thumb: self.seg[SEG_SORT].ends(),
                     thumb_a: 1.0,
-                    arrow: Some(self.sort_arrow.parts().map(|(icon, k, a, _)| (icon, k, a)).collect()),
+                    arrows: Some(&self.sort_arrow),
                 };
                 return draw_segment_set(g, f, fl.sort, &sort, lay::SEG_R, s);
             }
@@ -6396,7 +6445,7 @@ impl Popup {
                 cells: play_row.choices.iter().map(|c| (c.text.as_str(), on)).collect(),
                 thumb: self.seg[SEG_PLAY].ends(),
                 thumb_a: on,
-                arrow: None,
+                arrows: None,
             };
             draw_segment_set(g, f, fl.play, &play, lay::SEG_R, s)?;
         }
@@ -6654,7 +6703,7 @@ impl Popup {
         self.retarget_segments();
         self.seg.iter_mut().for_each(|s| s.step(dt));
         self.retarget_filter_motion();
-        self.sort_arrow.step(dt);
+        self.sort_arrow.step(dt, self.seg[SEG_SORT].ends());
         self.step_bar_swaps(dt);
         self.retarget_panel();
         self.open_s.step(dt);
@@ -7389,17 +7438,22 @@ fn draw_segments(
     rad: f32,          // 트랙 모서리 (DIP)
     s: f32,
 ) -> Result<()> {
-    let seg = Segments { cells: labels.iter().map(|&l| (l, 1.0)).collect(), thumb, thumb_a: 1.0, arrow: None };
+    let seg = Segments { cells: labels.iter().map(|&l| (l, 1.0)).collect(), thumb, thumb_a: 1.0, arrows: None };
     draw_segment_set(g, f, r, &seg, rad, s)
 }
 
 /// 세그먼트 컨트롤 재료: 칸마다 (글, 쓸 수 있는 정도 0 흐림 .. 1), 움직이는 손잡이 양 끝 (칸 단위)과 불투명도
-/// `arrow`가 있으면 손잡이가 덮은 칸 글 오른쪽에 정렬 방향 화살표, (아이콘, 배율, 불투명도) 목록이라 방향을 바꾸는 동안엔 둘
+/// `arrows`가 있으면 칸 글 오른쪽에 정렬 방향 화살표
 struct Segments<'a> {
     cells: Vec<(&'a str, f32)>,
     thumb: (f32, f32),
     thumb_a: f32,
-    arrow: Option<Vec<(Icon, f32, f32)>>,
+    arrows: Option<&'a SortArrows>,
+}
+
+/// 손잡이 양 끝 (칸 단위)이 칸 `i`를 덮는 정도 0 .. 1
+fn seg_cover((left, right): (f32, f32), i: usize) -> f32 {
+    (right.min(i as f32 + 1.0) - left.max(i as f32)).clamp(0.0, 1.0)
 }
 
 /// `draw_segments`에 흐린 칸·손잡이 불투명도·정렬 방향 화살표를 더한 것 (필터 시트)
@@ -7425,21 +7479,21 @@ fn draw_segment_set(g: &Gfx, f: &Fonts, r: D2D_RECT_F, seg: &Segments, rad: f32,
         let (aw, gap) = ((11.0 * s).round(), (3.0 * s).round());
         for (i, &(label, on)) in seg.cells.iter().enumerate() {
             // 라벨 색은 손잡이를 따라감, 지금 손잡이가 이 칸을 얼마나 덮는지로 정함
-            let cover = (tr.min(i as f32 + 1.0) - tl.max(i as f32)).clamp(0.0, 1.0) * seg.thumb_a;
+            let cover = seg_cover((tl, tr), i) * seg.thumb_a;
             let lit = SUB.a + (TEXT.a - SUB.a) * cover;
             let col = white(DISABLED.a + (lit - DISABLED.a) * on);
             let l = g.layout_centered(label, &f.item_bold, w, r.bottom - r.top)?;
             let mut x = r.left + w * i as f32;
-            // 화살표 11과 사이 3을 글과 한 덩어리로 칸 가운데에, 손잡이가 덮는 만큼 나타나며 글이 비켜남
-            if let Some(parts) = seg.arrow.as_ref().filter(|_| cover > 0.0) {
+            // 화살표 11과 사이 3을 글과 한 덩어리로 칸 가운데에, 화살표가 나타나는 만큼 글이 비켜남
+            if let Some(arrows) = seg.arrows.filter(|a| a.shown[i].value() > 0.0) {
                 let mut m = DWRITE_TEXT_METRICS::default();
                 l.GetMetrics(&mut m)?;
-                let shift = (aw + gap) / 2.0 * cover;
+                let shift = (aw + gap) / 2.0 * arrows.shown[i].look().0;
                 x -= shift;
                 let ax = r.left + w * (i as f32 + 0.5) + m.width / 2.0 - shift + gap + aw / 2.0;
                 // 시트 기록 안이라 흐림은 못 써서 바 아이콘 바꾸기에서 번짐만 뺌
-                for &(icon, k, a) in parts {
-                    g.fill_icon(icon, ax, cy, aw * k, &g.brush(white(col.a * cover * alpha_step(a)))?)?;
+                for (icon, k, a) in arrows.parts(i) {
+                    g.fill_icon(icon, ax, cy, aw * k, &g.brush(white(alpha_step(col.a * a)))?)?;
                 }
             }
             dc.DrawTextLayout(gfx::pt(x, r.top), &l, &g.brush(col)?, D2D1_DRAW_TEXT_OPTIONS_NONE);
